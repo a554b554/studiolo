@@ -1,5 +1,5 @@
 {
-  "name": "studio-local",
+  "name": "studiolo",
   "version": "0.1.0",
   "description": "Self-hosted, multi-machine workbench for CLI coding agents (claude, codex): peer-synced project history, Artifacts with persistent backends, in-page comments dispatched to agents.",
   "license": "MIT",

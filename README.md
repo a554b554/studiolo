@@ -1,4 +1,4 @@
-# Studio Local
+# Studiolo
 
 Self-hosted, multi-machine workbench for CLI coding agents. It drives the `claude` and `codex` CLIs that are already logged in on your computers (no API keys), keeps every project's conversation history as a synchronized journal that each machine serves as a peer (no central server), runs the web apps your agents build as "Artifacts" with persistent backends, and lets you comment on page content directly in the preview so an agent picks the comment up as a task. Interface in Chinese and English. Node.js 22.14+, zero npm dependencies.
 
