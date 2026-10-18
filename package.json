@@ -1,0 +1,16 @@
+{
+  "name": "studio-local",
+  "version": "0.1.0",
+  "description": "Self-hosted, multi-machine workbench for CLI coding agents (claude, codex): peer-synced project history, Artifacts with persistent backends, in-page comments dispatched to agents.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.14"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/server.mjs"
+  }
+}

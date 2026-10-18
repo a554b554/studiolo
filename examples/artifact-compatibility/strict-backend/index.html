@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strict CSP · Artifact 验收</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+<main>
+  <p class="eyebrow">后端 HTML · 严格 CSP</p>
+  <h1 id="strict-title" data-studio-id="strict-heading">可选择的标题与图表</h1>
+  <p id="script-status" role="status">等待外链 JavaScript…</p>
+  <section aria-labelledby="chart-title">
+    <h2 id="chart-title">SVG 柱状图</h2>
+    <svg viewBox="0 0 520 180" role="img" aria-label="三个可选取的柱形：24、38、52">
+      <title>示例数据</title>
+      <path d="M20 155H500" stroke="#8295a9"/>
+      <rect id="strict-bar" data-studio-id="strict-bar" x="60" y="95" width="90" height="60" fill="#5392e0"/>
+      <rect x="215" y="60" width="90" height="95" fill="#6caec6"/>
+      <rect x="370" y="25" width="90" height="130" fill="#9bc8a0"/>
+      <text x="100" y="83">24</text><text x="253" y="48">38</text><text x="410" y="16">52</text>
+    </svg>
+  </section>
+  <section>
+    <h2>原生 POST 表单</h2>
+    <form id="note-form" action="/form" method="post">
+      <label for="note">内容</label><input id="note" name="note" value="中文表单验收" maxlength="100">
+      <button id="form-submit" type="submit">提交表单</button>
+    </form>
+    <output id="form-output"></output>
+  </section>
+  <section>
+    <h2>Cookie 与流式响应</h2>
+    <button id="cookie-button" type="button">验证 Fetch／Cookie</button>
+    <output id="cookie-output">尚未请求</output>
+    <button id="stream-button" type="button">读取 3 条 SSE 事件</button>
+    <ol id="stream-output" aria-live="polite"></ol>
+  </section>
+</main>
+</body>
+</html>

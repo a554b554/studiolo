@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <META content="default-src &#39;self&#39;; script-src &#39;self&#39;; style-src &#39;self&#39;" HTTP-EQUIV="Content-Security-Policy">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strict Meta CSP · Artifact 验收</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+<main>
+  <p class="eyebrow">静态 HTML · 严格 Meta CSP</p>
+  <h1 id="meta-title" data-studio-id="meta-heading">Meta CSP 下仍可选取和批注</h1>
+  <p id="meta-script-status">等待外链脚本…</p>
+  <section>
+    <h2>SVG 图形</h2>
+    <svg viewBox="0 0 520 180" role="img" aria-label="可选取的蓝色柱形">
+      <rect id="meta-bar" data-studio-id="meta-bar" x="100" y="20" width="100" height="130" fill="#5392e0"/>
+      <text x="240" y="90">选择标题或此柱形</text>
+    </svg>
+  </section>
+  <section>
+    <h2>正常交互</h2>
+    <button id="meta-button" type="button">增加计数</button>
+    <output id="meta-output">0</output>
+  </section>
+</main>
+</body>
+</html>

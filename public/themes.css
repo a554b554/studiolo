@@ -1,0 +1,5 @@
+:root,[data-theme="brutal"]{color-scheme:light;--bg:#fffdf5;--panel:#f2efdf;--surface:#fffef9;--ink:#22221d;--muted:#6d695a;--border:#282823;--hover:#eee9d4;--selected:#e9edc5;--accent:#dced9b;--accent-ink:#22221d;--user:#f0e7c8;--danger:#ac3223;--radius:2px;--line:2px;--shadow:3px 3px 0 #282823;--font:Arial,"Microsoft YaHei",sans-serif}
+[data-theme="oled"]{color-scheme:dark;--bg:#050606;--panel:#080b09;--surface:#111613;--ink:#dfebe3;--muted:#94a49a;--border:#29362e;--hover:#142018;--selected:#1c3023;--accent:#b8ed86;--accent-ink:#18230f;--user:#151d17;--danger:#f59287;--radius:7px;--line:1px;--shadow:none;--font:"Segoe UI","Microsoft YaHei",sans-serif}
+[data-theme="brutal"] .brand{font-weight:900;letter-spacing:-1.8px}
+[data-theme="brutal"] .primary,[data-theme="brutal"] .composer{box-shadow:var(--shadow)}
+[data-theme="oled"] .brand,[data-theme="oled"] .run-status{font-family:Consolas,monospace}

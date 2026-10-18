@@ -1,0 +1,8 @@
+node_modules/
+projects/
+.studio/
+.studio-local/
+.test-tmp/
+examples/persistent-game/data/
+*.log
+.DS_Store
