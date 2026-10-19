@@ -22,13 +22,13 @@
 Paste this into Claude Code, Codex or any coding agent that can run commands on the machine you want to use:
 
 ```text
-Install Studiolo from <REPO_URL>: clone the repository, make sure Node.js 22.14+ is available and that the `claude` and/or `codex` CLIs are installed, run `node src/server.mjs` from the repository root, confirm http://127.0.0.1:4310 answers, then tell me to open Settings → Hosts & accounts to sign in my accounts. Do not sign anything in yourself.
+Install Studiolo from https://github.com/a554b554/studiolo: clone the repository, make sure Node.js 22.14+ is available and that the `claude` and/or `codex` CLIs are installed, run `node src/server.mjs` from the repository root, confirm http://127.0.0.1:4310 answers, then tell me to open Settings → Hosts & accounts to sign in my accounts. Do not sign anything in yourself.
 ```
 
 Or by hand:
 
 ```sh
-git clone <REPO_URL> studiolo && cd studiolo
+git clone https://github.com/a554b554/studiolo studiolo && cd studiolo
 node src/server.mjs        # http://127.0.0.1:4310
 ```
 
@@ -177,13 +177,13 @@ MIT — see [LICENSE](LICENSE).
 把这段话发给能在目标机器上执行命令的 Claude Code、Codex 或其他 coding agent：
 
 ```text
-从 <REPO_URL> 安装 Studiolo：克隆仓库，确认有 Node.js 22.14+ 和 claude / codex CLI，在仓库根目录运行 `node src/server.mjs`，确认 http://127.0.0.1:4310 能打开，然后提醒我到「设置 → 主机与账号」登录账号。不要替我登录任何账号。
+从 https://github.com/a554b554/studiolo 安装 Studiolo：克隆仓库，确认有 Node.js 22.14+ 和 claude / codex CLI，在仓库根目录运行 `node src/server.mjs`，确认 http://127.0.0.1:4310 能打开，然后提醒我到「设置 → 主机与账号」登录账号。不要替我登录任何账号。
 ```
 
 手动安装：
 
 ```sh
-git clone <REPO_URL> studiolo && cd studiolo
+git clone https://github.com/a554b554/studiolo studiolo && cd studiolo
 node src/server.mjs        # http://127.0.0.1:4310
 ```
 
