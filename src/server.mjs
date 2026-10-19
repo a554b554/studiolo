@@ -11,7 +11,8 @@ import {CliRunner} from './runner.mjs';
 import {ArtifactManager} from './artifacts.mjs';
 import {safePath,writeJson,httpError} from './paths.mjs';
 import {saveAnchorEvidence,readAnchorEvidence} from './evidence.mjs';
-import {changeLifecycle,inactive,listArchives} from './lifecycle.mjs';
+import {changeLifecycle,deleteProject,inactive,listArchives} from './lifecycle.mjs';
+import {ProjectPurger} from './purge.mjs';
 import {AccountUsage} from './account-usage.mjs';
 import {AccountAuth} from './account-auth.mjs';
 import {Accounts} from './accounts.mjs';
@@ -42,7 +43,7 @@ export async function createStudio(options={}){
   if(tailnet&&(bind!=='127.0.0.1'||(!token&&!tailnet.trustedHosts)))throw new Error('Tailscale Serve requires loopback binding and an explicit access policy');
   let machine;try{machine=JSON.parse(await fs.readFile(path.join(stateDir,'machine.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw new Error('本机配置无法读取，拒绝重建身份：'+error.message);machine={hostId:randomUUID(),name:tailnet?.name||os.hostname(),hosts:[]};await writeJson(path.join(stateDir,'machine.json'),machine);}
   const projectRoot=options.projectRoot||path.resolve(here,'../projects');
-  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const queue=new QueueManager({store,runner,hostId});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
+  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const queue=new QueueManager({store,runner,hostId});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
   const hosts=new Hosts({machine,projectRoot,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||4310}`:undefined),profiles:()=>runner.profiles()});await hosts.init();
   // Accounts live per machine; a conversation bound to an account that no longer exists on
   // its machine may continue with another account there (the native transcript is not kept).
@@ -168,9 +169,10 @@ export async function createStudio(options={}){
     const readBody=async()=>input||{};
     const lifecycle=/^\/(?:lifecycle|sessions\/([^/]+)\/lifecycle)$/.exec(tail);
     if(lifecycle&&req.method==='POST'){
-      const {action}=await readBody();const result=await changeLifecycle(store,pid,lifecycle[1],action);
+      const {action}=await readBody();
+      if(!lifecycle[1]&&action==='delete')return send(res,await deleteProject(purger,pid));
+      const result=await changeLifecycle(store,pid,lifecycle[1],action);
       if(action!=='restore')await runner.release?.(`${pid}:${lifecycle[1]?'session:'+lifecycle[1]+':':''}`);
-      if(!lifecycle[1]&&action==='delete')for(const artifact of state.artifacts)await artifacts.stop(pid,artifact.id);
       return send(res,result);
     }
     if(inactive(state.project)&&req.method!=='GET')throw httpError('项目已归档或删除，请先恢复',409);
@@ -196,7 +198,9 @@ export async function createStudio(options={}){
     throw httpError('接口不存在',404);
   }
   const server=http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)send(res,{error:e.message},e.status||400);else res.end();}));const port=options.port??Number(process.env.STUDIO_PORT||4310);try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,bind,resolve)});if(tailnet)await tailnet.forwarder.expose(server.address().port);await queue.init();}catch(error){unsubscribe();await queue.close();await artifacts.close();if(server.listening)await new Promise(r=>server.close(r));throw error;}
-  let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
-  return {server,store,queue,artifacts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await new Promise(r=>server.close(r));}};
+  let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{await purger.reconcile().catch(e=>{purger.lastError=e.message;});const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
+  // Projects soft-deleted before hard deletion existed are removed once, after startup.
+  const legacyPurge=purger.reconcile({legacy:true}).catch(e=>{purger.lastError=e.message;console.error('Project purge failed: '+e.message);});
+  return {server,store,queue,artifacts,purger,legacyPurge,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await new Promise(r=>server.close(r));}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}

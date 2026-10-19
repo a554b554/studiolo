@@ -56,7 +56,7 @@ test('Markdown previews read project images through a sandboxed raw route',async
  assert.equal((await fetch(`${root}/raw?path=notes.txt`)).status,415);
  for(const target of ['../state/machine.png','docs/missing.png'])assert.ok(!(await fetch(`${root}/raw?path=${target}`)).ok,target);
 });
-async function setup(t,options={}){const dir=await fs.mkdtemp(path.join(os.tmpdir(),'studio-http-'));const app=await createStudio({stateDir:path.join(dir,'state'),projectRoot:path.join(dir,'projects'),port:0,previewPort:0,runner,...options});t.after(async()=>{await app.close();await fs.rm(dir,{recursive:true,force:true});});const base=`http://127.0.0.1:${app.port}`;async function api(p,method='GET',data,headers={}){const res=await fetch(base+p,{method,headers:{...(data?{'Content-Type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):undefined});const payload=await res.json();if(!res.ok)throw Object.assign(new Error(payload.error),{status:res.status});return payload;}return {app,api,base,dir};}
+async function setup(t,options={}){const dir=await fs.mkdtemp(path.join(os.tmpdir(),'studio-http-'));const app=await createStudio({stateDir:path.join(dir,'state'),projectRoot:path.join(dir,'projects'),port:0,previewPort:0,runner,homedir:path.join(dir,'home'),env:{},...options});t.after(async()=>{await app.close();await fs.rm(dir,{recursive:true,force:true});});const base=`http://127.0.0.1:${app.port}`;async function api(p,method='GET',data,headers={}){const res=await fetch(base+p,{method,headers:{...(data?{'Content-Type':'application/json'}:{}),...headers},body:data?JSON.stringify(data):undefined});const payload=await res.json();if(!res.ok)throw Object.assign(new Error(payload.error),{status:res.status});return payload;}return {app,api,base,dir};}
 test('HTTP project, session, run idempotency and path bounds',async t=>{const {api}=await setup(t);const project=await api('/api/projects','POST',{name:'test'});const session=await api(`/api/projects/${project.id}/sessions`,'POST',{title:'one'});const input={requestId:'one',sessionId:session.id,text:'hi',profileId:'fake',model:'test'};const run=await api(`/api/projects/${project.id}/messages`,'POST',input);assert.equal((await api(`/api/projects/${project.id}/messages`,'POST',input)).id,run.id);await assert.rejects(()=>api(`/api/projects/${project.id}/file?path=../machine.json`),/范围/);await assert.rejects(()=>api('/api/projects','POST',{name:'attack'},{Origin:'https://evil.example'}),e=>e.status===403);});
 test('token required and session cookie auth',async t=>{const {api,base}=await setup(t,{token:'secret-test-only'});await assert.rejects(()=>api('/api/bootstrap'),e=>e.status===401);assert.ok((await api('/api/bootstrap','GET',undefined,{Authorization:'Bearer secret-test-only'})).hostId);const res=await fetch(base+'/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'secret-test-only'})});assert.equal(res.status,200);const cookie=res.headers.get('set-cookie').split(';')[0];assert.ok((await api('/api/bootstrap','GET',undefined,{Cookie:cookie})).hostId);});
 test('artifact isolated preview, annotation persists, snapshot restore',async t=>{const {api}=await setup(t);const project=await api('/api/projects','POST',{name:'artifact'});await fs.mkdir(path.join(project.path,'web'));await fs.mkdir(path.join(project.path,'data'));await fs.writeFile(path.join(project.path,'web/index.html'),'<!doctype html><html><meta charset="utf-8"><body><button id="test">Test</button></body></html>');await fs.writeFile(path.join(project.path,'data/save.json'),'1');const a=await api(`/api/projects/${project.id}/artifacts`,'POST',{name:'test',root:'web',dataPaths:['data']});const live=await api(`/api/projects/${project.id}/artifacts/${a.id}/start`,'POST',{});assert.ok(live.url.includes('/p/'));const html=await (await (await previewClient(live)).request()).text();assert.ok(html.includes('__STUDIO_BRIDGE__'));assert.ok(html.startsWith('<!doctype html>'));assert.ok(!html.includes('<base'));assert.ok(html.includes('<head><script'));const item=await api(`/api/projects/${project.id}/artifacts/${a.id}/annotations`,'POST',{requestId:'annotation-1',text:'Change',anchor:{selector:'#test'},profileId:'fake',model:'test'});await api(`/api/projects/${project.id}/annotations/${item.annotation.id}`,'PATCH',{anchorStatus:'orphaned'});assert.equal((await api(`/api/projects/${project.id}`)).annotations[0].status,'open');const snap=await api(`/api/projects/${project.id}/artifacts/${a.id}/snapshot`,'POST',{});await fs.writeFile(path.join(project.path,'data/save.json'),'2');await api(`/api/projects/${project.id}/artifacts/${a.id}/restore`,'POST',snap);assert.equal(await fs.readFile(path.join(project.path,'data/save.json'),'utf8'),'1');assert.equal((await fetch(live.url)).status,404);});
@@ -90,11 +90,42 @@ test('settings archives restore; deleted conversations are removed and cannot be
  await api(`${base}/lifecycle`,'POST',{action:'archive'});assert.equal((await api('/api/archives')).projects[0].id,p.id);
  await assert.rejects(()=>api(`${base}/sessions`,'POST',{title:'denied'}),e=>e.status===409);
  await api(`${base}/lifecycle`,'POST',{action:'restore'});assert.equal((await api('/api/archives')).projects.length,0);
- await api(`${base}/lifecycle`,'POST',{action:'delete'});assert.equal((await api('/api/archives')).projects.length,0);
- await assert.rejects(()=>api(`${base}/lifecycle`,'POST',{action:'restore'}),e=>e.status===410);
- assert.equal(await fs.readFile(path.join(p.path,'keep.txt'),'utf8'),'user source');
- const {Store}=await import('../src/store.mjs');const reloaded=await new Store({stateDir:app.stateDir,hostId:app.hostId}).init();assert.equal((await reloaded.read(p.id)).sessions.length,0);
  await assert.rejects(()=>api(route,'POST',{action:'purge'}),/无效/);
+ assert.deepEqual(await api(`${base}/lifecycle`,'POST',{action:'delete'}),{id:p.id,deleted:true});
+ assert.equal((await api('/api/archives')).projects.length,0);
+ assert.ok(!(await api('/api/projects')).some(x=>x.id===p.id));
+ await assert.rejects(()=>fs.access(p.path),e=>e.code==='ENOENT');
+ assert.equal(JSON.parse(await fs.readFile(path.join(path.dirname(p.path),'.deleted',p.id+'.json'),'utf8')).id,p.id);
+ await assert.rejects(()=>api(`${base}/lifecycle`,'POST',{action:'restore'}),e=>e.status===404);
+ const {Store}=await import('../src/store.mjs');const reloaded=await new Store({stateDir:app.stateDir,hostId:app.hostId,projectRoot:path.dirname(p.path)}).init();
+ assert.ok(!(await reloaded.listProjects()).some(x=>x.id===p.id));
+});
+
+test('project deletion removes local agent transcripts and survives late synchronization',async t=>{
+ const {api,app,dir}=await setup(t);const p=await api('/api/projects','POST',{name:'purge'}),other=await api('/api/projects','POST',{name:'keep'});
+ const claude=name=>path.join(app.stateDir,'accounts','acc_claude','projects',name.replace(/[^a-zA-Z0-9]/g,'-'));
+ const rollout=async(name,cwd)=>{const file=path.join(dir,'home','.codex','sessions','2026','10','18',name);await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,JSON.stringify({type:'session_meta',payload:{id:name,cwd}})+'\n{}\n');return file;};
+ for(const target of [claude(p.path),claude(path.join(p.path,'web')),claude(other.path)]){await fs.mkdir(target,{recursive:true});await fs.writeFile(path.join(target,'s.jsonl'),'{}');}
+ const gone=[await rollout('rollout-a.jsonl',p.path),await rollout('rollout-b.jsonl',path.join(p.path,'web'))],kept=await rollout('rollout-c.jsonl',other.path);
+ await api(`/api/projects/${p.id}/lifecycle`,'POST',{action:'delete'});
+ for(const file of [claude(p.path),claude(path.join(p.path,'web')),...gone])await assert.rejects(()=>fs.access(file),e=>e.code==='ENOENT');
+ await fs.access(claude(other.path));await fs.access(kept);await fs.access(other.path);
+ // A peer write that Syncthing delivers after the deletion recreates the folder: it stays hidden and is removed again.
+ await fs.mkdir(path.join(p.path,'.studio','events'),{recursive:true});await fs.writeFile(path.join(p.path,'.studio','events','late.json'),'{}');
+ assert.ok(!(await api('/api/projects')).some(x=>x.id===p.id));
+ await app.purger.reconcile();await assert.rejects(()=>fs.access(p.path),e=>e.code==='ENOENT');
+});
+
+test('tombstones from another machine and legacy soft deletions are purged',async t=>{
+ const {api,app}=await setup(t);const remote=await api('/api/projects','POST',{name:'remote'}),legacy=await api('/api/projects','POST',{name:'legacy'}),kept=await api('/api/projects','POST',{name:'kept'});
+ const root=path.dirname(remote.path);
+ await fs.mkdir(path.join(root,'.deleted'),{recursive:true});await fs.writeFile(path.join(root,'.deleted',`${remote.id}.sync-conflict-20261018-000000-ABCDEFG.json`),'{}');
+ await app.store.mutate(legacy.id,'project.delete',s=>{s.project.deletedAt=new Date().toISOString();});
+ await app.legacyPurge;const results=await app.purger.reconcile({legacy:true});
+ assert.deepEqual(Object.keys(results).sort(),[remote.id,legacy.id].sort());
+ for(const p of [remote,legacy])await assert.rejects(()=>fs.access(p.path),e=>e.code==='ENOENT');
+ assert.deepEqual((await api('/api/projects')).map(p=>p.id),[kept.id]);
+ assert.deepEqual(await app.purger.reconcile(),{});
 });
 
 test('lifecycle rejects pending work atomically and project deletion stops preview',async t=>{
@@ -110,9 +141,11 @@ test('lifecycle rejects pending work atomically and project deletion stops previ
  await fs.mkdir(path.join(p.path,'web'));await fs.writeFile(path.join(p.path,'web/index.html'),'<html>saved</html>');
  const a=await api(`${base}/artifacts`,'POST',{name:'preview',root:'web'});
  await api(`${base}/artifacts/${a.id}/start`,'POST',{});
+ assert.ok(app.artifacts.active.has(`${p.id}:${a.id}`));
  await api(`${base}/lifecycle`,'POST',{action:'delete'});
- assert.equal((await api(`${base}/artifacts/${a.id}/status`)).running,false);
- assert.equal(await fs.readFile(path.join(p.path,'web/index.html'),'utf8'),'<html>saved</html>');
+ assert.equal(app.artifacts.active.size,0);
+ assert.ok(![...app.artifacts.origins.keys()].some(key=>key.startsWith(p.id+':')));
+ await assert.rejects(()=>fs.access(p.path),e=>e.code==='ENOENT');
 });
 
 test('HTTP approval response is authenticated, origin-checked, scoped and single-use',async t=>{

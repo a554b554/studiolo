@@ -114,13 +114,64 @@ export class Store {
   // Lets the queue announce uncommitted live output without writing an event.
   notify(projectId, type) { this._notify(projectId, type); }
 
+  // Hard-deleted project IDs: one tombstone per project in the synced projects/.deleted
+  // folder. Names are parsed, not contents, so Syncthing conflict copies count as well.
+  async deletedIds() {
+    if (!this.projectRoot) return new Set();
+    const names = await fs.readdir(path.join(this.projectRoot, '.deleted')).catch(e => { if (e.code === 'ENOENT') return []; throw e; });
+    return new Set(names.map(name => /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b.*\.json$/i.exec(name)?.[1]?.toLowerCase()).filter(Boolean));
+  }
+
+  projectPath(id) {
+    if (!this.projectRoot || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw error('Hard deletion requires a managed project ID', 409);
+    return path.join(this.projectRoot, id);
+  }
+
+  // Deletes the project for every machine. `check` sees the current state under the project's
+  // write lock, so no transaction can be committed between the check and the deletion. The
+  // tombstone is written before the folder goes, so an interrupted deletion is finished by the
+  // next reconcile instead of reappearing.
+  async removeProject(id, check = () => {}) {
+    return this._serial(id, async () => {
+      const entry = this._entry(id);
+      await this._checkManagedEntry(entry);
+      check((await this._load(path.join(entry.path, '.studio'))).state);
+      await atomicWrite(path.join(this.projectRoot, '.deleted', `${id}.json`), JSON.stringify({ id, name: entry.name, deletedAt: now(), hostId: this.hostId }));
+      await this._dropFolder(id);
+    });
+  }
+
+  // Removes this machine's copy of a tombstoned project and forgets it locally.
+  async removeFolder(id) { return this._serial(id, () => this._dropFolder(id)); }
+
+  async _dropFolder(id) {
+    const directory = this.projectPath(id);
+    const info = await fs.lstat(directory).catch(e => { if (e.code === 'ENOENT') return null; throw e; });
+    if (info && (info.isSymbolicLink() || !info.isDirectory() || await realpath(directory) !== directory)) throw error('Project directory must remain inside managed projects', 409);
+    if (info) await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    const root = path.join(directory, '.studio');
+    for (const key of [root, root + ':legacy']) this.eventCache.delete(key);
+    for (const key of [`${root}:false`, `${root}:true`]) this.eventLoads.delete(key);
+    this.journalCache.delete(root);
+    for (const filename of this.derivedCache.keys()) if (filename.startsWith(root + path.sep)) this.derivedCache.delete(filename);
+    this.derivedErrors.delete(id);
+    await this._serial('registry', async () => {
+      const before = this.registry.projects.length;
+      this.registry.projects = this.registry.projects.filter(p => p.id !== id);
+      if (this.registry.projects.length !== before) await atomicWrite(path.join(this.stateDir, 'registry.json'), JSON.stringify(this.registry, null, 2));
+    });
+    this._notify(id, 'project.deleted');
+  }
+
   async discoverProjects() {
     if (!this.projectRoot) return;
     return this._serial('registry',async()=>{
       const entries=await fs.readdir(this.projectRoot,{withFileTypes:true});
+      const deleted=await this.deletedIds();
       const found=[];
       for (const entry of entries) {
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entry.name)) continue;
+        if (deleted.has(entry.name.toLowerCase())) continue;
         const directory=path.join(this.projectRoot,entry.name);
         const cached=this.registry.projects.find(p=>p.id===entry.name);
         try {

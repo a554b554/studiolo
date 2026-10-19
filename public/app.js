@@ -263,7 +263,7 @@ function confirmLifecycle(project,session,action) {
   $('#lifecycle-title').textContent=t(deleting?(session?'删除对话':'删除项目'):(session?'归档对话':'归档项目'));
   $('#lifecycle-name').textContent=session?.title || project.name;
   $('#lifecycle-description').textContent=t(deleting
-    ? (session?'删除后，该对话及其消息记录将无法在平台恢复。':'删除后，该项目及其对话将无法在平台恢复。项目文件会保留。')
+    ? (session?'删除后，该对话及其消息记录将无法在平台恢复。':'删除后，该项目的文件夹、对话记录和各电脑上的 agent 会话记录都会被永久删除，无法恢复。')
     : (session?'归档后，对话将从列表隐藏，可在设置中恢复。':'归档后，项目及其对话将从列表隐藏，可在设置中恢复。'));
   const confirm=$('#lifecycle-confirm');
   confirm.textContent=t(deleting?'确认删除':'确认归档');confirm.className=deleting?'primary danger':'primary';

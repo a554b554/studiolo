@@ -1,6 +1,14 @@
 import {httpError} from './paths.mjs';
 
 export const inactive = item => Boolean(item?.archivedAt || item?.deletedAt);
+const pendingWork = (state, sessionId) => state.runs.some(r => (!sessionId || r.sessionId===sessionId) && ['queued','running','waiting'].includes(r.status));
+const busy = () => httpError('请先取消或完成该项目／对话中的排队、执行和等待任务',409);
+// Project deletion is permanent: the folder, its history and this machine's agent
+// transcripts are removed (see purge.mjs). Archiving remains the reversible option.
+export async function deleteProject(purger, projectId) {
+  await purger.remove(projectId, state => { if (pendingWork(state)) throw busy(); });
+  return {id:projectId,deleted:true};
+}
 export async function changeLifecycle(store, projectId, sessionId, action) {
   if (!['archive','delete','restore'].includes(action)) throw httpError('无效操作');
   return store.mutate(projectId, `${sessionId ? 'session' : 'project'}.${action}`, state => {
@@ -8,7 +16,7 @@ export async function changeLifecycle(store, projectId, sessionId, action) {
     if (!target) throw httpError('对话不存在',404);
     if (target.deletedAt) throw httpError('已删除，不能恢复',410);
     if (sessionId && inactive(state.project)) throw httpError('请先恢复项目',409);
-    if (action !== 'restore' && state.runs.some(r => (!sessionId || r.sessionId===sessionId) && ['queued','running','waiting'].includes(r.status))) throw httpError('请先取消或完成该项目／对话中的排队、执行和等待任务',409);
+    if (action !== 'restore' && pendingWork(state, sessionId)) throw busy();
     if (action === 'archive') {
       target.archivedAt ||= new Date().toISOString();
     } else if (action === 'delete' && sessionId) {

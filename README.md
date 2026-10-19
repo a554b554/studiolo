@@ -134,8 +134,11 @@ In the preview, *select an element, text or a canvas region* and write a comment
 | `projects/<id>/.studio/artifact-storage/`, `snapshots/`, `attachments/` | Synced preview storage, data snapshots, comment evidence |
 | `projects/<id>/uploads/` | Files dropped into the chat or the resource pane |
 | `projects/.servers/` | Public addresses of servers for discovery (no secrets) |
+| `projects/.deleted/<id>.json` | Tombstones of deleted projects (synchronized); a folder recreated by late sync is removed again |
 | `~/.studio-local/` | Machine-private: identity, `accounts.json`, `accounts/<id>/`, pairing, Tailscale settings — never synchronize |
 | `~/.studio-local/agent-profiles.json` | Optional: executable path / env per CLI family (`claude`, `codex`) or per account id |
+
+Deleting a project is permanent (archiving stays reversible) and is refused while work is queued, running or waiting. The deleting server writes a tombstone, then removes the whole `projects/<id>/` folder; your sync tool carries both to the other machines. Each server, on seeing a new tombstone, removes its leftover copy, the project's resident agent processes and Artifact preview ports, and the Claude transcripts (`projects/<encoded path>*` in each config directory) and Codex rollouts (matched by the `cwd` on their first line) whose working directory was inside the project. Handled IDs are recorded in `~/.studio-local/purged-projects.json`. Projects soft-deleted by older versions (`deletedAt`) are removed once at startup.
 
 ---
 
@@ -272,8 +275,11 @@ CLI 在终端里会询问的权限请求会出现在页面上：批准本次或�
 | `projects/<id>/.studio/artifact-storage/`、`snapshots/`、`attachments/` | 同步的预览存档、数据快照、批注证据 |
 | `projects/<id>/uploads/` | 聊天和资源栏上传的文件 |
 | `projects/.servers/` | 各服务器的公共地址，用于自动发现（不含秘密） |
+| `projects/.deleted/<id>.json` | 已删除项目的墓碑（随同步）；目录被迟到的同步重建时据此再次删除 |
 | `~/.studio-local/` | 机器私有：身份、`accounts.json`、`accounts/<id>/`、配对、Tailscale 设置——不要同步 |
 | `~/.studio-local/agent-profiles.json` | 可选：按 CLI 家族（`claude`、`codex`）或账号 id 覆盖可执行文件路径／环境变量 |
+
+删除项目是永久删除（归档仍可恢复）：有排队、执行或等待中的任务时拒绝。执行删除的服务器先写墓碑，再删除整个 `projects/<id>/`；同步工具把两者带到其他电脑。每台服务器看到新墓碑后，删除本机的残留目录、该项目的常驻 agent 进程和 Artifact 预览端口，以及工作目录在该项目内的 Claude 记录（各配置目录下的 `projects/<编码路径>*`）和 Codex rollout（按首行 `cwd` 匹配）；处理过的 ID 记在 `~/.studio-local/purged-projects.json`。旧版本留下的软删除项目（`deletedAt`）在启动时一次性删除。
 
 ## 常见问题
 

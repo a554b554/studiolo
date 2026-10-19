@@ -60,7 +60,7 @@ export const english = Object.freeze({
   "确认删除": "Delete",
   "确认归档": "Archive",
   "删除后，该对话及其消息记录将无法在平台恢复。": "This conversation and its messages cannot be restored in Studiolo after deletion.",
-  "删除后，该项目及其对话将无法在平台恢复。项目文件会保留。": "This project and its conversations cannot be restored in Studiolo after deletion. Project files will be kept.",
+  "删除后，该项目的文件夹、对话记录和各电脑上的 agent 会话记录都会被永久删除，无法恢复。": "The project folder, its conversations and the agent session records on every machine will be permanently deleted. This cannot be undone.",
   "归档后，对话将从列表隐藏，可在设置中恢复。": "This conversation will be hidden from the list. You can restore it in Settings.",
   "归档后，项目及其对话将从列表隐藏，可在设置中恢复。": "This project and its conversations will be hidden from the list. You can restore them in Settings.",
   "重命名": "Rename",
