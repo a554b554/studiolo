@@ -43,8 +43,23 @@ export function runNotice(text) {
   if (/Permission or user input required|CLI requires user input/i.test(text || '')) return t('旧版 CLI 调用已结束，无法补交批准。点击“用自动审核继续”可在新执行中接续未完成的工作。新执行的批准请求可直接在网页处理。');
   return String(text || '').split('\n')[0].slice(0,220);
 }
+// Accounts known to the page (every host's profiles), so an account id reads as its name.
+const directory = new Map();
+export function setAccountDirectory(hosts = []) {
+  directory.clear();
+  for (const host of hosts) for (const profile of host.profiles || []) directory.set(profile.id, { label: profile.label || profile.id, family: profile.family, email: profile.identity?.email || null, model: profile.models });
+}
+export const familyName = family => family === 'codex' ? 'Codex' : family === 'claude' ? 'Claude' : '';
+// Display name of the account behind a run or message: the run's own snapshot first (accounts can
+// be renamed or removed later), then the live directory, then the raw id.
+export function accountName(profileId, run) {
+  const known = run?.account || directory.get(profileId);
+  return known?.label || profileId || 'Agent';
+}
 export function agentLabel(message, run = {}) {
   const model = run.actualModel || run.model || message.model;
   const names = {'claude-fable-5-1':'Fable 5.1','claude-opus-5-5':'Opus 5.5','claude-sonnet-5-5':'Sonnet 5.5','claude-haiku-4-5-20251001':'Haiku 4.5'};
-  return [message.profileId || run.profileId || 'Agent', names[model] || model, run.actualReasoningEffort || run.reasoningEffort || t('effort: CLI 默认')].filter(Boolean).join(' · ');
+  const known = run.account || directory.get(message.profileId || run.profileId);
+  const modelLabel = names[model] || known?.model?.find(m => m.id === model)?.label || model;
+  return [accountName(message.profileId || run.profileId, run), modelLabel, run.actualReasoningEffort || run.reasoningEffort || t('effort: CLI 默认')].filter(Boolean).join(' · ');
 }

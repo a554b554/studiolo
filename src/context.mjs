@@ -4,7 +4,8 @@ import {createHash} from 'node:crypto';
 // Instructions live in the native transcript. Resuming it must not append another
 // copy of the platform prompt (or replay the conversation) on every user turn.
 export function buildContext(state, run, nativeSessionId, hostId) {
-  const prior = state.runs.filter(r => r.id !== run.id && r.hostId === hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.status === 'succeeded');
+  // Slash-command runs carry no platform prompt, so they do not count as the bootstrap turn.
+  const prior = state.runs.filter(r => r.id !== run.id && r.hostId === hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.status === 'succeeded' && !r.command);
   const bootstrap = !nativeSessionId || !prior.length;
   const root = state.project.path;
   const parts = [run.text];

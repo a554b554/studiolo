@@ -19,6 +19,11 @@ foreach ($listener in $listeners) {
         & taskkill.exe /PID $listener.OwningProcess /T /F | Out-Null
     }
 }
+# Stopping the task ends only its headless conhost; let the old launcher release its lock first.
+for ($attempt=0; $attempt -lt 20; $attempt++) {
+    if (-not @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*\start-studio-windows.ps1*' }).Count) { break }
+    Start-Sleep -Milliseconds 500
+}
 Start-ScheduledTask -TaskName 'Studio Local - Login'
 for ($attempt=0; $attempt -lt 45; $attempt++) {
     Start-Sleep -Seconds 2

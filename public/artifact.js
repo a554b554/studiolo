@@ -150,7 +150,8 @@ $('#selection-label').textContent=t('先选取页面内容或直接填写批注'
 $('#comment-text').placeholder=t('输入批注…');
 attempt(async () => {
   if (!projectId || !artifactId) throw new Error(t('链接缺少项目或 Artifact ID。请从项目文件栏打开。'));
-  const data = await bootstrap(); choices = initChoices(data,'',{hostId:data.hostId}); await reload(); await loadStatus();
+  const data = await bootstrap(); choices = initChoices(data,'',{hostId:data.hostId});
+  await reload(); await loadStatus();
 
   if (innerWidth <= 850) showComments(false);
   // Store events never change the preview process, so its status is re-read only after a

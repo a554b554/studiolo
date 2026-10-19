@@ -30,12 +30,20 @@ test('parallel callers share one refresh and a failing account does not hide oth
  let calls=0;const service=new AccountUsage({runner:{configuration:async()=>({claude1:config('claude1'),claude2:config('claude2')})},read:async c=>{calls++;if(c.id==='claude2')throw Error('bad');return claude;}});
  const [a,b]=await Promise.all([service.get(),service.get({refresh:true})]);assert.equal(a,b);assert.equal(calls,2);assert.deepEqual(a.accounts.map(x=>x.status),['ok','unavailable']);
 });
-function native(codex,never=false){
+function native(codex,never=false,init={}){
  const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.kill=()=>{child.killed=true;child.emit('close');};const calls=[];
- child.stdin.on('data',chunk=>{for(const line of chunk.toString().trim().split('\n')){const message=JSON.parse(line);calls.push(message);if(never||message.method==='initialized')continue;queueMicrotask(()=>{const result=(message.method||message.request.subtype)==='initialize'?{}:claude;child.stdout.write(JSON.stringify(codex?{id:message.id,result}:{type:'control_response',response:{request_id:message.request_id,subtype:'success',response:result}})+'\n');});}});
+ child.stdin.on('data',chunk=>{for(const line of chunk.toString().trim().split('\n')){const message=JSON.parse(line);calls.push(message);if(never||message.method==='initialized')continue;queueMicrotask(()=>{const result=(message.method||message.request.subtype)==='initialize'?init:claude;child.stdout.write(JSON.stringify(codex?{id:message.id,result}:{type:'control_response',response:{request_id:message.request_id,subtype:'success',response:result}})+'\n');});}});
  return {child,calls,spawnProcess:()=>child};
 }
 test('quota readers use metadata RPC only, close processes, and bound hanging calls',async()=>{
  for(const id of ['claude','codex']){const f=native(id==='codex');await readNativeUsage(config(id),f);assert.equal(f.child.killed,true);const methods=f.calls.map(x=>x.method||x.request?.subtype);assert.ok(methods.includes(id==='codex'?'account/rateLimits/read':'get_usage'));assert.ok(!methods.includes('turn/start'));assert.ok(!methods.includes('thread/start'));assert.ok(!f.calls.some(x=>x.type==='user'));}
  const f=native(true,true);await assert.rejects(readNativeUsage(config('codex'),{...f,timeoutMs:10}),/quota_read_failed/);assert.equal(f.child.killed,true);
+});
+test('a signed-out Claude CLI is reported as not logged in instead of an account without quota',async()=>{
+ const f=native(false,false,{account:{tokenSource:'none',apiProvider:'firstParty'}});
+ await assert.rejects(readNativeUsage(config(),f),/not_logged_in/);assert.equal(f.child.killed,true);assert.ok(!f.calls.some(x=>x.request?.subtype==='get_usage'));
+ const signedIn=native(false,false,{account:{email:'private@example.test',subscriptionType:'Claude Team'}});await readNativeUsage(config(),signedIn);
+ let fail=true;const service=new AccountUsage({runner:{configuration:async()=>({claude:config()})},read:async()=>{if(fail)throw Error('not_logged_in');return claude;}});
+ const first=await service.get();assert.equal(first.accounts[0].error,'not_logged_in');assert.equal(first.accounts[0].status,'unavailable');
+ fail=false;service.invalidate();assert.equal((await service.get({refresh:true})).accounts[0].status,'ok');
 });

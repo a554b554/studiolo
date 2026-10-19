@@ -4,8 +4,10 @@ import {inactive} from './lifecycle.mjs';
 import {Approvals} from './approvals.mjs';
 import {SessionTitles} from './session-titles.mjs';
 import {sessionBinding} from './journal.mjs';
+import {parseCommand} from './commands.mjs';
 
 const now = () => new Date().toISOString();
+const noActiveTurn = e => e?.message === 'no_active_turn';
 const active = status => status === 'running' || status === 'waiting';
 function error(message, status = 400) { return Object.assign(new Error(message), { status, statusCode: status }); }
 const scrub = text => String(text ?? '').replace(/\b(?:Bearer)\s+[\w.\-~+/]+=*/gi, 'Bearer [REDACTED]').replace(/\bsk-[A-Za-z0-9_-]{12,}/g, '[REDACTED]').replace(/((?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_KEY)\s*[=:]\s*)[^\s,"']+/gi, '$1[REDACTED]');
@@ -59,17 +61,23 @@ export class QueueManager {
     // cancellation committed before the final buffered batch reached disk.
     if (!current || current.hostId !== this.hostId) return;
     const done = current.outputSeq || 0;
-    let text = '', textAt;
+    // Text streams into the current assistant segment; a steer (a user message delivered
+    // mid-turn) is recorded in order and opens a new segment for what the agent says next.
+    let text = '', textAt, assistantId = live.assistantId;
     const appendText = () => {
       if (!text) return;
-      let msg = s.messages.find(m => m.runId === live.runId && m.role === 'assistant' && m.kind !== 'background_reply');
-      if (!msg) { msg = this._message(current, 'assistant', ''); msg.id = live.assistantId; msg.createdAt = textAt; s.messages.push(msg); }
+      let msg = s.messages.find(m => m.id === assistantId);
+      if (!msg) { msg = this._message(current, 'assistant', ''); msg.id = assistantId; msg.createdAt = textAt; s.messages.push(msg); }
       msg.text = scrub(msg.text + text); text = '';
     };
     for (const event of live.events) {
       if (event.seq <= done || upto !== undefined && event.seq > upto) continue;
       if (event.type === 'text') { if (!text) textAt = event.at; text += event.text; continue; }
       appendText();
+      if (event.type === 'steer') {
+        s.messages.push({ ...this._message(current, 'user', event.text), id: event.id, createdAt: event.at, kind: 'steer' });
+        assistantId = event.assistantId; continue;
+      }
       if (event.type === 'reply') {
         if (event.text) s.messages.push({...this._message(current, 'assistant', event.text), id:event.id, createdAt:event.at, kind:'background_reply'});
         continue;
@@ -81,8 +89,10 @@ export class QueueManager {
       s.messages.push(msg);
     }
     appendText();
-    if (upto !== undefined) current.outputSeq = Math.max(done, upto);
+    if (upto !== undefined) { current.outputSeq = Math.max(done, upto); live.assistantId = assistantId; }
   }
+
+  _sessionKey(projectId, run) { return `${projectId}:${run.queueId}:${run.profileId}:${this.hostId}`; }
 
   async init() {
     for (const project of await this.store.listProjects()) {
@@ -112,7 +122,11 @@ export class QueueManager {
 
   async submit(projectId, input) {
     if (this.closed) throw error('Queue manager is closed', 503);
-    if(this.runner.profiles){const profiles=await this.runner.profiles();const p=profiles.find(p=>p.id===input.profileId);if(!p||p.available===false||!p.models.some(m=>m.id===input.model))throw error('Selected account or model is unavailable',409);}
+    let profiles = null;
+    if(this.runner.profiles){profiles=await this.runner.profiles();const p=profiles.find(p=>p.id===input.profileId);if(!p||p.available===false||!p.models.some(m=>m.id===input.model))throw error('Selected account or model is unavailable',409);}
+    if (input.steer) { const steered = await this._steer(projectId, input); if (steered) return steered; }
+    const command = parseCommand(input.text);
+    if (command?.name === 'clear') return this._clear(projectId, input);
     const run = await this.store.mutate(projectId, 'run.queued', state => {
 
       if (inactive(state.project) || input.sessionId && inactive(state.sessions.find(s=>s.id===input.sessionId))) throw error('项目或对话已归档／删除，请先恢复',409);
@@ -131,21 +145,72 @@ export class QueueManager {
       if(input.sessionId){
         const session=state.sessions.find(s=>s.id===input.sessionId);
         const bound=sessionBinding(state,session.id);
-        if(bound.hostId&&bound.hostId!==this.hostId||bound.profileId&&bound.profileId!==input.profileId||bound.model&&bound.model!==input.model)throw error('This conversation is fixed to its machine, account and model. Create a new conversation to change them.',409);
+        // An account removed from this machine releases its conversations to another account here.
+        const gone=Boolean(bound.profileId)&&profiles!==null&&!profiles.some(p=>p.id===bound.profileId);
+        if(bound.hostId&&bound.hostId!==this.hostId||!gone&&(bound.profileId&&bound.profileId!==input.profileId||bound.model&&bound.model!==input.model))throw error('This conversation is fixed to its machine, account and model. Create a new conversation to change them.',409);
         session.hostId=this.hostId;session.profileId=input.profileId;session.model=input.model;
         session.selection={model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode};
       }
       const queueId = input.sessionId ? `session:${input.sessionId}` : `artifact:${input.artifactId}:${this.hostId}`;
       const item = { id: randomUUID(), requestId: input.requestId, queueId, text: input.text, profileId: input.profileId, model: input.model, reasoningEffort: input.reasoningEffort || null, permissionMode, hostId: this.hostId, status: 'queued', createdAt: now() };
       for (const field of ['sessionId', 'artifactId', 'annotationId']) if (input[field]) item[field] = input[field];
+      // A slash command reaches the CLI verbatim (Claude) or as a mapped native request (Codex).
+      if (command) item.command = command;
+      // Who ran it, as shown at the time: accounts can be renamed or removed later.
+      const account = profiles?.find(p => p.id === input.profileId);
+      if (account) item.account = { label: account.label, family: account.family, email: account.identity?.email || null };
       // Uploaded files the user attached to this request, as project-relative paths.
       if (Array.isArray(input.attachments) && input.attachments.length) item.attachments = input.attachments.filter(a => typeof a === 'string');
       state.runs.push(item);
       state.queues[queueId] ||= { paused: false };
+      // A queue the user merely stopped resumes when they send again; failures still need an explicit resume.
+      if (state.queues[queueId].paused && state.queues[queueId].reason === 'stopped') state.queues[queueId] = { paused: false };
       state.messages.push(this._message(item, 'user', input.text));
       return item;
     });
     this._kick(projectId, run.queueId);
+    return run;
+  }
+
+  // Deliver a message into the turn that is executing right now instead of queueing it.
+  // Returns null when nothing is executing here, so the caller queues it normally.
+  async _steer(projectId, input) {
+    if (!input.sessionId || typeof input.text !== 'string' || !input.text.trim() || !input.requestId || input.attachments?.length) return null;
+    if (this.steered?.has(input.requestId)) return this.steered.get(input.requestId);
+    const state = await this.store.read(projectId);
+    const current = state.runs.find(r => r.sessionId === input.sessionId && active(r.status) && r.hostId === this.hostId);
+    if (!current || !this.runner.steer || parseCommand(input.text)) return null;
+    if (current.profileId !== input.profileId || current.model !== input.model) throw error('This conversation is fixed to its machine, account and model. Create a new conversation to change them.', 409);
+    try { await this.runner.steer(this._sessionKey(projectId, current), input.text); }
+    catch (e) { if (noActiveTurn(e)) return null; throw e; }
+    const result = { ...current, steered: true };
+    (this.steered ||= new Map()).set(input.requestId, result);
+    if (this.steered.size > 500) this.steered.delete(this.steered.keys().next().value);
+    return result;
+  }
+
+  // /clear: forget the native session so the next message starts a fresh one. Shared history
+  // files are untouched; the agent re-reads them on demand like any new conversation.
+  async _clear(projectId, input) {
+    const run = await this.store.mutate(projectId, 'session.cleared', state => {
+      if (inactive(state.project) || input.sessionId && inactive(state.sessions.find(s=>s.id===input.sessionId))) throw error('项目或对话已归档／删除，请先恢复',409);
+      if (!input.requestId || typeof input.requestId !== 'string') throw error('requestId is required');
+      const existing = state.runs.find(r => r.requestId === input.requestId);
+      if (existing) return existing;
+      if (!input.sessionId || !state.sessions.some(s => s.id === input.sessionId)) throw error('Session not found', 404);
+      if (!input.profileId || !input.model) throw error('Agent and model are required');
+      const bound = sessionBinding(state, input.sessionId);
+      if (bound.hostId && bound.hostId !== this.hostId || bound.profileId && bound.profileId !== input.profileId) throw error('This conversation is fixed to its machine, account and model. Create a new conversation to change them.', 409);
+      const queueId = `session:${input.sessionId}`;
+      if (state.runs.some(r => r.queueId === queueId && (active(r.status) || r.status === 'queued'))) throw error('请先停止当前执行，再清空上下文', 409);
+      const stamp = now();
+      const item = { id: randomUUID(), requestId: input.requestId, queueId, sessionId: input.sessionId, text: input.text, command: { name: 'clear', args: '' }, profileId: input.profileId, model: input.model, hostId: this.hostId, status: 'succeeded', createdAt: stamp, startedAt: stamp, endedAt: stamp };
+      delete state.nativeSessions[mappingKey(this.hostId, item)];
+      state.runs.push(item);
+      state.messages.push(this._message(item, 'user', input.text), { ...this._message(item, 'system', 'Context cleared. The next message starts a new native session.'), kind: 'status' });
+      return item;
+    });
+    await this.runner.release?.(this._sessionKey(projectId, run));
     return run;
   }
 
@@ -217,22 +282,25 @@ export class QueueManager {
       if (!run) return;
       const state = await this.store.read(projectId);
       const nativeSessionId = state.nativeSessions[mappingKey(this.hostId, run)];
-      const {prompt, metadata} = buildContext(state, run, nativeSessionId, this.hostId);
+      // Slash commands go to the CLI verbatim: no platform prompt, no attachment notes.
+      const {prompt, metadata} = run.command ? {prompt: run.text, metadata: {version:1, mode:'command', promptChars: run.text.length}} : buildContext(state, run, nativeSessionId, this.hostId);
       const previousUsage = state.runs.findLast(r => r.id !== run.id && r.hostId === this.hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.usage?.sessionTotal)?.usage?.sessionTotal;
       await this.store.mutate(projectId, 'run.context', s => { s.runs.find(r => r.id === runId).context = metadata; });
       this.live.set(runId, live);
       // Runners emit without awaiting. The returned promise settles when the event is durable.
       const onEvent = event => {
-        if (this.closed || controller.signal.aborted || !['text', 'tool', 'status', 'reply'].includes(event?.type)) return Promise.resolve();
+        if (this.closed || controller.signal.aborted || !['text', 'tool', 'status', 'reply', 'steer'].includes(event?.type)) return Promise.resolve();
         const text = typeof event.text === 'string' ? event.text : '';
-        if (event.type === 'text' && !text) return Promise.resolve();
+        if ((event.type === 'text' || event.type === 'steer') && !text) return Promise.resolve();
         const item = { type: event.type, text, raw: event.raw, seq: ++live.seq, at: now() };
         if (event.type !== 'text') item.id = randomUUID();
+        if (event.type === 'steer') item.assistantId = randomUUID();
         live.events.push(item); live.chars += text.length;
         live.next ||= deferred();
         const durable = live.next.promise;
-        // Native session identity must survive a crash, so it is committed at once.
-        if (event.type === 'reply' || event.type === 'status' && event.raw || live.chars > this.outputBufferChars) commit();
+        // Native session identity must survive a crash, so it is committed at once; so is a
+        // steered user message, which the sender expects to see in the conversation right away.
+        if (event.type === 'reply' || event.type === 'steer' || event.type === 'status' && event.raw || live.chars > this.outputBufferChars) commit();
         else live.timer ||= setTimeout(commit, this.outputCommitMs);
         this._liveNotify(projectId);
         return durable;
@@ -241,15 +309,19 @@ export class QueueManager {
         await commit();
         return this.approvals.request(projectId,runId,request,AbortSignal.any([controller.signal,requestSignal]));
       };
-      const result = await this.runner.execute({ cwd: state.project.path, prompt, profileId: run.profileId, model: run.model, reasoningEffort: run.reasoningEffort, permissionMode: run.permissionMode ?? 'auto', nativeSessionId, previousUsage, sessionKey:`${projectId}:${run.queueId}:${run.profileId}:${this.hostId}`, onEvent, onApproval, signal: controller.signal });
+      const result = await this.runner.execute({ cwd: state.project.path, prompt, profileId: run.profileId, model: run.model, reasoningEffort: run.reasoningEffort, permissionMode: run.permissionMode ?? 'auto', nativeSessionId, previousUsage, sessionKey: this._sessionKey(projectId, run), command: run.command, onEvent, onApproval, signal: controller.signal });
       await commit();
       await this.store.mutate(projectId, 'run.finished', s => {
         const item = s.runs.find(r => r.id === runId);
         if (item.status !== 'running') return;
+        let stopped = false;
         if (item.hostId !== this.hostId) {
           item.status = 'interrupted'; item.error = 'Project ownership changed during execution';
         } else if (this.closed || controller.signal.aborted) {
           item.status = this.closed ? 'interrupted' : 'cancelled';
+        } else if (result.status === 'interrupted') {
+          // Stopped by the user; the native session is intact and later messages continue it.
+          item.status = 'cancelled'; stopped = true;
         } else if (result.status === 'waiting') {
           item.status = 'waiting'; item.error = scrub(result.error || 'CLI requires user input or approval; cancel this run and submit a continuation after completing the required action.');
         } else if (result.error) {
@@ -258,14 +330,22 @@ export class QueueManager {
         rememberNative(s, item, this.hostId, result);
         if (result.usage) item.usage = result.usage;
         if (result.runtime) item.nativeRuntime = result.runtime;
-        let message = s.messages.find(m => m.runId === runId && m.role === 'assistant' && m.kind !== 'background_reply');
+        // The final text replaces the last streamed segment (the one after the latest steer).
+        const message = s.messages.filter(m => m.runId === runId && m.role === 'assistant' && m.kind !== 'background_reply').at(-1);
         if (result.text) {
           if (message) { if (message.text !== scrub(result.text)) message.progressText = message.text; message.text = scrub(result.text); }
           else s.messages.push(this._message(item, 'assistant', result.text));
         }
         if (item.status !== 'waiting') item.endedAt = now();
-        if (item.status !== 'succeeded') s.queues[item.queueId] = { paused: true, reason: item.error || item.status };
-        s.messages.push(this._message(item, 'system', item.status === 'succeeded' ? '处理完成。' : item.error || item.status));
+        if (stopped) {
+          // Hold later queued messages until the user decides; a plain stop needs no resume click.
+          const pending = s.runs.some(r => r.queueId === item.queueId && r.status === 'queued');
+          s.queues[item.queueId] = pending ? { paused: true, reason: 'stopped' } : { paused: false };
+          s.messages.push({ ...this._message(item, 'system', 'Stopped.'), kind: 'status' });
+        } else {
+          if (item.status !== 'succeeded') s.queues[item.queueId] = { paused: true, reason: item.error || item.status };
+          s.messages.push(this._message(item, 'system', item.status === 'succeeded' ? '处理完成。' : item.error || item.status));
+        }
       });
       this.titles.schedule(projectId, runId);
     } catch (e) {
@@ -273,12 +353,34 @@ export class QueueManager {
       await this.store.mutate(projectId, 'run.failed', s => {
         const run = s.runs.find(r => r.id === runId);
         if (!run || !active(run.status)) return;
-        run.status = this.closed ? 'interrupted' : controller.signal.aborted ? 'cancelled' : 'failed';
+        run.status = this.closed ? 'interrupted' : controller.signal.aborted || e.name === 'AbortError' ? 'cancelled' : 'failed';
         run.error = scrub(e.message); run.endedAt = now();
         s.queues[run.queueId] = { paused: true, reason: run.error };
         s.messages.push(this._message(run, 'system', run.error));
       });
     } finally { clearTimeout(live.timer); live.timer = undefined; this.live.delete(runId); this.controllers.delete(runId); await this.approvals.expire(projectId,runId); }
+  }
+
+  // Stop like Esc in the CLIs: the current turn ends, the process and native session stay.
+  // A queued message is simply withdrawn. Without a resident turn to interrupt (older
+  // transport, boot in progress) this falls back to the hard cancel.
+  async interrupt(projectId, runId) {
+    const state = await this.store.read(projectId);
+    const run = state.runs.find(r => r.id === runId);
+    if (!run) throw error('Run not found', 404);
+    this._assertRun(run);
+    if (run.status === 'queued') {
+      return this.store.mutate(projectId, 'run.cancelled', s => {
+        const item = s.runs.find(r => r.id === runId);
+        if (item.status === 'queued') { item.status = 'cancelled'; item.endedAt = now(); s.messages.push({ ...this._message(item, 'system', 'Queued message withdrawn.'), kind: 'status' }); }
+        return item;
+      });
+    }
+    if (!active(run.status)) return run;
+    if (!this.runner.interrupt) return this.cancel(projectId, runId);
+    try { await this.runner.interrupt(this._sessionKey(projectId, run)); }
+    catch (e) { if (!noActiveTurn(e)) throw e; return this.cancel(projectId, runId); }
+    return run;
   }
 
   async cancel(projectId, runId) {

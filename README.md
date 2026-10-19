@@ -1,163 +1,292 @@
 # Studiolo
 
-Self-hosted, multi-machine workbench for CLI coding agents. It drives the `claude` and `codex` CLIs that are already logged in on your computers (no API keys), keeps every project's conversation history as a synchronized journal that each machine serves as a peer (no central server), runs the web apps your agents build as "Artifacts" with persistent backends, and lets you comment on page content directly in the preview so an agent picks the comment up as a task. Interface in Chinese and English. Node.js 22.14+, zero npm dependencies.
+### One workbench for every coding-agent CLI you pay for, on every machine you own.
 
-个人自托管 AI 工作台。通过本机已登录的 `claude`、`claude1`、`claude2`、`codex` CLI 工作（不需要 API key）；每个项目的对话记录以事务日志保存在项目目录里，随 Syncthing 等文件同步工具到达每台电脑，每台电脑各自运行一个对等服务；可运行带后端和持久数据的网页 Artifact，并在预览里对网页内容发送批注，交给 agent 执行。
+**Chat with Claude Code and Codex from a browser, with the accounts, machines and project history shared across your computers.**
 
-## 它和"又一个 CLI 网页界面"的区别
+[![Node.js ≥ 22.14](https://img.shields.io/badge/node-%E2%89%A5%2022.14-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![Zero npm dependencies](https://img.shields.io/badge/npm%20dependencies-0-blue)](package.json)
+[![Tests](https://img.shields.io/badge/tests-node%20--test-6f42c1)](test)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-- **无中心的多机架构**：每台电脑运行同一个服务，项目目录（含 `.studio/` 对话记录）通过 Syncthing 同步。历史是不可变事务日志，离线修改可确定性合并；在线服务器之间还会直接交换日志加速同步。任何一台电脑都能查看全部对话，执行始终在对话绑定的那台电脑上进行。
-- **用自己的 CLI 订阅**：所有请求走本机 CLI 进程，凭据由各 CLI 自己管理；支持多个 Claude 账号（独立配置目录）和 Codex 并行，并按账号显示额度。
-- **Artifact 工作流**：agent 生成的静态网页或带 Node 后端的应用直接登记、在隔离端口预览、localStorage 自动落盘并随项目同步，支持数据快照与恢复。
-- **页面内批注**：在预览里选取元素、文字或 Canvas 区域，带证据发出评论，进入该 Artifact 的 agent 队列顺序执行；批注历史跨机共享。
-- **网页端批准**：原生 CLI 需要人工批准时，在网页里批准或拒绝并继续同一次执行。
+**English** · [中文](#中文) · [Quick start](#quick-start) · [Accounts](#accounts-and-sign-in) · [Chat like the CLI](#chat-like-the-cli) · [Multi-machine](#multi-machine) · [Artifacts](#artifacts-and-in-page-comments) · [FAQ](#faq)
 
-## 启动
+![Studiolo: a conversation with a Claude account on the local workstation, account usage on the left, project files and Artifacts on the right](docs/screenshot.png)
 
-需要 Node.js **22.14 或更高版本**，以及已在当前电脑登录的 CLI。没有必须安装的 npm 依赖。
+> The screenshot is a synthetic demo: fictional accounts, scripted replies.
+
+---
+
+## Install with a coding agent
+
+Paste this into Claude Code, Codex or any coding agent that can run commands on the machine you want to use:
+
+```text
+Install Studiolo from <REPO_URL>: clone the repository, make sure Node.js 22.14+ is available and that the `claude` and/or `codex` CLIs are installed, run `node src/server.mjs` from the repository root, confirm http://127.0.0.1:4310 answers, then tell me to open Settings → Hosts & accounts to sign in my accounts. Do not sign anything in yourself.
+```
+
+Or by hand:
 
 ```sh
-node src/server.mjs
+git clone <REPO_URL> studiolo && cd studiolo
+node src/server.mjs        # http://127.0.0.1:4310
 ```
 
-打开 <http://127.0.0.1:4310>。4311 保留为预览入口；每个 Artifact 分配独立、持久的预览端口。按 Ctrl+C 停止平台及其子进程；活动任务标记中断，不自动重放。测试：`node --test test/*.test.mjs`。
+Studiolo has no npm dependencies; `npm install` is not needed. Tests: `node --test test/*.test.mjs`.
 
-支持的环境变量：`STUDIO_STATE_DIR`（机器私有状态目录，默认 `~/.studio-local`）、`STUDIO_BIND`、`STUDIO_PORT`、`STUDIO_PREVIEW_PORT`、`STUDIO_TOKEN`、`STUDIO_UPLOAD_LIMIT`（单文件上传上限，字节，默认 100 MB）。每个 stateDir 仅运行一个服务。
+---
 
-## CLI 账号与模型
+## What it is
 
-服务固定提供四个入口：`claude`、`claude1`、`claude2`、`codex`。`claude` 和 `codex` 直接使用 PATH 上的同名可执行文件；`claude1`、`claude2` 是同一个 `claude` 可执行文件配合独立的配置目录（默认 `~/.claude1`、`~/.claude2`，通过 `CLAUDE_CONFIG_DIR` 传入），用于登录第二、第三个 Claude 账号。找不到可执行文件的入口会在界面里标为不可用，不影响其他入口。
+Studiolo is a self-hosted web workbench that drives the **Claude Code** and **Codex** CLIs already installed on your computers. It is not another chat UI over an API key:
 
-在 `STUDIO_STATE_DIR/agent-profiles.json` 中可以按入口覆盖设置，这个文件只属于本机，不要放进同步目录：
+- **Your subscriptions, your CLIs.** Every request runs through the real `claude` or `codex` process — same tools, skills, MCP servers, permission modes and agent behaviour as the terminal. Subscription sign-in or API key, your choice per account.
+- **Accounts per machine, managed by Studiolo.** Sign in several Claude and Codex accounts on each computer from the browser. Each account gets its own isolated CLI configuration directory; nothing touches your personal `~/.claude` or `~/.codex`. Quota for every account is shown live.
+- **One project history across machines.** Projects live in a folder you synchronize however you like (Syncthing, for example). Conversation history is an append-only journal that merges deterministically; every machine runs the same server and serves the same history. A conversation executes on the machine you chose for it; you can read and continue it from any of them.
+- **The terminal experience, in the browser.** Stop a turn with Esc, steer a running agent with a follow-up message, type `/` for the CLI's own slash commands — all mapped to the native protocols, not re-implemented.
+- **Artifacts and in-page comments.** Web apps the agents build run as Artifacts with persistent backends and synchronized storage; select something in the preview and send it to an agent as a task.
 
-```json
-{
-  "claude": { "command": "/opt/homebrew/bin/claude", "label": "Claude 主账号" },
-  "claude1": { "configDir": "/Users/me/.claude-work" },
-  "claude2": { "models": [] },
-  "codex": {
-    "command": "codex",
-    "args": [],
-    "env": { "CODEX_HOME": "/Users/me/.codex" },
-    "models": [{ "id": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "efforts": ["low", "medium", "high"], "defaultEffort": "medium" }]
-  }
-}
-```
+---
 
-字段：`command`（可执行文件名或绝对路径）、`args`（附加参数数组）、`env`（附加环境变量）、`configDir`（仅 `claude1`、`claude2`）、`models`（允许的模型列表，`[]` 表示禁用该入口）、`label`（界面显示名）。Codex 未覆盖 `models` 时读取 `~/.codex/models_cache.json` 中的可见模型；`claude1`、`claude2` 只能使用内置 Claude 模型列表。文件修改后立即生效，不需要重启。
+## Quick start
 
-## 使用
+1. **Prerequisites** — Node.js 22.14+, and the `claude` and/or `codex` CLI installed on the machine (`claude --version`, `codex --version`).
+2. **Run** `node src/server.mjs` and open <http://127.0.0.1:4310>.
+3. **Add accounts** — Settings → *Hosts & accounts* → *Add account*. Pick the machine, the type (Claude Code / Codex) and the sign-in method, then follow the steps shown (see below).
+4. **Create a project, start a conversation** — the composer picks **machine → account → model → effort → permission mode**. The first message fixes machine, account and model for that conversation; effort and permissions can change per message.
 
-点击顶部「＋ 新建项目」，填写名称；点击项目旁的 `+` 直接创建会话。新对话首条消息选择执行电脑、CLI 账号和模型，提交后这三项固定；同一项目的不同对话可以在不同电脑同时执行。reasoning effort 和权限可逐条调整。默认"自动审核"显式启用 Claude auto 或 Codex auto_review；不会永久修改原生 CLI 配置。原生 CLI 需要人工批准时，聊天和 Artifact 页面显示具体操作，可"批准本次／拒绝"并继续同一次执行。
+Environment variables: `STUDIO_STATE_DIR` (machine-private state, default `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (bytes, default 100 MB). One server per state directory.
 
-左下角「账号额度」显示当前服务电脑上的四个 CLI 账号：Claude1／Claude2 显示五小时剩余额度，Claude／Codex 显示周剩余额度。点击 ↻ 重新读取；点击「详细 Usage」查看所有账号的额度窗口、重置时间、套餐、额外额度和可用重置次数（以账号实际返回为准）。页面首次打开读取一次，普通读取缓存 60 秒，手动刷新最短间隔 5 秒；不轮询、不发送模型消息。通过 Claude 原生 `get_usage` 和 Codex `account/rateLimits/read` 查询，凭据仍由各 CLI 管理。查询失败保留带时间戳的旧数据或显示不可用。旧版 CLI 若不支持该查询，需要升级对应 CLI。
+---
 
-项目固定保存在平台目录的 `projects/<项目ID>/` 下，创建时自动建文件夹，不接受自定义路径。代码、Artifact、持久数据与 `.studio/` 对话记录一起通过你的文件同步目录同步。服务启动和运行期间会自动发现这些项目；每台电脑根据自己的平台目录计算路径，不需要手动关联。机器身份、主机配对令牌和 CLI 登录仍只保存在本机，不随项目同步。
+## Accounts and sign-in
 
-聊天窗口和「项目资源」栏都支持上传文件：点击输入框旁的 📎 或资源栏的「＋ 上传文件」选择文件，或直接从系统文件管理器拖放到聊天区域或资源栏。所有上传统一保存到项目的 `uploads/` 文件夹，同名文件自动加 ` (2)`、` (3)` 后缀而不覆盖已有文件，文件名只保留最后一段并去掉 Windows 与 Syncthing 不能存储的字符；不支持上传文件夹。拖放或通过 📎 添加到聊天的文件先上传，再以附件标签显示在输入框上方，随本条消息一起发送；agent 在本次请求的提示词中收到这些文件的项目相对路径，消息记录和 `.studio/sessions/*.md` 也保留附件列表。附件保存在当前浏览器所连接的服务器上；若对话绑定在另一台电脑执行，agent 需要等待文件同步送达（提示词中已说明）。
+Accounts belong to a machine and are created from the browser. Each account is a directory under `~/.studio-local/accounts/<id>/`, used as `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, so several accounts of one CLI coexist and your terminal's own sign-in is never touched. When an account is created, Studiolo seeds that directory from your default CLI directory — it copies `settings.json` / `CLAUDE.md` (Codex: `config.toml` / `AGENTS.md`) and links `skills`, `plugins` and friends — so agents keep the skills and MCP servers you already use. Credentials are never copied.
 
-新会话首轮回复成功后，会用该轮选定的 CLI 账号和模型单独生成一句简短标题，消耗少量额度；生成在后台进行，不占用会话队列，不添加隐藏会话消息。生成失败或超时则使用首条消息的简短摘录。对话旁的 `⋯` →「重命名」可保存 1–120 字符的自定义标题，手动名称不会被自动标题覆盖；名称同步显示在侧栏、聊天顶部和历史导出中。
+| Type | Method | What happens |
+| --- | --- | --- |
+| Claude Code | **Subscription** | Studiolo runs `claude auth login`; you open the link, sign in, paste the authorization code back into the page. |
+| Claude Code | **Anthropic API key** | The key is stored in the account directory (mode 0600) and passed as `ANTHROPIC_API_KEY`; verified through the CLI handshake, dropped if rejected. Pay-as-you-go, no quota windows. |
+| Codex | **ChatGPT** | Device code via the Codex app-server: the page shows a link and a one-time code; sign in from any browser, the page updates when done. |
+| Codex | **OpenAI API key** | Stored by Codex itself in the account's `CODEX_HOME`. |
 
-## Tailscale 与其他电脑
+After sign-in Studiolo reads the account's identity (e-mail, plan) and model list straight from the CLI — no model request is spent — and, for Claude, the CLI's slash commands for the composer's autocomplete. An account without a custom name is renamed to its e-mail, so the composer, the conversation header, every reply and the usage panel say who is talking. Accounts can be renamed, refreshed, signed out (`claude auth logout` / `codex logout`) or removed; a conversation whose account was removed may continue with another account on the same machine.
 
-本机可启用持久的 Tailscale Serve 转发：在机器私有的 `STUDIO_STATE_DIR` 保存 `tailnet.json`，内容为 `{"enabled":true,"command":"tailscale"}`，并在同目录 `access-token.txt` 保存至少 32 字符的随机访问令牌。Windows 可将 command 设为 Tailscale 可执行文件的绝对路径。这两个文件不要放进同步目录。
+The usage panel (bottom left) follows the machine chosen in the composer: Claude subscriptions show the 5-hour window, Codex the weekly one, API-key accounts are billed by usage. It reads the CLIs' own usage endpoints (`get_usage`, `account/rateLimits/read`), caches for 60 s, never polls and never starts a CLI for a signed-out account.
 
-启用后正常运行 `node src/server.mjs` 即可：服务仍只监听回环地址，启动时自动检查并建立主页面端口的 `tailscale serve --bg --tcp` 转发；每个 Artifact 启动时也自动转发其独立预览端口。已有端口转发必须指向本服务，否则报错，不覆盖其他服务，也不启用 Funnel。用 `http://<本机 Tailscale 名称或 IP>:4310` 访问，首次在网页登录上述访问令牌。聊天、SSE 实时输出、权限批准、文件、额度和 Artifact 使用相同接口；浏览器不需安装 CLI。Tailscale 必须已登录并在线，访问设备也需获 tailnet 策略允许。Serve 的后台配置可跨 Tailscale 重启保留；这不等于自动启动 Studio 本身。
+All of this works for remote machines too: pick another online host in *Hosts & accounts* and the requests are relayed to it.
 
-如果整个 tailnet 都可信，可在 `tailnet.json` 中设置 `"trustTailnet":true`。此模式不需要访问令牌，允许本机及发往本机 Tailscale IP／名称的内网转发连接；监听必须保持 `127.0.0.1`，未知 Host 仍被拒绝，跨站操作仍检查 Origin，不开启公网 Funnel。启动时从本机 Tailscale 状态读取允许的地址，需要 Tailscale 已连接。
+---
 
-不使用 Serve 时也可以直接监听 Tailscale 地址。每台执行电脑分别安装 Node 和需要使用的 CLI，完成该机登录，保留独立的 `STUDIO_STATE_DIR`，以该机的 Tailscale IPv4 地址绑定服务，并设一个自己生成的长随机访问令牌：
+## Chat like the CLI
 
-```sh
-export STUDIO_BIND='你的 Tailscale IPv4 地址'
-export STUDIO_TOKEN='你生成的长随机令牌'
-node src/server.mjs
-```
+Each conversation owns a resident native process — Claude Code over bidirectional `stream-json`, Codex over `app-server` — so the agent behaves exactly as in the terminal. The web controls map onto the native protocols:
 
-Windows PowerShell 用 `$env:STUDIO_BIND` 和 `$env:STUDIO_TOKEN`。从电脑或手机打开 `http://该机Tailscale地址:4310`，输入令牌。预览需要浏览器能访问执行机上每个 Artifact 的独立端口；端口保存在机器私有的 `preview-ports.json`，状态 API 的 `previewPort` 也会返回它。防火墙规则应限定在自己的 Tailscale 网络，包含管理端口和所需预览端口。无需公开互联网入口。当前使用直接 HTTP over Tailscale，未验收反向代理的 HTTPS 配置。跨主机 HTTP iframe 若被浏览器的第三方 Cookie 规则拦截，可用"在执行电脑打开"进入该机工作台登录后预览。
+| In the terminal | In Studiolo | How |
+| --- | --- | --- |
+| Esc to stop | **■ Stop** or Esc in the composer | Claude `interrupt` control request / Codex `turn/interrupt`. The process and native session survive; the partial reply is kept; later messages continue the same session. |
+| Type while the agent works | Send while a turn runs = **Steer** | Claude reads it at the next tool boundary; Codex `turn/steer`. Shown as *You · steer*; the reply continues in a new segment. **Queue** sends after the turn instead. |
+| `/compact`, `/context`, custom commands, skills | Type `/` for the command list | Claude commands pass through verbatim (the list comes from the CLI itself). Codex has no text commands; `/compact`, `/review`, `/skills`, `/mcp` are mapped to app-server requests. |
+| — | `/model`, `/effort`, `/mode`, `/rename`, `/new`, `/status`, `/clear`, `/stop`, `/help` | Platform commands handled in the browser or by the queue. |
 
-可信 Tailscale 服务器会通过 `projects/.servers/` 中的公共地址自动发现彼此；不在该目录保存令牌。也可在「设置」中手动配对地址；采用令牌认证时填写令牌，可信 Tailscale 模式可留空。同一个 `projects/` 同步到各电脑后会自动登记，项目稳定 ID 会复用；Windows 与 Mac 的平台绝对路径可以不同。项目没有独占执行机。每台服务器读取同一份项目历史，并通过在线服务器之间的事务交换加速同步。下拉框只列出在线且协议兼容的服务器；已有对话的执行机离线时历史仍可阅读，但不能改绑或执行。新建对话可以选择另一台在线电脑。
+Permission requests that the CLI would ask in the terminal appear in the page: approve this once or deny, and the same execution continues. Auto mode is the CLI's own (Claude `auto`, Codex `auto_review`); Studiolo never adds bypass flags or permanent allow rules. Reasoning effort and model can change per message within a conversation (Claude `set_model` / `apply_flag_settings`, Codex `turn/start` parameters).
 
-原生 CLI 会话始终在绑定机器上继续；不会自动迁移进程或私有 CLI 文件。旧对话根据最后一次执行记录保留原来的机器、账号和模型。手机仅作为浏览器访问在线电脑。
+---
 
-## 开机自启与升级
+## Multi-machine
 
-**macOS**：运行 `node scripts/install-studio-macos.mjs` 安装当前用户登录启动服务，并立即启动。需要已连接的 Tailscale 和已登录的 CLI。机器配置保存在 `~/.studio-local`；LaunchAgent 为 `~/Library/LaunchAgents/net.studio-local.server.plist`。日志在 `~/.studio-local/server.stdout.log` 和 `server.stderr.log`。Tailscale 暂未就绪时，launchd 间隔重试。重启：`launchctl kickstart -k gui/$(id -u)/net.studio-local.server`。
+Run the same server on every computer; put `projects/` in a folder you synchronize (Syncthing or any file sync). Each project's `.studio/events/` is an immutable, causally-ordered journal; machines that are online also exchange journals directly so changes appear within seconds. Any machine can show every conversation; execution always happens on the machine the conversation is bound to, and native CLI sessions never migrate.
 
-**Windows**：`scripts/start-studio-windows.ps1` 是适合注册为任务计划程序的启动脚本：以当前用户、非管理员身份隐藏运行，使用文件锁并检查已有 4310 服务，不会重复拉起；日志在 `~/.studio-local/autostart.log` 和 `server-*.stdout.log` / `server-*.stderr.log`。建议的任务设置：用户登录后延迟约 30 秒触发、禁止重复实例、失败每分钟重试、不设运行时长限制。平台目录移动后需更新任务路径。`scripts/restart-studio-windows.ps1` 会先确认没有活动任务，再通过该计划任务重启服务。
+**Reaching other machines.** The simplest secure setup is [Tailscale](https://tailscale.com): put `tailnet.json` (`{"enabled":true,"command":"tailscale"}`) and a random `access-token.txt` (≥ 32 chars) in the state directory, start normally, and Studiolo publishes its port with `tailscale serve`; open `http://<machine>:4310` and enter the token once. With `"trustTailnet":true` the token is skipped for tailnet traffic. Without Tailscale, bind to a private address with `STUDIO_BIND` and set `STUDIO_TOKEN`. Servers discover each other through `projects/.servers/` or by manual pairing in Settings.
 
-**多服务器升级**：等待代码同步到各电脑，确认没有活动任务后重启对应服务。`/api/identity` 应返回 `protocol: 2`；服务器选择器不会列出仍运行旧协议的进程。`public/` 下的前端文件按请求从磁盘读取，同步完成即生效；`src/` 的改动需要重启。
+**Autostart.** macOS: `node scripts/install-studio-macos.mjs` installs a LaunchAgent (`net.studio-local.server`). Windows: register `scripts/start-studio-windows.ps1` as a Task Scheduler task (action `conhost.exe --headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>`, run at logon, no duplicate instances, retry every minute); `scripts/restart-studio-windows.ps1` restarts it after an upgrade once no runs are active.
 
-## 多服务器行为
+**Upgrading.** Front-end files under `public/` are read per request and take effect as soon as they sync; changes under `src/` need a restart on every machine.
 
-每个服务器地址展示共同的项目、对话和 Artifact 列表，手动登记和清单登记的 Artifact 都使用同步的项目记录。清单先到、页面目录后到时仍展示 Artifact；启动前显示等待同步，同步完成后直接启动，无需重新登记。Artifact 的启动、停止、预览和数据快照在当前浏览器地址所指向的服务器执行。批注历史共享，批注执行队列按 Artifact 和服务电脑分别排队。批注和回复固定由当前 Artifact 网页服务器上的 CLI 执行。
+---
 
-历史同步不等于通用文件数据库合并：代码和 Artifact 数据仍由文件同步工具同步。两个 agent 同时修改同一个普通文件，或两个 Artifact 后端同时写同一数据库，仍需应用自身的并发/复制机制；平台不会合并数据库内部事务。新服务器首次使用项目须先完成项目文件的同步。已有但尚未发送的草稿对话由创建服务器协调首次绑定；该服务器离线时可在在线服务器新建对话。
+## Artifacts and in-page comments
 
-## Artifact 与批注
-
-请求 agent 生成网页时，它会收到 `studio.artifacts.json` 清单格式说明。项目根目录清单示例：
+Ask an agent for a web page or app and it maintains `studio.artifacts.json` at the project root:
 
 ```json
 {
   "artifacts": [
-    {
-      "key": "game",
-      "name": "点击目标",
-      "root": "game",
-      "entry": "index.html",
-      "command": ["node", "server.mjs"],
-      "port": 4320,
-      "dataPaths": ["game/data"]
-    }
+    { "key": "game", "name": "Click the target", "root": "game", "entry": "index.html",
+      "command": ["node", "server.mjs"], "port": 4320, "dataPaths": ["game/data"] }
   ]
 }
 ```
 
-静态 HTML 省略 command、port、dataPaths。静态页面以及后端 HTML 在 Studio 预览里使用的 localStorage 自动保存到项目 `.studio/artifact-storage/<ArtifactID>/`；不需要为该存档添加 dataPaths。首次打开会导入这个浏览器之前的 localStorage，已有共享值和已删除键不会被旧值覆盖。独立存档记录随项目同步，双方修改不同键可以合并，同键冲突采用确定性顺序；不是对存档字符串内部的业务合并。页面显示"存档已保存到项目"表示当前服务器已落盘，不表示已同步到另一台。短暂断网时待保存操作留在浏览器并重试，刷新、停止和创建快照会先等待当前预览保存。每个 Artifact 当前存档上限 5 MiB；sessionStorage、IndexedDB、Cookie 和第三方服务数据不自动同步。后端持久数据必须使用项目内相同的相对路径，避免主机名、用户目录或临时目录；普通数据库仍需停写后等待同步再换机运行。root 相对于项目目录；command 是直接执行的 argv 数组，工作目录为 root，不经过 shell。后端使用环境变量 PORT 和 HOST（127.0.0.1）。dataPaths 相对于**项目目录**，应覆盖完整数据库文件及相关日志目录。示例在 `examples/persistent-game/`：真实 Node 后端、SQLite 存档、Canvas 游戏。
+Static pages omit `command`, `port` and `dataPaths`. Each Artifact gets its own persistent preview port and origin; the preview's `localStorage` is persisted into the project and synchronized, so a game saved on one machine continues on another. Backends run as plain local processes (not a sandbox) with `PORT` and `HOST`; **Snapshot** stops the backend and copies the declared data paths, **Restore** puts them back.
 
-清单保存后，项目刷新会自动登记或更新链接；稳定 key 保持 Artifact ID 和批注。删除清单条目不会删除已有 Artifact 或讨论。也可从右侧手动登记。点击链接后，在 Artifact 页启动应用。
+In the preview, *select an element, text or a canvas region* and write a comment: it becomes a task for the agent you pick, with the selection as evidence (DOM path, quoted text or a PNG of the canvas). Comments on one Artifact run in order; different Artifacts and conversations run in parallel. See `examples/persistent-game/` (Node backend + SQLite + Canvas) and `examples/artifact-compatibility/`.
 
-"选取内容／文字／框选区域"产生批注证据，按 Escape 退出选取。支持 HTML 元素、SVG、开放 Shadow DOM、文字引用与 Canvas 区域；正常浏览模式保留页面自身交互。Canvas 可导出时附 PNG，保存到项目 `.studio/attachments/`，agent 获得实际图片路径。评论选择 agent 后单条入队；同一 Artifact 的评论顺序执行，不同会话和 Artifact 可以并行。完成不自动解决批注；点击"解决"才结束。定位失败的内容保留在"位置失效"筛选中。
+---
 
-预览保留页面的 DOCTYPE、原有 base、相对链接和根路径资源；支持 ES modules、多页面及静态 SPA 路由刷新。选取控件使用独立 Shadow DOM，与页面样式分离。多标签页共用实时更新连接；不支持 SharedWorker 的浏览器定时同步。兼容样例在 `examples/artifact-compatibility/`。
+## Files and configuration
 
-"数据快照"会停止后端并复制声明的数据路径，同时保存平台托管的 localStorage；纯静态 Artifact 也可创建和恢复存档快照。恢复保留替换前的 `.before-restore-*` 副本，应用保持停止，需重新启动。迁移前先创建快照并等同步完成；异常离线时优先恢复最后一个完整快照，不把仍在写入的数据库副本当作一致备份。当前进程停止以进程树终止为边界，复制完整数据目录；SQLite 恢复已验证，其他数据库需采用该数据库支持的备份／恢复方式。
+| Location | Contents |
+| --- | --- |
+| `projects/<id>/` | Project working directory: code, Artifacts, data (synchronized) |
+| `projects/<id>/.studio/events/` | Authoritative, immutable conversation journal |
+| `projects/<id>/.studio/state.json`, `history-index.md`, `sessions/`, `artifacts/` | Rebuildable state and readable history for agents |
+| `projects/<id>/.studio/artifact-storage/`, `snapshots/`, `attachments/` | Synced preview storage, data snapshots, comment evidence |
+| `projects/<id>/uploads/` | Files dropped into the chat or the resource pane |
+| `projects/.servers/` | Public addresses of servers for discovery (no secrets) |
+| `~/.studio-local/` | Machine-private: identity, `accounts.json`, `accounts/<id>/`, pairing, Tailscale settings — never synchronize |
+| `~/.studio-local/agent-profiles.json` | Optional: executable path / env per CLI family (`claude`, `codex`) or per account id |
+
+---
+
+## FAQ
+
+**Does it use my API key?** Only if you add an API-key account. Subscription accounts run through the CLIs' own sign-in; Studiolo stores no credentials of its own.
+
+**Will my terminal `claude` / `codex` be affected?** No. Studiolo accounts live in their own directories; `~/.claude` and `~/.codex` are only read once to copy settings and link skills.
+
+**Is this a sandbox?** No. Agents and Artifact backends are your own local processes with your permissions, exactly like the CLIs in a terminal.
+
+**Can I use it from my phone?** Yes, as a browser client over Tailscale; CLIs run on your computers.
+
+**Why zero dependencies?** The server is plain Node.js (ESM, `node:` modules only) so it runs anywhere Node 22 runs and nothing in the supply chain sits between you and your CLIs.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+# 中文
+
+### 把你付费的每一个 coding agent CLI、每一台电脑，放进同一个工作台。
+
+**在浏览器里和 Claude Code、Codex 对话，账号、机器和项目历史在你的所有电脑之间共享。**
+
+[English](#studiolo) · [快速开始](#快速开始) · [账号与登录](#账号与登录) · [像 CLI 一样对话](#像-cli-一样对话) · [多机器](#多机器) · [Artifact 与批注](#artifact-与批注) · [常见问题](#常见问题)
+
+> 上方截图为合成演示：虚构的账号、脚本化的回复。
+
+## 用 coding agent 安装
+
+把这段话发给能在目标机器上执行命令的 Claude Code、Codex 或其他 coding agent：
+
+```text
+从 <REPO_URL> 安装 Studiolo：克隆仓库，确认有 Node.js 22.14+ 和 claude / codex CLI，在仓库根目录运行 `node src/server.mjs`，确认 http://127.0.0.1:4310 能打开，然后提醒我到「设置 → 主机与账号」登录账号。不要替我登录任何账号。
+```
+
+手动安装：
+
+```sh
+git clone <REPO_URL> studiolo && cd studiolo
+node src/server.mjs        # http://127.0.0.1:4310
+```
+
+没有 npm 依赖，不需要 `npm install`。测试：`node --test test/*.test.mjs`。
+
+## 它是什么
+
+Studiolo 是一个自托管的网页工作台，驱动的是你电脑上已经装好的 **Claude Code** 和 **Codex** CLI，不是又一个套 API key 的聊天界面：
+
+- **用你的订阅、你的 CLI。** 每个请求都经过真实的 `claude` 或 `codex` 进程——工具、skills、MCP、权限模式和 agent 行为与终端完全一致。每个账号可选订阅登录或 API key。
+- **账号按机器管理，由 Studiolo 自己登录。** 在浏览器里为每台电脑登录多个 Claude、Codex 账号；每个账号有独立的 CLI 配置目录，绝不碰你个人的 `~/.claude`、`~/.codex`。所有账号的额度实时显示。
+- **一份项目历史，跨机器共享。** 项目放在你自己同步的文件夹里（例如 Syncthing）。对话记录是只追加、可确定性合并的事务日志；每台电脑运行同一个服务、看到同一份历史。对话在你为它选定的机器上执行，在任何一台电脑上都能阅读和继续。
+- **终端体验，在浏览器里。** Esc 停止、执行中插话、输入 `/` 使用 CLI 自己的斜杠命令——全部映射到原生协议，不是重新实现。
+- **Artifact 与页面内批注。** agent 做出的网页应用作为 Artifact 运行，支持持久后端和跨机同步的存档；在预览里选中内容，直接作为任务交给 agent。
+
+## 快速开始
+
+1. **准备**：Node.js 22.14+，以及机器上已安装的 `claude` 和／或 `codex` CLI（`claude --version`、`codex --version`）。
+2. **运行** `node src/server.mjs`，打开 <http://127.0.0.1:4310>。
+3. **添加账号**：设置 → 「主机与账号」→ 「添加账号」。选择机器、类型（Claude Code／Codex）和登录方式，按页面提示完成（见下文）。
+4. **新建项目、开始对话**：输入框依次选择 **机器 → 账号 → 模型 → effort → 权限模式**。首条消息固定该对话的机器、账号和模型；effort 和权限可逐条调整。
+
+环境变量：`STUDIO_STATE_DIR`（机器私有状态目录，默认 `~/.studio-local`）、`STUDIO_BIND`、`STUDIO_PORT`（4310）、`STUDIO_PREVIEW_PORT`（4311）、`STUDIO_TOKEN`、`STUDIO_UPLOAD_LIMIT`（字节，默认 100 MB）。每个状态目录只运行一个服务。
+
+## 账号与登录
+
+账号属于某一台机器，在浏览器里创建。每个账号是 `~/.studio-local/accounts/<id>/` 下的一个目录，作为 `CLAUDE_CONFIG_DIR` 或 `CODEX_HOME` 使用，因此同一个 CLI 可以登录多个账号，而你终端自己的登录完全不受影响。创建账号时，Studiolo 会从默认 CLI 目录继承配置：复制 `settings.json`／`CLAUDE.md`（Codex 为 `config.toml`／`AGENTS.md`），链接 `skills`、`plugins` 等目录，让 agent 保留你已有的 skills 和 MCP 服务器；凭据永远不复制。
+
+| 类型 | 方式 | 流程 |
+| --- | --- | --- |
+| Claude Code | **订阅登录** | Studiolo 运行 `claude auth login`：打开链接登录，把页面显示的授权码粘贴回网页。 |
+| Claude Code | **Anthropic API key** | key 保存在账号目录（0600），运行时以 `ANTHROPIC_API_KEY` 注入；通过 CLI 握手验证，无效即丢弃。按用量计费，没有额度窗口。 |
+| Codex | **ChatGPT 登录** | Codex app-server 设备码：网页显示链接和一次性代码，在任意浏览器完成登录，页面自动更新。 |
+| Codex | **OpenAI API key** | 由 Codex 自己保存在该账号的 `CODEX_HOME`。 |
+
+登录成功后，Studiolo 直接从 CLI 读取账号身份（邮箱、套餐）和模型列表——不消耗任何模型请求——Claude 账号还会读取 CLI 的斜杠命令列表用于输入框补全。没有自定义名称的账号会自动改名为邮箱，于是输入框、对话标题、每条回复的署名和额度面板都能看出是谁在说话。账号可以重命名、刷新、退出登录（`claude auth logout`／`codex logout`）或移除；绑定到已移除账号的对话可以改用同一台机器上的其他账号继续。
+
+左下角额度面板跟随输入框选中的机器：Claude 订阅显示五小时窗口，Codex 显示周窗口，API key 账号按用量计费。它读取 CLI 自己的用量接口（`get_usage`、`account/rateLimits/read`），缓存 60 秒，不轮询，也不会为未登录账号启动 CLI。
+
+以上对远程机器同样适用：在「主机与账号」里选择另一台在线主机，请求会被转发过去。
+
+## 像 CLI 一样对话
+
+每个对话拥有一个常驻的原生进程——Claude Code 走双向 `stream-json`，Codex 走 `app-server`——所以 agent 的行为和终端里一模一样。网页控件映射到原生协议：
+
+| 终端里 | Studiolo 里 | 实现 |
+| --- | --- | --- |
+| Esc 停止 | **■ 停止** 或在输入框按 Esc | Claude `interrupt` 控制请求／Codex `turn/interrupt`。进程和原生会话保留，已输出部分保存，后续消息继续同一会话。 |
+| agent 工作时继续输入 | 执行中发送 = **插话** | Claude 在下一次工具调用边界读到它；Codex `turn/steer`。显示为「你 · 插话」，回复另起一段。「排队」则等本轮结束再发。 |
+| `/compact`、`/context`、自定义命令、skills | 输入 `/` 弹出命令列表 | Claude 命令原样透传（列表来自 CLI 本身）。Codex 没有文本命令，`/compact`、`/review`、`/skills`、`/mcp` 映射为 app-server 请求。 |
+| — | `/model`、`/effort`、`/mode`、`/rename`、`/new`、`/status`、`/clear`、`/stop`、`/help` | 平台命令，由浏览器或队列处理。 |
+
+CLI 在终端里会询问的权限请求会出现在页面上：批准本次或拒绝，同一次执行继续。Auto 模式就是 CLI 自己的（Claude `auto`、Codex `auto_review`）；Studiolo 不添加绕过参数，也不写入永久允许规则。同一对话内模型和 effort 可以逐条切换（Claude `set_model`／`apply_flag_settings`，Codex `turn/start` 参数）。
+
+## 多机器
+
+在每台电脑上运行同一个服务，把 `projects/` 放进你同步的文件夹（Syncthing 或任何文件同步工具）。每个项目的 `.studio/events/` 是不可变、带因果顺序的日志；在线的机器之间还会直接交换日志，改动几秒内可见。任何机器都能显示所有对话；执行始终发生在对话绑定的机器上，原生 CLI 会话从不迁移。
+
+**访问其他机器。** 最简单安全的方式是 [Tailscale](https://tailscale.com)：在状态目录放 `tailnet.json`（`{"enabled":true,"command":"tailscale"}`）和一个随机的 `access-token.txt`（≥ 32 字符），正常启动，Studiolo 会用 `tailscale serve` 发布端口；打开 `http://<机器名>:4310` 输入一次令牌即可。设置 `"trustTailnet":true` 后 tailnet 内的访问不再需要令牌。不用 Tailscale 时，用 `STUDIO_BIND` 绑定内网地址并设置 `STUDIO_TOKEN`。服务器通过 `projects/.servers/` 自动互相发现，也可在设置中手动配对。
+
+**开机自启。** macOS：`node scripts/install-studio-macos.mjs` 安装 LaunchAgent（`net.studio-local.server`）。Windows：把 `scripts/start-studio-windows.ps1` 注册为任务计划程序任务（操作为 `conhost.exe --headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <脚本路径>`，登录时触发、禁止重复实例、失败每分钟重试）；升级后用 `scripts/restart-studio-windows.ps1` 在没有活动任务时重启。
+
+**升级。** `public/` 下的前端文件按请求读取，同步到位即生效；`src/` 的改动需要在每台机器上重启。
+
+## Artifact 与批注
+
+让 agent 做网页或应用时，它会维护项目根目录的 `studio.artifacts.json`：
+
+```json
+{
+  "artifacts": [
+    { "key": "game", "name": "点击目标", "root": "game", "entry": "index.html",
+      "command": ["node", "server.mjs"], "port": 4320, "dataPaths": ["game/data"] }
+  ]
+}
+```
+
+静态页面省略 `command`、`port`、`dataPaths`。每个 Artifact 有独立、持久的预览端口和 origin；预览里的 `localStorage` 会落盘到项目并随之同步，一台机器上存的游戏进度在另一台继续。后端是普通的本地进程（不是沙箱），通过 `PORT` 和 `HOST` 启动；「数据快照」停止后端并复制声明的数据路径，「恢复」把它们放回去。
+
+在预览里*选取元素、文字或 Canvas 区域*写下批注，它会成为你选定 agent 的任务，选区作为证据（DOM 路径、引用文字或 Canvas 的 PNG）。同一个 Artifact 的批注顺序执行，不同 Artifact 和对话并行。示例见 `examples/persistent-game/`（Node 后端 + SQLite + Canvas）和 `examples/artifact-compatibility/`。
 
 ## 文件与配置
 
 | 位置 | 内容 |
 | --- | --- |
-| `projects/<项目ID>/` | 项目独立工作目录：代码、Artifact 与持久数据 |
-| `项目/uploads/` | 聊天附件和资源栏上传的文件，随项目同步 |
-| `项目/.studio/events/` | 权威、不可变事务记录 |
-| `项目/.studio/state.json` | 可重建当前状态 |
-| `项目/.studio/history-index.md` | 各 agent 的共同历史入口 |
-| `项目/.studio/sessions/`、`artifacts/` | 可读对话和批注记录 |
-| `项目/.studio/snapshots/` | Artifact 数据快照 |
-| `项目/.studio/artifact-storage/` | 各 Artifact 的共享 localStorage 存档，随项目同步 |
-| `项目/.studio/attachments/` | 批注的 Canvas 图片证据 |
-| `projects/.servers/` | 各服务器的公共地址登记，用于自动发现；不含令牌 |
-| `~/.studio-local/` | 本机身份、路径登记、配对信息、`agent-profiles.json`、`tailnet.json`、访问令牌；不要同步 |
+| `projects/<id>/` | 项目工作目录：代码、Artifact、数据（随同步） |
+| `projects/<id>/.studio/events/` | 权威、不可变的对话日志 |
+| `projects/<id>/.studio/state.json`、`history-index.md`、`sessions/`、`artifacts/` | 可重建的状态与供 agent 阅读的历史 |
+| `projects/<id>/.studio/artifact-storage/`、`snapshots/`、`attachments/` | 同步的预览存档、数据快照、批注证据 |
+| `projects/<id>/uploads/` | 聊天和资源栏上传的文件 |
+| `projects/.servers/` | 各服务器的公共地址，用于自动发现（不含秘密） |
+| `~/.studio-local/` | 机器私有：身份、`accounts.json`、`accounts/<id>/`、配对、Tailscale 设置——不要同步 |
+| `~/.studio-local/agent-profiles.json` | 可选：按 CLI 家族（`claude`、`codex`）或账号 id 覆盖可执行文件路径／环境变量 |
 
-`projects/` 是数据目录，不应提交到代码仓库；把它交给 Syncthing 或类似的文件同步工具。
+## 常见问题
 
-## 安全边界
+**它会用我的 API key 吗？** 只有你添加 API key 账号时才会。订阅账号走 CLI 自己的登录，Studiolo 不保存任何自己的凭据。
 
-- 服务默认只监听回环地址；非回环监听必须设置访问令牌。跨站请求按 Origin 拒绝；每个 Artifact 与管理页面使用独立 origin，并校验桥接来源。
-- Artifact 后端是用户自己的本机进程，**不是 OS 沙箱**。HTTP 代理支持表单、命名空间 Cookie、重定向、压缩 HTML、缓存与 SSE；暂不代理 WebSocket 或依赖 WebSocket 的热更新。
-- 网页批准通道使用 Claude 双向 stream-json 和 Codex 本地 app-server。自动审核保留原生策略；不会绕过拒绝规则、静默换模型或永久添加允许规则。服务重启会使未决请求失效。第三方登录和不支持的 MCP 专有交互仍需对应原生界面。
-- 发给 agent 的页面证据和历史被标记为参考数据；提示词要求 agent 不执行页面内容里嵌入的指令。公开操作文本会做二次脱敏，但 CLI 自身输出的内容仍以 CLI 为准。
+**会影响我终端里的 `claude`／`codex` 吗？** 不会。Studiolo 的账号在自己的目录里；`~/.claude`、`~/.codex` 只在创建账号时读一次，用来复制设置和链接 skills。
 
-## 当前边界
+**这是沙箱吗？** 不是。agent 和 Artifact 后端都是以你的权限运行的本地进程，和终端里的 CLI 一样。
 
-- 已安装的 Claude CLI 不支持 Haiku 4.5 配合 Auto。界面会禁用并标注该选项，提交前拒绝此组合；请显式选择沿用 CLI 权限、Plan 或允许修改项目。不会自动切换模型或放宽权限。
-- Canvas 导出受浏览器跨域污染限制；DOM 框选保存文字／位置证据，不生成整个网页的像素截图。跨域 iframe、封闭 Shadow DOM 的内部内容受浏览器边界约束。复杂改版不能保证自动重新定位，每条讨论仍保留。依赖第三方登录、设备权限或特殊浏览器能力的 HTML 需独立验收，HTML 注入上限 16 MiB。
-- 事务使用带因果父节点的字段变更日志。不同机器离线产生的记录可确定性合并；缺失父节点时停止写入，等待同步。不要手动删改 `.studio/events`。升级后所有服务器必须使用新版；旧服务进程需要重启。
-- 历史读取按文件身份、大小和修改时间校验已验证的事件缓存；新增事件仅解析增量，旧事件变化则重新验证完整链。磁盘历史仍是权威来源。
-- Agent 流式输出先在内存中合并，最多每 3 秒提交一次字段变更；原生会话身份、批准请求和执行结束时立即提交。页面通过实时叠加显示尚未提交的输出。服务异常退出时，最后约 3 秒的中间输出可能不在记录中。
-- 回归测试覆盖离线合并、首次绑定竞争、批准转发、数据快照、多主机路由和文件上传；真实 CLI 行为随各家 CLI 版本变化，升级 CLI 后请重新验证额度查询和批准通道。
+**手机能用吗？** 能，通过 Tailscale 作为浏览器客户端；CLI 运行在你的电脑上。
 
-## 开发
+**为什么零依赖？** 服务端是纯 Node.js（ESM，只用 `node:` 模块），Node 22 能跑的地方都能跑，供应链里没有任何东西隔在你和你的 CLI 之间。
 
-源码在 `src/`（Node ESM），网页在 `public/`（浏览器原生 ES modules，无构建步骤），测试在 `test/`（`node:test`，启动临时实例，不占用 4310/4311）。`node --check src/server.mjs` 做语法检查，`node --test test/*.test.mjs` 运行全部测试。
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。

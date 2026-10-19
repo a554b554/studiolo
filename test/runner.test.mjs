@@ -43,7 +43,7 @@ test('Claude permission denial returns waiting, not success; resume and wrapper 
     if (!process.argv.includes('--resume') || !process.argv.includes('session-old')) process.exit(12);
     if (!process.argv.includes('--permission-prompts') || !process.argv.includes('none')) process.exit(13);
     send({type:'result',subtype:'success',result:'Cannot write',session_id:'session-old',permission_denials:[{tool_name:'Write',tool_input:{file_path:'x'}}]});
-  `, 'claude1');
+  `, 'claude1', { configDir: path.join(os.tmpdir(), 'studio-wrapper', '.claude1') });
   const result = await h.execute({ nativeSessionId: 'session-old' });
   assert.equal(result.status, 'waiting');
   assert.match(result.error, /Write/);
@@ -118,10 +118,9 @@ test('Machine-local configuration and models do not expose env secrets through p
   assert.equal(redact('api_key=abcdef Bearer mytoken'), 'api_key=[REDACTED] Bearer [REDACTED]');
 });
 
-test('Restricted profiles reject Fable even if machine file adds it', async t => {
-  const h = await harness(t, '', 'claude2', { models: [{ id: 'claude-fable-5-1', label: 'Fable' }] });
-  await assert.rejects(h.execute({ model: 'claude-fable-5-1' }), /available/);
-  await assert.rejects(h.execute(), /No models/);
+test('An account without any model list is unavailable and never spawns', async t => {
+  const h = await harness(t, '', 'claude2', { models: [] });
+  await assert.rejects(h.execute({ model: 'claude-fable-5-1' }), /No models/);
   assert.equal((await h.runner.profiles()).find(p => p.id === 'claude2').available, false);
 });
 

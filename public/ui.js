@@ -1,6 +1,6 @@
 import { t, getLanguage, onLanguageChange } from './i18n.js';
 import { api, post } from './api.js';
-import { conversationItems, runNotice, agentLabel } from './conversation.js';
+import { conversationItems, runNotice, agentLabel, accountName, familyName } from './conversation.js';
 import { markdown } from './markdown.js';
 import {supportsAuto,validateModelPermission} from './model-permissions.js';
 function renderItem(item, runs, previous) {
@@ -18,7 +18,7 @@ function renderItem(item, runs, previous) {
   }
   const message = item.message, article = node('article',`message message-${message.role}`);
   const head = node('div','message-header');
-  head.append(node('strong','',message.role === 'user' ? t('你') : agentLabel(message,runs?.find(run => run.id === message.runId))),node('time','',time(message.createdAt)));
+  head.append(node('strong','',message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId))),node('time','',time(message.createdAt)));
   article.append(head,messageContent(message)); return article;
 }
 export function renderMessages(container, messages, runs) {
@@ -107,18 +107,20 @@ export async function bootstrap() {
 }
 export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
   const profiles=$(`#${prefix}profile`),models=$(`#${prefix}model`),hosts=$(`#${prefix}host`),efforts=$(`#${prefix}effort`),permission=$(`#${prefix}permission`);
-  let available=data.hosts||[],bound=null,sessionId=null,loading=false,generation=0;
-  const modeLabels=()=>{if(permission){const auto=permission.querySelector('[value="auto"]');auto.disabled=!supportsAuto(profiles.value,models.value);auto.textContent=auto.disabled?t('Auto · 此模型不支持'):profiles.value==='codex'?'Approve for me':'Auto';permission.querySelector('[value="read-only"]').textContent=profiles.value==='codex'?t('只读'):'Plan';}};
+  let available=data.hosts||[],bound=null,sessionId=null,loading=false,generation=0,current=[];
+  const selectedProfile=()=>current.find(p=>p.id===profiles.value);
+  const familyOf=p=>p?.family||(p?.id?.startsWith('codex')?'codex':p?.id?.startsWith('claude')?'claude':null);
+  const modeLabels=()=>{if(permission){const profile=selectedProfile(),codex=familyOf(profile)==='codex';const auto=permission.querySelector('[value="auto"]');auto.disabled=!supportsAuto(profile||profiles.value,models.value);auto.textContent=auto.disabled?t('Auto · 此模型不支持'):codex?'Approve for me':'Auto';permission.querySelector('[value="read-only"]').textContent=codex?t('只读'):'Plan';}};
   const setValue=(select,value)=>{if(value&&!Array.from(select.options).some(o=>o.value===value))select.add(new Option(value,value));if(value)select.value=value;};
   const fillModels=(list,selection)=>{
     const old=selection?.model||models.value;models.replaceChildren();
     for(const m of list.find(p=>p.id===profiles.value)?.models||[])models.add(new Option(m.label||m.id,m.id));
     if(Array.from(models.options).some(o=>o.value===old))models.value=old;
-    if(bound?.model)setValue(models,bound.model);
+    if(bound?.model&&(!bound.profileId||list.some(p=>p.id===bound.profileId)))setValue(models,bound.model);
     const model=list.find(p=>p.id===profiles.value)?.models?.find(m=>m.id===models.value);
     const effort=selection?.reasoningEffort??efforts?.value??'';
     if(efforts){efforts.replaceChildren(new Option(t('Effort · CLI 默认'),''));for(const e of model?.efforts||[])efforts.add(new Option(e,e));efforts.value=model?.efforts?.includes(effort)?effort:model?.defaultEffort||'';efforts.disabled=!model?.efforts?.length;}
-    models.disabled=loading||Boolean(bound?.model);modeLabels();
+    models.disabled=loading||Boolean(bound?.model)&&(!bound.profileId||list.some(p=>p.id===bound.profileId));modeLabels();
   };
   const load=async(selection)=>{
     const version=++generation,selected=hosts.value;loading=true;profiles.disabled=models.disabled=true;
@@ -126,10 +128,15 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
       const host=available.find(h=>h.id===selected);
       const list=host?.profiles||(selected===data.hostId?data.profiles:host?(await api(`/api/hosts/${encodeURIComponent(selected)}/bootstrap`)).profiles:[]);
       if(version!==generation)return;
+      current=list||[];
       const old=bound?.profileId||profiles.value;profiles.replaceChildren();
-      for(const p of list||[]){const option=new Option(`${p.label||p.id}${p.available===false?t(' · 不可用'):''}`,p.id);option.disabled=p.available===false;profiles.add(option);}
-      if(bound?.profileId)setValue(profiles,bound.profileId);else if(Array.from(profiles.options).some(o=>o.value===old&&!o.disabled))profiles.value=old;else profiles.value=Array.from(profiles.options).find(o=>!o.disabled)?.value||'';
-      loading=false;profiles.disabled=Boolean(bound?.profileId);fillModels(list||[],selection);
+      // Family first, then the account's name (its e-mail once signed in), so two accounts of one person stay apart.
+      for(const p of current){const option=new Option(`${familyName(p.family)?familyName(p.family)+' · ':''}${p.label||p.id}${p.status==='signed_out'?t(' · 未登录'):p.available===false?t(' · 不可用'):''}`,p.id);option.disabled=p.available===false;option.title=[p.label,p.identity?.email,p.identity?.plan].filter(Boolean).join(' · ');profiles.add(option);}
+      if(!Array.from(profiles.options).some(o=>!o.disabled)){const placeholder=new Option(t(current.length?'账号未登录，请先登录':'该电脑尚未登录账号'),'');placeholder.disabled=true;placeholder.selected=true;profiles.add(placeholder,0);}
+      // A conversation whose account was removed from its machine may continue with another one.
+      const boundMissing=bound?.profileId&&!current.some(p=>p.id===bound.profileId);
+      if(bound?.profileId&&!boundMissing)setValue(profiles,bound.profileId);else if(Array.from(profiles.options).some(o=>o.value===old&&!o.disabled))profiles.value=old;else profiles.value=Array.from(profiles.options).find(o=>!o.disabled)?.value||'';
+      loading=false;profiles.disabled=Boolean(bound?.profileId)&&!boundMissing;if(boundMissing)profiles.title=t('原账号已从该电脑移除，可选择其他账号继续；原生会话上下文不会保留。');fillModels(list||[],selection);
       profiles.onchange=()=>fillModels(list||[]);models.onchange=()=>fillModels(list||[]);
     }catch(error){if(version===generation){profiles.replaceChildren();models.replaceChildren();loading=false;showError(error);}}
   };
@@ -142,13 +149,15 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
     hosts.title=fixedHostId?t('批注由当前 Artifact 运行服务器执行。'):bound?.hostId?t('电脑、账号和模型已固定；更换请新建对话。'):'';
   };
   hosts.onchange=()=>load();fillHosts();load();
-  const choose=()=>{const choice={hostId:hosts.value,profileId:loading||!available.some(h=>h.id===hosts.value)?'':profiles.value,model:models.value,reasoningEffort:efforts?.value||null,permissionMode:permission?.value||'auto'};validateModelPermission(choice.profileId,choice.model,choice.permissionMode);return choice;};
+  const choose=()=>{const choice={hostId:hosts.value,profileId:loading||!available.some(h=>h.id===hosts.value)?'':profiles.value,model:models.value,reasoningEffort:efforts?.value||null,permissionMode:permission?.value||'auto'};validateModelPermission(selectedProfile()||choice.profileId,choice.model,choice.permissionMode);return choice;};
+  choose.profile=selectedProfile;
   choose.bindSession=(session,runs=[])=>{
     const last=runs.at(-1),next=session?{hostId:session.hostId||last?.hostId,profileId:session.profileId||last?.profileId,model:session.model||session.selection?.model||last?.model}:null;
     const changed=sessionId!==(session?.id||null)||JSON.stringify(next)!==JSON.stringify(bound);sessionId=session?.id||null;bound=next;
     if(changed){fillHosts();const selection=session?.selection||last;load(selection);if(permission)permission.value=selection?.permissionMode||'auto';}
   };
   choose.updateHosts=next=>{if(JSON.stringify(next)===JSON.stringify(available))return;available=next;fillHosts();load();};
+  choose.reloadProfiles=()=>load();
   onLanguageChange(()=>{fillHosts();modeLabels();});return choose;
 }
 export function listenChanges(onChange) {
@@ -214,22 +223,29 @@ export function listenChanges(onChange) {
 const approvalDrafts=new Map();
 // `scope` identifies the queue the callbacks act on; unchanged output is not rebuilt, so
 // buttons stay clickable and approval answers keep focus while agents stream.
-export function renderRuns(container, runs, queue, onCancel, onResume, onApproval, onContinue, scope = '') {
+// `onInterrupt` stops an executing run softly (the native session survives) and withdraws a
+// queued one; `stopRequests` (runId → time) decides when to offer the hard cancel instead.
+export function renderRuns(container, runs, queue, onCancel, onResume, onApproval, onContinue, scope = '', onInterrupt, stopRequests) {
   for (const run of runs) for (const approval of run.approvals || []) if (approval.status !== 'pending') approvalDrafts.delete(approval.id);
   const active = runs.filter(run => ['queued','running','waiting'].includes(run.status) || queue?.paused && ['failed','interrupted'].includes(run.status));
-  const signature = JSON.stringify([getLanguage(), scope, active.slice(-12), queue]);
+  const hardStop = run => Boolean(onInterrupt && stopRequests?.has(run.id) && Date.now() - stopRequests.get(run.id) > 12000);
+  const signature = JSON.stringify([getLanguage(), scope, active.slice(-12), queue, Boolean(onInterrupt), active.map(hardStop)]);
   if (container.studioSignature === signature) return;
   container.studioSignature = signature;
   container.replaceChildren();
   for (const run of active.slice(-12)) {
     const row = node('div','run-row'); const text = node('span','run-text',run.text); text.title = run.text;
     row.append(node('span',`run-status status-${run.status}`,statuses[run.status] || run.status),text);
-    if (['queued','running','waiting'].includes(run.status)) row.append(button(t('取消'),() => onCancel(run.id),'quiet'));
+    if (run.status === 'queued') row.append(button(t(onInterrupt ? '撤回' : '取消'),() => (onInterrupt || onCancel)(run.id),'quiet'));
+    else if (['running','waiting'].includes(run.status)) {
+      if (onInterrupt && !hardStop(run)) row.append(button(t('停止'),() => onInterrupt(run.id),'quiet'));
+      if (!onInterrupt || hardStop(run)) row.append(button(t(hardStop(run) ? '强制终止' : '取消'),() => onCancel(run.id),'quiet danger'));
+    }
     container.append(row);
     if(run.status==='waiting'&&!run.approvals?.some(a=>a.status==='pending')&&onContinue)container.append(button(t('用自动审核继续'),()=>onContinue(run.id),'resume-button'));
     for(const approval of run.approvals?.filter(a=>a.status==='pending')||[]){
       const card=node('section','approval-card');card.setAttribute('aria-label',t('待批准操作'));
-      card.append(node('strong','',`${run.profileId} · ${approval.title}`));
+      card.append(node('strong','',`${accountName(run.profileId, run)} · ${approval.title}`));
       if(approval.detail)card.append(node('pre','approval-detail',approval.detail));
       const answers=approvalDrafts.get(approval.id)||{};approvalDrafts.set(approval.id,answers);
       for(const q of approval.questions||[]){
@@ -246,7 +262,7 @@ export function renderRuns(container, runs, queue, onCancel, onResume, onApprova
     }
     if (run.error) container.append(node('p','run-error',runNotice(run.error)));
   }
-  if (!active.some(run => run.status === 'waiting') && queue?.paused) container.append(button(t('恢复队列'),onResume,'resume-button'));
+  if (!active.some(run => run.status === 'waiting') && queue?.paused) container.append(button(t(queue.reason === 'stopped' ? '继续执行排队消息' : '恢复队列'),onResume,'resume-button'));
   container.hidden = !container.childNodes.length;
   container.classList.toggle('has-approval',Boolean(container.querySelector('.approval-card')));
 }

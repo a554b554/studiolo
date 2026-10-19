@@ -13,6 +13,9 @@ import {safePath,writeJson,httpError} from './paths.mjs';
 import {saveAnchorEvidence,readAnchorEvidence} from './evidence.mjs';
 import {changeLifecycle,inactive,listArchives} from './lifecycle.mjs';
 import {AccountUsage} from './account-usage.mjs';
+import {AccountAuth} from './account-auth.mjs';
+import {Accounts} from './accounts.mjs';
+import {AccountLogin} from './account-login.mjs';
 import {renameSession,needsTitle} from './session-titles.mjs';
 import {loadTailnet} from './tailnet.mjs';
 import {Hosts} from './hosts.mjs';
@@ -39,16 +42,24 @@ export async function createStudio(options={}){
   if(tailnet&&(bind!=='127.0.0.1'||(!token&&!tailnet.trustedHosts)))throw new Error('Tailscale Serve requires loopback binding and an explicit access policy');
   let machine;try{machine=JSON.parse(await fs.readFile(path.join(stateDir,'machine.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw new Error('本机配置无法读取，拒绝重建身份：'+error.message);machine={hostId:randomUUID(),name:tailnet?.name||os.hostname(),hosts:[]};await writeJson(path.join(stateDir,'machine.json'),machine);}
   const projectRoot=options.projectRoot||path.resolve(here,'../projects');
-  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const runner=options.runner||new CliRunner({stateDir,hostId});const queue=new QueueManager({store,runner,hostId});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
+  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const queue=new QueueManager({store,runner,hostId});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
   const hosts=new Hosts({machine,projectRoot,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||4310}`:undefined),profiles:()=>runner.profiles()});await hosts.init();
+  // Accounts live per machine; a conversation bound to an account that no longer exists on
+  // its machine may continue with another account there (the native transcript is not kept).
+  const accountGone=(host,profileId)=>Boolean(profileId)&&!host.profiles.some(p=>p.id===profileId);
   async function bindSession(pid,id,input,origin){
-    validateModelPermission(input.profileId,input.model,input.permissionMode);
     const host=await hosts.get(input.hostId||hostId,origin);
     const profile=host.profiles.find(p=>p.id===input.profileId);
     if(!profile||profile.available===false||!profile.models.some(m=>m.id===input.model))throw httpError('Selected account or model is unavailable',409);
+    validateModelPermission(profile,input.model,input.permissionMode);
     return store.mutate(pid,'session.bound',s=>{
       const old=sessionBinding(s,id);if(!old)throw httpError('Session not found',404);
-      if(old.hostId){if(old.hostId!==host.id||old.profileId!==input.profileId||old.model!==input.model)throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);return old;}
+      if(old.hostId){
+        const rebind=old.hostId===host.id&&accountGone(host,old.profileId);
+        if(old.hostId!==host.id||!rebind&&(old.profileId!==input.profileId||old.model!==input.model))throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
+        if(!rebind)return old;
+        const target=s.sessions.find(x=>x.id===id);Object.assign(target,{profileId:input.profileId,model:input.model,selection:{model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode:input.permissionMode||'auto'}});return target;
+      }
       if((old.createdHostId||s.project.ownerHostId)!==hostId)throw httpError('Bind on the conversation creation server',409);
       const target=s.sessions.find(x=>x.id===id);Object.assign(target,{hostId:host.id,profileId:input.profileId,model:input.model,selection:{model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode:input.permissionMode||'auto'}});return target;
     });
@@ -59,6 +70,12 @@ export async function createStudio(options={}){
     await hosts.sync(store,host,pid);return result;
   }
   const accountUsage=options.accountUsage||new AccountUsage({runner});
+  // Sign-in runs on the machine that owns the account; pages on other machines reach it through
+  // /api/hosts/:id/accounts. Claude subscription sign-in is the pasted-code flow in AccountAuth.
+  const accountChanged=()=>{accountUsage.invalidate?.();hosts.cache=null;};
+  const accountAuth=options.accountAuth||new AccountAuth({runner,onSuccess:async id=>{accountChanged();await login.refresh(id).catch(()=>{});}});
+  const login=options.accountLogin||new AccountLogin({accounts,runner,oauth:accountAuth,onChange:accountChanged});
+  const accountsView=async()=>{const list=await accounts.list();return (await runner.profiles()).map(p=>({...p,seed:list.find(a=>a.id===p.id)?.seed,lastError:list.find(a=>a.id===p.id)?.lastError||null}));};
   const uploadLimit=options.uploadLimit??Number(process.env.STUDIO_UPLOAD_LIMIT||100*1024*1024);
   async function handler(req,res){
     const url=new URL(req.url,'http://localhost');const pathname=url.pathname;const origin='http://'+req.headers.host;
@@ -71,10 +88,41 @@ export async function createStudio(options={}){
     let parentOrigin=origin;if(req.headers['x-studio-parent-origin']){if(!equals(bearer,token)||req.headers['x-studio-hop']!=='1')throw httpError('无效预览来源',403);const candidate=new URL(req.headers['x-studio-parent-origin']);if(!['http:','https:'].includes(candidate.protocol)||candidate.origin!==req.headers['x-studio-parent-origin'])throw httpError('无效预览来源');parentOrigin=candidate.origin;}
     if(pathname==='/api/logout'&&req.method==='POST'){sessions.delete(cookie);res.setHeader('Set-Cookie','studio_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,{ok:true});}
     if(pathname==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});res.write('event: change\ndata: {}\n\n');clients.add(res);const timer=setInterval(()=>res.write(': heartbeat\n\n'),15000);req.on('close',()=>{clearInterval(timer);clients.delete(res)});return;}
-    if(pathname==='/api/account-usage'&&req.method==='GET')return send(res,{hostId,hostName:machine.name,...await accountUsage.get({refresh:url.searchParams.get('refresh')==='1'})});
+    // Account management and quota, for this machine or (forwarded) for another online host.
+    let accountPath=pathname==='/api/account-usage'||pathname.startsWith('/api/accounts')?pathname:null;
+    const viaHost=/^\/api\/hosts\/([^/]+)(\/(?:accounts|account-usage)(?:\/.*)?)$/.exec(pathname);
+    if(viaHost){
+      if(viaHost[1]!==hostId){
+        if(req.headers['x-studio-hop'])throw httpError('Host not found',404);
+        const host=await hosts.get(viaHost[1],origin);const input=['POST','PATCH','PUT'].includes(req.method)?await body(req):undefined;
+        return send(res,await hosts.request(host,'/api'+viaHost[2]+url.search,{method:req.method,data:input,timeout:120000}),req.method==='POST'&&viaHost[2]==='/accounts'?201:200);
+      }
+      accountPath='/api'+viaHost[2];
+    }
+    if(accountPath==='/api/account-usage'&&req.method==='GET')return send(res,{hostId,hostName:machine.name,...await accountUsage.get({refresh:url.searchParams.get('refresh')==='1'})});
+    if(accountPath==='/api/accounts'){
+      if(req.method==='GET')return send(res,{hostId,hostName:machine.name,accounts:await accountsView()});
+      if(req.method==='POST'){const input=await body(req);const created=await accounts.create({family:input.family,auth:input.auth,label:input.label});runner.invalidate();accountChanged();return send(res,created,201);}
+    }
+    const accountRoute=accountPath&&/^\/api\/accounts\/([^/]+)(?:\/(login|logout|refresh)(?:\/([^/]+)(\/code)?)?)?$/.exec(accountPath);
+    if(accountRoute){
+      const [,id,action,flowId,code]=accountRoute;
+      if(!action&&req.method==='PATCH'){const input=await body(req);const updated=await accounts.update(id,{label:input.label});runner.invalidate();accountChanged();return send(res,updated);}
+      if(!action&&req.method==='DELETE'){await login.remove(id);return send(res,{ok:true});}
+      if(action==='login'&&!flowId&&req.method==='POST')return send(res,await login.start(id,await body(req)),201);
+      if(action==='login'&&flowId&&!code&&req.method==='GET')return send(res,login.status(flowId));
+      if(action==='login'&&flowId&&code&&req.method==='POST')return send(res,await login.submit(flowId,(await body(req)).code));
+      if(action==='login'&&flowId&&!code&&req.method==='DELETE')return send(res,login.cancel(flowId));
+      if(action==='logout'&&req.method==='POST')return send(res,await login.logout(id));
+      if(action==='refresh'&&req.method==='POST')return send(res,await login.refresh(id));
+    }
+    if(pathname==='/api/account-auth'&&req.method==='POST')return send(res,await accountAuth.start((await body(req)).profileId),201);
+    const authFlow=/^\/api\/account-auth\/([^/]+)(\/code)?$/.exec(pathname);
+    if(authFlow?.[2]&&req.method==='POST')return send(res,await accountAuth.submit(authFlow[1],(await body(req)).code));
+    if(authFlow&&!authFlow[2]&&req.method==='DELETE')return send(res,accountAuth.cancel(authFlow[1]));
     if(pathname==='/api/archives'&&req.method==='GET')return send(res,await listArchives(store));
     if(pathname==='/api/identity')return send(res,{protocol:2,hostId,name:machine.name,profiles:await runner.profiles()});
-    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin))});
+    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,features:{},projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin))});
     if(pathname==='/api/hosts'&&req.method==='POST'){const input=await body(req);const target=new URL(input.url);if(!['http:','https:'].includes(target.protocol)||target.username||target.password)throw httpError('仅支持 HTTP(S) 主机地址');const host={url:target.origin,token:input.token};const info=await hosts.request(host,'/api/identity');if(info.protocol!==2)throw httpError('Upgrade the remote server first',409);if(info.hostId===hostId)throw httpError('不能把本机登记为远程主机');host.id=info.hostId;host.name=input.name||info.name||info.hostId;machine.hosts=machine.hosts.filter(h=>h.id!==host.id);machine.hosts.push(host);await writeJson(path.join(stateDir,'machine.json'),machine);const {token:secret,...visible}=host;hosts.cache=null;return send(res,visible);}
     const hostMatch=/^\/api\/hosts\/([^/]+)\/bootstrap$/.exec(pathname);if(hostMatch){const host=await hosts.get(hostMatch[1],origin);return send(res,{hostId:host.id,profiles:host.profiles});}
     if(pathname==='/api/projects'){if(req.method==='GET')return send(res,await store.listProjects());if(req.method==='POST'){const input=await body(req);if(typeof input.name!=='string'||!input.name.trim())throw httpError('需要项目名称');if(Object.hasOwn(input,'path'))throw httpError('项目目录由平台自动管理，不接受自定义路径');return send(res,await store.createProject({name:input.name.trim()}),201);}}
@@ -103,7 +151,12 @@ export async function createStudio(options={}){
     if(tail==='/messages'&&input?.sessionId){
       let bound=sessionBinding(state,input.sessionId);if(!bound)throw httpError('Session not found',404);
       if(!bound.hostId){const creator=bound.createdHostId||project.ownerHostId||hostId;bound=creator===hostId?await bindSession(pid,input.sessionId,input,origin):await forward(creator,pid,`/api/projects/${pid}/sessions/${input.sessionId}/bind`,'POST',input,origin);}
-      if(input.hostId&&input.hostId!==bound.hostId||input.profileId!==bound.profileId||input.model!==bound.model)throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
+      if(input.hostId&&input.hostId!==bound.hostId)throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
+      if(input.profileId!==bound.profileId||input.model!==bound.model){
+        // Only a conversation whose account disappeared from its machine may switch accounts.
+        if(!accountGone(await hosts.get(bound.hostId,origin),bound.profileId))throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
+        bound=bound.hostId===hostId?await bindSession(pid,input.sessionId,input,origin):await forward(bound.hostId,pid,`/api/projects/${pid}/sessions/${input.sessionId}/bind`,'POST',input,origin);
+      }
       target=bound.hostId;
     }
     const runRoute=/^\/runs\/([^/]+)/.exec(tail);
@@ -129,7 +182,9 @@ export async function createStudio(options={}){
     if(tail==='/messages'&&req.method==='POST'){const input=await readBody();if(!input.text?.trim()||!input.requestId)throw httpError('需要消息与 requestId');if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);if(input.sessionId&&!state.sessions.some(s=>s.id===input.sessionId))throw httpError('会话不存在',404);if(input.artifactId&&!state.artifacts.some(a=>a.id===input.artifactId))throw httpError('Artifact 不存在',404);if(!input.sessionId&&(!input.artifactId||!state.annotations.some(a=>a.id===input.annotationId&&a.artifactId===input.artifactId)))throw httpError('缺少会话或批注');return send(res,await queue.submit(pid,{...input,text:input.text.trim(),hostId,queueId:input.sessionId?'session:'+input.sessionId:'artifact:'+input.artifactId}),201);}
     const approval=/^\/runs\/([^/]+)\/approvals\/([^/]+)$/.exec(tail);if(approval&&req.method==='POST')return send(res,await queue.approvals.respond(pid,approval[1],approval[2],await readBody()));
     const continuation=/^\/runs\/([^/]+)\/continue$/.exec(tail);if(continuation&&req.method==='POST')return send(res,await queue.continueWaiting(pid,continuation[1]));
-    const cancel=/^\/runs\/([^/]+)\/cancel$/.exec(tail);if(cancel&&req.method==='POST'){await queue.cancel(pid,cancel[1]);return send(res,{ok:true});}if(tail==='/queues/resume'&&req.method==='POST'){const input=await readBody();await queue.resume(pid,input.queueId);return send(res,{ok:true});}
+    const cancel=/^\/runs\/([^/]+)\/cancel$/.exec(tail);if(cancel&&req.method==='POST'){await queue.cancel(pid,cancel[1]);return send(res,{ok:true});}
+    // Stop the current turn but keep the native process and session (Esc in the CLIs).
+    const interrupt=/^\/runs\/([^/]+)\/interrupt$/.exec(tail);if(interrupt&&req.method==='POST'){await queue.interrupt(pid,interrupt[1]);return send(res,{ok:true});}if(tail==='/queues/resume'&&req.method==='POST'){const input=await readBody();await queue.resume(pid,input.queueId);return send(res,{ok:true});}
     if(tail==='/files'){const rel=url.searchParams.get('path')||'';const dir=await safePath(project.path,rel);const entries=await fs.readdir(dir,{withFileTypes:true});const results=[];for(const entry of entries.filter(e=>!['.git','node_modules'].includes(e.name))){const p=path.posix.join(rel.replaceAll('\\','/'),entry.name);try{await safePath(project.path,p);results.push({name:entry.name,path:p,type:entry.isDirectory()?'directory':'file'});}catch{}}return send(res,results.sort((a,b)=>a.type===b.type?a.name.localeCompare(b.name):a.type==='directory'?-1:1));}
     if(tail==='/file'){const rel=url.searchParams.get('path')||'';const file=await safePath(project.path,rel);if((await fs.stat(file)).size>1024*1024)throw httpError('文件超过 1 MB 预览限制',413);const data=await fs.readFile(file);if(data.includes(0))throw httpError('二进制文件暂不支持文本预览');return send(res,{path:rel,content:data.toString('utf8')});}
     // Images referenced by Markdown previews. Sandboxed like evidence so a project SVG cannot run script.
@@ -142,6 +197,6 @@ export async function createStudio(options={}){
   }
   const server=http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)send(res,{error:e.message},e.status||400);else res.end();}));const port=options.port??Number(process.env.STUDIO_PORT||4310);try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,bind,resolve)});if(tailnet)await tailnet.forwarder.expose(server.address().port);await queue.init();}catch(error){unsubscribe();await queue.close();await artifacts.close();if(server.listening)await new Promise(r=>server.close(r));throw error;}
   let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
-  return {server,store,queue,artifacts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;unsubscribe();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await new Promise(r=>server.close(r));}};
+  return {server,store,queue,artifacts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await new Promise(r=>server.close(r));}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}

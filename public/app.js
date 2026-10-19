@@ -7,6 +7,10 @@ import { syncMessages, mergeRuntime } from './ui.js';
 import { category, visibleItems, moreButton } from './lifecycle.js';
 import { markdown, isMarkdownPath } from './markdown.js';
 import { $, node, button, empty, time, showError, clearError, attempt, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
+import { platformCommands, codexCommands, parseSlash, mergeCommands, createSlashMenu } from './commands.js';
+import { initAccounts } from './accounts.js';
+import { setAccountDirectory, accountName, familyName } from './conversation.js';
+let usage = { setHost() {}, reload() {} }, accountsUI = null, lastComposerHost = null;
 
 initLanguage(); initTheme(); initDialogs();
 $('#connection').textContent=t('连接中'); $('#session-title').textContent=t('选择项目'); $('#prompt').placeholder=t('输入消息…');
@@ -111,6 +115,73 @@ dropZone($('.conversation'), addAttachments);
 dropZone($('.explorer'), uploadToProject);
 $('#attach').addEventListener('click', () => $('#attach-input').click());
 $('#attach-input').addEventListener('change', event => { const files = [...event.target.files]; event.target.value = ''; attempt(() => addAttachments(files)); });
+
+// Interactive controls, matching the terminal CLIs: Esc / ■ stops the current turn but keeps the
+// native session; a message sent while a run executes is delivered into that turn (steer) unless
+// the user chose to queue it; "/" opens the command list.
+const stopRequests = new Map();
+let sendMode = 'auto';
+const currentSession = () => view.project?.sessions.find(item => item.id === view.sessionId);
+const activeRunOf = session => session ? (view.project?.runs || []).filter(r => r.sessionId === session.id && ['running','waiting'].includes(r.status)).at(-1) : undefined;
+const nativeOf = session => session ? Object.entries(view.project?.nativeRuntime || {}).find(([key]) => key.startsWith(`${view.projectId}:session:${session.id}:`))?.[1] : undefined;
+let noteTimer;
+function note(text) {
+  const el = $('#compose-note'); clearTimeout(noteTimer);
+  el.textContent = text; el.classList.add('flash');
+  noteTimer = setTimeout(() => { el.textContent = t(el.dataset.i18n); el.classList.remove('flash'); }, 6000);
+}
+function availableCommands() {
+  const session = currentSession(), native = nativeOf(session)?.commands;
+  // Before the native session connects, the account's own command list (read at sign-in) is used.
+  const profile = choices.profile?.() || view.bootstrap?.profiles?.find(p => p.id === (session?.profileId || $('#profile').value));
+  const family = profile?.family || ((session?.profileId || $('#profile').value || '').startsWith('codex') ? 'codex' : 'claude');
+  return mergeCommands(platformCommands(), native || profile?.commands || (family === 'codex' ? codexCommands() : []));
+}
+const slashMenu = createSlashMenu({ textarea: $('#prompt'), menu: $('#slash-menu'), commands: availableCommands, onSubmit: () => $('#composer').requestSubmit() });
+async function stopActiveRun() {
+  const run = activeRunOf(currentSession()); if (!run) return;
+  const hard = stopRequests.has(run.id) && Date.now() - stopRequests.get(run.id) > 12000;
+  if (!stopRequests.has(run.id)) stopRequests.set(run.id, Date.now());
+  await post(`${path()}/runs/${run.id}/${hard ? 'cancel' : 'interrupt'}`); await reloadProject();
+}
+function selectOption(select, value, label) {
+  const wanted = String(value).toLowerCase();
+  const option = Array.from(select.options).find(o => !o.disabled && (o.value.toLowerCase() === wanted || o.textContent.trim().toLowerCase() === wanted));
+  if (!option) throw new Error(t('{label}不存在：{value}', {label, value}));
+  if (select.disabled) throw new Error(t('{label}已固定，更换请新建对话。', {label}));
+  select.value = option.value; select.dispatchEvent(new Event('change'));
+  return option.textContent.trim();
+}
+// Commands that never reach the server. Returns false for the ones the queue or the CLI run.
+async function runLocalCommand({name, args}) {
+  const session = currentSession();
+  switch (name) {
+    case 'help': slashMenu.showAll(); return true;
+    case 'stop': await stopActiveRun(); return true;
+    case 'new': if (view.projectId) await createProjectSession(view.projectId); return true;
+    case 'model': if (!args) throw new Error(t('用法：/model <模型>')); note(t('模型：{value}', {value: selectOption($('#model'), args, t('模型'))})); return true;
+    case 'effort': if (!args) throw new Error(t('用法：/effort <low|medium|high|xhigh|max>')); note(t('Effort：{value}', {value: selectOption($('#effort'), args, 'Effort')})); return true;
+    case 'mode': {
+      const modes = {auto:'auto', default:'default', cli:'default', plan:'read-only', 'read-only':'read-only', readonly:'read-only', write:'project-write', 'project-write':'project-write', edit:'project-write'};
+      if (!modes[args.toLowerCase()]) throw new Error(t('用法：/mode <auto|cli|plan|write>'));
+      note(t('执行权限：{value}', {value: selectOption($('#permission'), modes[args.toLowerCase()], t('执行权限'))})); return true;
+    }
+    case 'rename': {
+      if (!session) return true; if (!args) throw new Error(t('用法：/rename <标题>'));
+      await api(`${path()}/sessions/${encodeURIComponent(session.id)}`, {method:'PATCH', body:{title: args}}); await reloadProject(); return true;
+    }
+    case 'status': {
+      if (!session) return true;
+      const native = nativeOf(session), last = (view.project?.runs || []).filter(r => r.sessionId === session.id).at(-1);
+      const host = view.bootstrap.hosts.find(h => h.id === session.hostId);
+      const parts = [host ? host.name : t('未绑定电脑'), session.profileId ? accountName(session.profileId, last) : '—', last?.actualModel || session.model || '—', last?.actualReasoningEffort ? `effort ${last.actualReasoningEffort}` : null, native?.connected ? t('原生会话已连接') + (native.busy ? t('（执行中）') : '') : t('原生会话未连接'), last?.usage?.sessionTotal?.totalTokens ? t('会话累计 {n} tokens', {n: last.usage.sessionTotal.totalTokens}) : null];
+      note(parts.filter(Boolean).join(' · ')); return true;
+    }
+    default: return false;
+  }
+}
+$('#stop').addEventListener('click', () => attempt(stopActiveRun));
+$('#queue-send').addEventListener('click', () => { sendMode = 'queue'; $('#composer').requestSubmit(); });
 $('#files-upload').addEventListener('click', () => { if (!view.projectId) return showError(new Error(t('请先打开项目'))); $('#files-input').click(); });
 $('#files-input').addEventListener('change', event => { const files = [...event.target.files]; event.target.value = ''; attempt(() => uploadToProject(files)); });
 
@@ -234,12 +305,28 @@ function renderConversation() {
   $('#takeover').hidden = true;
   const messages = view.project?.messages.filter(message => message.sessionId === view.sessionId) || [];
   const runs = view.project?.runs.filter(run => run.sessionId === view.sessionId) || [];
+  // While this conversation executes, sending steers that turn; the user can queue instead or stop.
+  const activeRun = runs.filter(run => ['running','waiting'].includes(run.status)).at(-1);
+  const steering = Boolean(activeRun && writable && machineOnline);
+  $('#stop').hidden = !activeRun; $('#stop').disabled = !machineOnline;
+  $('#stop').querySelector('span').textContent = activeRun && stopRequests.has(activeRun.id) && Date.now() - stopRequests.get(activeRun.id) > 12000 ? t('强制终止') : t('■ 停止');
+  $('#queue-send').hidden = !steering;
+  $('#send-label').textContent = t(steering ? '插话 ↑' : '发送 ↑');
+  $('#prompt').placeholder = steering ? t('输入插话内容，Ctrl / ⌘ + Enter 发送给正在执行的 agent…') : $('#prompt').placeholder;
+  for (const [id, at] of stopRequests) if (!runs.some(r => r.id === id && ['running','waiting'].includes(r.status)) && Date.now() - at > 60000) stopRequests.delete(id);
   choices.bindSession?.(session,runs);
+  // The quota panel follows the composer's machine only when that changes (switching
+  // conversations); a machine picked in the panel itself stays until then.
+  const composerHost = $('#host').value || view.bootstrap?.hostId;
+  if (composerHost !== lastComposerHost) { lastComposerHost = composerHost; usage.setHost(composerHost); }
   const native=Object.entries(view.project?.nativeRuntime||{}).find(([key])=>key.startsWith(`${view.projectId}:session:${view.sessionId}:`))?.[1];
   $('#session-title').title=native?.connected?t('原生会话在线')+(native.busy?t(' · 执行中'):t(' · 等待消息')):t('发送消息时建立或恢复原生会话');
   let nativeStatus=$('#native-session-status');
   if(!nativeStatus){nativeStatus=node('span','muted');nativeStatus.id='native-session-status';$('#project-title').after(nativeStatus);}
-  nativeStatus.textContent=session?(!machineOnline?t('执行电脑离线'):native?.connected?t('原生会话 · {status}',{status:native.busy?t('执行中'):t('已连接')}):t('原生会话 · 待连接')):'';
+  // Which machine and account this conversation talks to, then the native session state.
+  const boundRun=runs.at(-1),boundAccount=session?.profileId||boundRun?.profileId;
+  const who=session&&boundAccount?[view.bootstrap.hosts.find(h=>h.id===(session.hostId||boundRun?.hostId))?.name,`${familyName(boundRun?.account?.family||view.bootstrap.hosts.flatMap(h=>h.profiles||[]).find(p=>p.id===boundAccount)?.family)} ${accountName(boundAccount,boundRun)}`.trim()].filter(Boolean).join(' · '):'';
+  nativeStatus.textContent=session?[who,!machineOnline?t('执行电脑离线'):native?.connected?t('原生会话 · {status}',{status:native.busy?t('执行中'):t('已连接')}):t('原生会话 · 待连接')].filter(Boolean).join(' · '):'';
   const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,messages,runs]);
   if (signature !== messageSignature) {
     messageSignature = signature; const container = $('#messages');
@@ -254,7 +341,8 @@ function renderConversation() {
     if (nearBottom || !messages.length) container.scrollTop = container.scrollHeight;
   }
   const queueId = `session:${view.sessionId}`;
-  renderRuns($('#queue'), runs, view.project?.queues?.[queueId], runId => attempt(async () => { await post(`${path()}/runs/${runId}/cancel`); await reloadProject(); }), () => attempt(async () => { await post(`${path()}/queues/resume`,{queueId}); await reloadProject(); }), async (runId,id,input)=>{await post(`${path()}/runs/${runId}/approvals/${id}`,input);await reloadProject();},runId=>attempt(async()=>{await post(`${path()}/runs/${runId}/continue`);await reloadProject();}),`${view.projectId}:${queueId}`);
+  renderRuns($('#queue'), runs, view.project?.queues?.[queueId], runId => attempt(async () => { await post(`${path()}/runs/${runId}/cancel`); await reloadProject(); }), () => attempt(async () => { await post(`${path()}/queues/resume`,{queueId}); await reloadProject(); }), async (runId,id,input)=>{await post(`${path()}/runs/${runId}/approvals/${id}`,input);await reloadProject();},runId=>attempt(async()=>{await post(`${path()}/runs/${runId}/continue`);await reloadProject();}),`${view.projectId}:${queueId}`,
+    runId => attempt(async () => { if (!stopRequests.has(runId)) stopRequests.set(runId, Date.now()); await post(`${path()}/runs/${runId}/interrupt`); await reloadProject(); }), stopRequests);
 }
 function selectSession(id) {
   view.drafts.set(draftKey(),$('#prompt').value); view.sessionId = id; $('#prompt').value = view.drafts.get(draftKey()) || ''; messageSignature = ''; renderNavigation(); renderConversation(); rememberSelection(); closeDrawer(); $('#messages').scrollTop = $('#messages').scrollHeight;
@@ -385,22 +473,37 @@ $('#artifact-form').addEventListener('submit', event => { event.preventDefault()
 $('#host-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { await post('/api/hosts',body); view.bootstrap = await api('/api/bootstrap'); choices = initChoices(view.bootstrap); renderHosts(); event.target.reset(); }); });
 $('#takeover').addEventListener('click', () => attempt(async () => { if (!confirm(t('确认原电脑已停止执行和 Artifact 写入，并且项目数据已同步。现在由本机接管此项目？'))) return; await post(`${path()}/takeover`,{confirm:true}); await reloadProject(); }));
 $('#prompt').addEventListener('input', () => view.drafts.set(draftKey(),$('#prompt').value));
-$('#prompt').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('#composer').requestSubmit(); } });
-$('#composer').addEventListener('submit', event => { event.preventDefault(); attempt(async () => {
+$('#prompt').addEventListener('keydown', event => {
+  if (slashMenu.handleKey(event)) { event.preventDefault(); return; }
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('#composer').requestSubmit(); return; }
+  // Esc stops the executing turn, like the terminal CLIs; the drawer handler only runs otherwise.
+  if (event.key === 'Escape' && activeRunOf(currentSession()) && !$('#stop').hidden) { event.preventDefault(); event.stopPropagation(); attempt(stopActiveRun); }
+});
+$('#composer').addEventListener('submit', event => { event.preventDefault(); const mode = sendMode; sendMode = 'auto'; attempt(async () => {
   const text = $('#prompt').value.trim(), chosen = choices(); if (!text || !view.sessionId || view.submitting) return;
+  const command = parseSlash(text);
+  if (command && await runLocalCommand(command)) { $('#prompt').value = ''; view.drafts.delete(draftKey()); return; }
   if (!chosen.profileId) throw new Error(t('所选电脑没有可用的 CLI 入口。'));
   const pendingUploads = attachmentList().filter(item => item.status === 'uploading');
   if (pendingUploads.length) throw new Error(t('附件仍在上传，请稍候再发送。'));
   const attachments = attachmentList().filter(item => item.status === 'ready').map(item => item.path);
+  // Steer by default while a run executes; attachments and commands always queue.
+  const steer = mode !== 'queue' && !command && !attachments.length && Boolean(activeRunOf(currentSession()));
   view.submitting = true; $('#send').disabled = true; const originalKey = draftKey(), sessionId = view.sessionId, projectId = view.projectId;
-  const signature = JSON.stringify({sessionId,text,attachments,...chosen}), pendingKey = `${originalKey}:${signature}`;
+  const signature = JSON.stringify({sessionId,text,attachments,steer,...chosen}), pendingKey = `${originalKey}:${signature}`;
   if (!pendingRequests.has(pendingKey)) pendingRequests.set(pendingKey,requestId());
-  try { await post(`${projectURL(projectId)}/messages`,{requestId:pendingRequests.get(pendingKey),sessionId,text,...(attachments.length ? {attachments} : {}),...chosen}); pendingRequests.delete(pendingKey); view.drafts.delete(originalKey); view.attachments.delete(originalKey); if (draftKey() === originalKey && $('#prompt').value.trim() === text) $('#prompt').value = ''; renderAttachments(); await reloadProject(); $('#messages').scrollTop = $('#messages').scrollHeight; }
+  try { await post(`${projectURL(projectId)}/messages`,{requestId:pendingRequests.get(pendingKey),sessionId,text,...(attachments.length ? {attachments} : {}),...(steer ? {steer:true} : {}),...chosen}); pendingRequests.delete(pendingKey); view.drafts.delete(originalKey); view.attachments.delete(originalKey); if (draftKey() === originalKey && $('#prompt').value.trim() === text) $('#prompt').value = ''; renderAttachments(); await reloadProject(); $('#messages').scrollTop = $('#messages').scrollHeight; }
   finally { view.submitting = false; $('#send').disabled = !view.sessionId; }
 }); });
 
 async function start() {
-  view.bootstrap = await bootstrap(); initAccountUsage(); choices = initChoices(view.bootstrap); $('#machine-label').textContent = t('本机 · {id}',{id:view.bootstrap.hosts.find(h=>h.local)?.name||view.bootstrap.hostId});
+  view.bootstrap = await bootstrap(); setAccountDirectory(view.bootstrap.hosts); choices = initChoices(view.bootstrap);
+  const refreshAccounts = async () => { view.bootstrap = await api('/api/bootstrap'); setAccountDirectory(view.bootstrap.hosts); choices.updateHosts(view.bootstrap.hosts); choices.reloadProfiles?.(); usage.reload(); renderHosts(); messageSignature = ''; renderConversation(); };
+  accountsUI = initAccounts({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, onChange: () => attempt(refreshAccounts) });
+  usage = initAccountUsage({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, openAccounts: (hostId, accountId) => accountsUI.open(hostId, accountId) });
+  $('#accounts-open').addEventListener('click', () => { $('#settings-dialog').close(); accountsUI.open($('#host').value || view.bootstrap.hostId); });
+  $('#host').addEventListener('change', () => usage.setHost($('#host').value));
+  $('#machine-label').textContent = t('本机 · {id}',{id:view.bootstrap.hosts.find(h=>h.local)?.name||view.bootstrap.hostId});
   const previous = previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
   if (project) await selectProject(project.id,previous.sessionId); else { renderNavigation(); renderConversation(); }
   // Run output and conversation events only touch their own project; the project list
@@ -419,7 +522,7 @@ async function start() {
     if (document.hidden || polling) return;
     polling = true;
     try {
-      const fresh = await api('/api/bootstrap');view.bootstrap.hosts=fresh.hosts;choices.updateHosts(fresh.hosts);renderHosts();
+      const fresh = await api('/api/bootstrap');view.bootstrap.hosts=fresh.hosts;view.bootstrap.profiles=fresh.profiles;setAccountDirectory(fresh.hosts);choices.updateHosts(fresh.hosts);renderHosts();
       const projects = fresh.projects;
       if (JSON.stringify(projects) !== JSON.stringify(view.bootstrap.projects)) {
         view.bootstrap.projects = projects; await reconcileSelection();

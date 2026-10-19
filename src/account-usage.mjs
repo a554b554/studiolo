@@ -10,8 +10,11 @@ function window(id,label,used,reset,minutes,extra={}){
 }
 
 // Return only quota/account metadata. Never forward the CLI's full initialize or usage response.
+// Claude subscriptions are summarized by their five-hour window, Codex by the weekly one;
+// legacy claude/codex profile ids keep the weekly summary they always showed.
+export const summaryWindowFor=config=>config.family==='claude'&&config.id!=='claude'?'five_hour':'seven_day';
 export function normalizeUsage(config,raw){
-  const result={id:config.id,label:config.label||config.id,family:config.family,summaryWindow:config.id==='claude1'||config.id==='claude2'?'five_hour':'seven_day',windows:[],plan:null,credits:null,resetCredits:null};
+  const result={id:config.id,label:config.label||config.id,family:config.family,auth:config.auth||null,summaryWindow:summaryWindowFor(config),windows:[],plan:null,credits:null,resetCredits:null};
   if(config.family==='claude'){
     result.plan=text(raw.subscription_type);
     const limits=raw.rate_limits;
@@ -79,8 +82,11 @@ export async function readNativeUsage(config,{spawnProcess=spawn,timeoutMs=20000
     }catch{rejectAll();}}});
   const timer=setTimeout(()=>{rejectAll();child.kill();},timeoutMs);
   try{
-    await rpc('initialize',codex?{clientInfo:{name:'studio_usage',version:'0.1.0'},capabilities:{experimentalApi:true}}:{});
+    const init=await rpc('initialize',codex?{clientInfo:{name:'studio_usage',version:'0.1.0'},capabilities:{experimentalApi:true}}:{});
     if(codex)write({method:'initialized'});
+    // A signed-out Claude CLI answers get_usage without limits, which would read as "no quota".
+    const account=init?.account;
+    if(!codex&&account?.tokenSource==='none'&&!account.apiKeySource&&!account.email)throw new Error('not_logged_in');
     return await rpc(codex?'account/rateLimits/read':'get_usage');
   }finally{
     clearTimeout(timer);child.stdin.end();if(!closed)child.kill();rejectAll();
@@ -89,6 +95,8 @@ export async function readNativeUsage(config,{spawnProcess=spawn,timeoutMs=20000
 
 export class AccountUsage {
   constructor({runner,read=readNativeUsage,now=Date.now,ttlMs=60000}){Object.assign(this,{runner,read,now,ttlMs});this.cache=null;this.pending=null;}
+  // After a sign-in the next read must reach the CLI even inside the refresh throttle.
+  invalidate(){this.lastAttempt=-Infinity;}
   async get({refresh=false}={}){
     if(this.pending)return this.pending;
     if(this.cache&&(!refresh||this.now()-this.lastAttempt<5000)&&this.now()-this.lastAttempt<this.ttlMs)return this.cache;
@@ -97,9 +105,14 @@ export class AccountUsage {
   async load(){
     const configs=Object.values(await this.runner.configuration());
     const accounts=await Promise.all(configs.map(async config=>{
-      const base={id:config.id,label:config.label||config.id,family:config.family,summaryWindow:['claude1','claude2'].includes(config.id)?'five_hour':'seven_day'};
-      try{return {...normalizeUsage(config,await this.read(config)),status:'ok',updatedAt:new Date(this.now()).toISOString()};}
-      catch(error){const previous=this.cache?.accounts.find(a=>a.id===config.id&&a.updatedAt);const code=['cli_missing','quota_unavailable'].includes(error.message)?error.message:'quota_read_failed';return {...base,...previous,status:previous?'stale':'unavailable',error:code,windows:previous?.windows||[],summary:previous?.summary||null};}
+      const base={id:config.id,label:config.label||config.id,family:config.family,auth:config.auth||null,summaryWindow:summaryWindowFor(config),identity:config.identity||null};
+      // A signed-out account has nothing to read; do not start its CLI just to learn that.
+      if(config.status==='signed_out')return {...base,status:'unavailable',error:'not_logged_in',windows:[],summary:null};
+      try{return {...normalizeUsage(config,await this.read(config)),identity:config.identity||null,status:'ok',updatedAt:new Date(this.now()).toISOString()};}
+      catch(error){
+        // Pay-as-you-go API keys have no quota windows; that is not a failure.
+        if(config.auth==='api_key'&&error.message==='quota_unavailable')return {...base,status:'ok',windows:[],summary:null,plan:null,credits:null,updatedAt:new Date(this.now()).toISOString()};
+        const previous=this.cache?.accounts.find(a=>a.id===config.id&&a.updatedAt);const code=['cli_missing','quota_unavailable','not_logged_in'].includes(error.message)?error.message:'quota_read_failed';return {...base,...previous,status:previous?'stale':'unavailable',error:code,windows:previous?.windows||[],summary:previous?.summary||null};}
     }));
     this.lastAttempt=this.now();return this.cache={checkedAt:new Date(this.now()).toISOString(),accounts};
   }
