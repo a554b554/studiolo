@@ -15,6 +15,16 @@ function bar(row,label){
   const fill=el('span','quota-fill');fill.style.width=`${value}%`;meter.append(fill);return meter;
 }
 const period=row=>row?.windowDurationMins===10080?t('周额度'):row?.windowDurationMins===300?t('五小时额度'):row?.windowDurationMins?t('{hours} 小时额度',{hours:Math.round(row.windowDurationMins/60*10)/10}):t('其他额度');
+// Short name of the limit a sidebar row shows: "五小时额度", "周额度", "Fable 周额度".
+const windowName=(account,row)=>{
+  if(account.family==='codex')return ['codex','default'].includes(row.bucket)?period(row):`${row.label} ${period(row)}`;
+  return ['five_hour','seven_day'].includes(row.id)||!row.windowDurationMins?t(row.label):`${t(row.label)} ${period(row)}`;
+};
+// The limit each account shows in the sidebar, chosen in Usage 详情 and kept per browser as
+// {"<host>/<account>":"<limit>"}. Model limits are numbered by position, so they are kept by name.
+const PICKS='studio-usage-windows';
+const windowKey=row=>row.id.startsWith('scoped_')?`scoped:${row.label}`:row.id;
+let picks={};try{picks=JSON.parse(localStorage.getItem(PICKS)||'{}')||{};}catch{}
 
 export function initAccountUsage({hosts=()=>[],localHostId,openAccounts=()=>{}}={}){
   const root=document.querySelector('#account-usage');if(!root)return {setHost(){},reload(){}};
@@ -31,6 +41,9 @@ export function initAccountUsage({hosts=()=>[],localHostId,openAccounts=()=>{}}=
   manage.onclick=()=>{dialog.close();openAccounts(hostId);};
   const hostName=()=>hosts().find(h=>h.id===hostId)?.name||data?.hostName||hostId;
   const signIn=account=>{dialog.close();openAccounts(hostId,account.id);};
+  const pickId=account=>`${data?.hostId||hostId}/${account.id}`;
+  const shownWindow=account=>{const key=picks[pickId(account)];return (key&&account.windows?.find(w=>windowKey(w)===key))||account.summary||null;};
+  const pick=(account,row)=>{picks={...picks,[pickId(account)]:windowKey(row)};try{localStorage.setItem(PICKS,JSON.stringify(picks));}catch{}render();};
   function renderDetails(){
     content.replaceChildren();
     content.append(el('p','quota-machine',t('{host} 上的账号',{host:hostName()})),el('p','small muted',t('显示账号整体额度，包含在其他聊天和设备上的使用。进度条表示剩余。')));
@@ -43,11 +56,18 @@ export function initAccountUsage({hosts=()=>[],localHostId,openAccounts=()=>{}}=
       if(account.status!=='ok')card.append(el('p','quota-error',t(errors[account.error]||loginErrors[account.error]||'暂无额度数据')));
       if(account.status==='stale')card.append(el('p','small muted',t('上次成功读取：{time}',{time:date(account.updatedAt)})));
       if(!account.windows?.length&&account.status==='ok')card.append(el('p','muted',account.auth==='api_key'?t('API 账号按用量计费，没有额度窗口。'):t('暂无额度数据')));
+      const shown=shownWindow(account);
       for(const row of account.windows||[]){
         const item=el('div','quota-window'),line=el('div','quota-line');
         const label=account.family==='codex'||row.id.startsWith('scoped_')?`${row.label} · ${period(row)}`:t(row.label);
         line.append(el('strong','',label),el('span','',row.remainingPercent===null?'—':t('剩余 {percent}',{percent:percent(row.remainingPercent)})));item.append(line,bar(row,label));
-        item.append(el('p','small muted',`${t('已用 {percent}',{percent:row.usedPercent===null?'—':percent(row.usedPercent)})} · ${t('重置：{time}',{time:date(row.resetsAt)})}`));
+        const meta=el('div','quota-window-meta');meta.append(el('p','small muted',`${t('已用 {percent}',{percent:row.usedPercent===null?'—':percent(row.usedPercent)})} · ${t('重置：{time}',{time:date(row.resetsAt)})}`));
+        // With more than one limit, choose which one the sidebar row shows.
+        if(account.windows.length>1){
+          if(shown&&windowKey(shown)===windowKey(row))meta.append(el('span','quota-plan quota-pick',t('主页显示中')));
+          else{const button=el('button','quiet quota-pick',t('设为主页显示'));button.type='button';button.title=t('在侧栏的账号额度里显示这个额度');button.onclick=()=>pick(account,row);meta.append(button);}
+        }
+        item.append(meta);
         if(row.remainingDollars!==null&&row.remainingDollars!==undefined)item.append(el('p','small muted',t('剩余金额：{amount}',{amount:`USD ${row.remainingDollars} / ${row.limitDollars??'—'}`})));
         card.append(item);
       }
@@ -78,9 +98,9 @@ export function initAccountUsage({hosts=()=>[],localHostId,openAccounts=()=>{}}=
       const row=el('button','quota-row');row.type='button';
       const signedOut=account.error==='not_logged_in';
       row.onclick=()=>{if(signedOut)signIn(account);else{renderDetails();dialog.showModal();}};
-      const line=el('div','quota-line'),value=account.summary?.remainingPercent;
-      line.append(el('strong','',account.label),el('span','quota-value',value===null||value===undefined?'—':percent(value)));row.append(line,bar(account.summary,account.label));
-      const kind=account.auth==='api_key'?'API':t(account.summaryWindow==='five_hour'?'五小时额度':'周额度');
+      const shown=shownWindow(account),line=el('div','quota-line'),value=shown?.remainingPercent;
+      line.append(el('strong','',account.label),el('span','quota-value',value===null||value===undefined?'—':percent(value)));row.append(line,bar(shown,account.label));
+      const kind=account.auth==='api_key'?'API':shown?windowName(account,shown):t(account.summaryWindow==='five_hour'?'五小时额度':'周额度');
       row.append(el('span','quota-caption',`${kind} · ${t(signedOut?'未登录 · 点击登录':account.status==='stale'?'上次数据':account.status==='unavailable'?'暂不可用':value===null||value===undefined?(account.auth==='api_key'?'按用量计费':'暂无额度数据'):'剩余')}`));
       rows.append(row);
     }
