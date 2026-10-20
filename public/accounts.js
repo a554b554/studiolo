@@ -30,18 +30,18 @@ export function initAccounts({hosts,localHostId,onChange=()=>{}}){
   const changed=()=>{onChange(hostId);return load();};
   async function act(key,fn){if(pending.has(key))return;pending.add(key);render();try{await fn();}catch(e){fail(e);}finally{pending.delete(key);render();}}
   // Sign-in flows by account id. Device-code flows are polled until the host reports the outcome.
+  // Callers run this inside act('login:<id>') or act('create'); it must not take the 'login:<id>'
+  // key itself, or the button's own act() would make it return before doing anything.
   async function startLogin(account,apiKey){
-    await act('login:'+account.id,async()=>{
-      const popup=account.auth==='oauth'?window.open('','_blank'):null;
-      flows[account.id]={status:'starting'};render();
-      try{
-        const flow=await post(`${base()}/accounts/${encodeURIComponent(account.id)}/login`,apiKey!==undefined?{apiKey}:{});
-        flows[account.id]={...flow,code:''};
-        if(flow.kind==='oauth'&&popup&&!popup.closed){popup.opener=null;popup.location.href=flow.url;}else popup?.close();
-        if(flow.status==='ok'){delete flows[account.id];await changed();return;}
-        if(flow.kind==='device_code')poll(account.id,flow.id);
-      }catch(e){popup?.close();flows[account.id]={status:'failed',error:e.message};}
-    });
+    const popup=account.auth==='oauth'?window.open('','_blank'):null;
+    flows[account.id]={status:'starting'};render();
+    try{
+      const flow=await post(`${base()}/accounts/${encodeURIComponent(account.id)}/login`,apiKey!==undefined?{apiKey}:{});
+      flows[account.id]={...flow,code:''};
+      if(flow.kind==='oauth'&&popup&&!popup.closed){popup.opener=null;popup.location.href=flow.url;}else popup?.close();
+      if(flow.status==='ok'){delete flows[account.id];await changed();return;}
+      if(flow.kind==='device_code')poll(account.id,flow.id);
+    }catch(e){popup?.close();flows[account.id]={status:'failed',error:e.message};}
   }
   async function poll(accountId,flowId){
     while(flows[accountId]?.id===flowId){
@@ -98,7 +98,7 @@ export function initAccounts({hosts,localHostId,onChange=()=>{}}){
     const form=el('form','account-form'),input=el('input','');
     Object.assign(input,{type:'password',autocomplete:'off',spellcheck:false,placeholder:account.family==='claude'?'sk-ant-…':'sk-…'});input.setAttribute('aria-label','API key');
     const submit=el('button','primary',t(create?'保存并登录':'登录'));submit.type='submit';
-    form.onsubmit=event=>{event.preventDefault();const key=input.value.trim();if(!key)return;input.value='';void startLogin(account,key);};
+    form.onsubmit=event=>{event.preventDefault();const key=input.value.trim();if(!key)return;input.value='';void act('login:'+account.id,()=>startLogin(account,key));};
     form.append(input,submit);
     const note=el('p','small muted',t('API key 只保存在该电脑的账号目录里，不会同步，也不会再显示。'));
     const wrap=el('div','account-flow');wrap.append(form,note);return wrap;
