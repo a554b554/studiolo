@@ -25,7 +25,7 @@ document.querySelectorAll('[data-close-drawer]').forEach(el => el.addEventListen
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 $('#notice').addEventListener('click', clearError);
 $('#project-new').addEventListener('click', () => showDialog('#project-dialog'));
-$('#settings-open').addEventListener('click', () => { renderHosts(); showDialog('#settings-dialog'); attempt(renderArchives); });
+$('#settings-open').addEventListener('click', () => { renderHosts(); showDialog('#settings-dialog'); attempt(renderArchives); attempt(renderSubagentSettings); });
 $('#artifact-new').addEventListener('click', () => { if (!view.projectId) return showError(new Error(t('请先打开项目'))); showDialog('#artifact-dialog'); });
 $('#files-refresh').addEventListener('click', () => attempt(async () => { await reloadProject(); await loadFiles(); }));
 document.querySelectorAll('[data-resource]').forEach(tab => tab.addEventListener('click', () => {
@@ -446,6 +446,31 @@ function renderHosts() {
   const list = $('#host-list'); list.replaceChildren();
   for (const host of view.bootstrap?.hosts || []) { const row = node('div','host-item'); row.append(node('span','',host.name || host.id),node('small','muted',host.local ? t('本机') : host.url || '')); list.append(row); }
 }
+// Subagent routing rules: a shared prompt the agents read; each machine appends its own accounts
+// and quota when a conversation starts, so the preview shows what this server would send.
+let subagentSettings = null;
+async function renderSubagentSettings() {
+  const status = $('#subagent-status'); status.textContent = t('正在读取…');
+  try {
+    subagentSettings = await api('/api/settings/subagents');
+    $('#subagent-enabled').checked = subagentSettings.enabled !== false;
+    $('#subagent-rules').value = subagentSettings.rules || '';
+    $('#subagent-preview').textContent = subagentSettings.preview || (subagentSettings.previewError ? `${t('无法生成预览')}: ${subagentSettings.previewError}` : t(subagentSettings.enabled === false ? '已关闭：新对话不会收到子代理说明。' : '本机没有可用账号，新对话不会收到子代理说明。'));
+    status.textContent = subagentSettings.updatedAt ? t('上次保存：{time}', {time: time(subagentSettings.updatedAt)}) : t('使用默认规则');
+  } catch (error) {
+    // A server still running the previous version has no settings route; say so instead of raising a notice.
+    if (error.status === 404) { status.textContent = t('此服务器尚未启用子代理设置（需要重启服务）'); $('#subagent-preview').textContent = ''; return; }
+    status.textContent = ''; throw error;
+  }
+}
+async function saveSubagentSettings() {
+  const status = $('#subagent-status'); status.textContent = t('正在保存…');
+  await api('/api/settings/subagents', {method: 'PUT', body: {enabled: $('#subagent-enabled').checked, rules: $('#subagent-rules').value}});
+  await renderSubagentSettings();
+  status.textContent = t('已保存。新对话立即生效，进行中的对话在下一条消息收到更新。');
+}
+$('#subagent-save').addEventListener('click', () => attempt(saveSubagentSettings));
+$('#subagent-reset').addEventListener('click', () => { if (subagentSettings) $('#subagent-rules').value = subagentSettings.defaultRules || ''; });
 async function renderArchives() {
   const list=$('#archive-list');list.replaceChildren(empty(t('正在读取…')));
   try {

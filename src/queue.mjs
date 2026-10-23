@@ -28,7 +28,10 @@ const deferred = () => { let resolve, reject; const promise = new Promise((yes, 
 export class QueueManager {
   // Each commit writes a full project snapshot, so streamed output is committed at most
   // every outputCommitMs; clients see uncommitted output through overlay() meanwhile.
-  constructor({ store, runner, hostId, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
+  // `knowledge` resolves the machine-specific shared knowledge ({text, hash} or null) appended to
+  // platform prompts; see subagents.mjs. A failure there never blocks the run.
+  constructor({ store, runner, hostId, knowledge = null, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
+    this.knowledge = knowledge;
     this.store = store;
     this.runner = runner;
     this.hostId = hostId;
@@ -283,7 +286,8 @@ export class QueueManager {
       const state = await this.store.read(projectId);
       const nativeSessionId = state.nativeSessions[mappingKey(this.hostId, run)];
       // Slash commands go to the CLI verbatim: no platform prompt, no attachment notes.
-      const {prompt, metadata} = run.command ? {prompt: run.text, metadata: {version:1, mode:'command', promptChars: run.text.length}} : buildContext(state, run, nativeSessionId, this.hostId);
+      const knowledge = run.command || !this.knowledge ? null : await Promise.resolve().then(() => this.knowledge(run)).catch(() => null);
+      const {prompt, metadata} = run.command ? {prompt: run.text, metadata: {version:1, mode:'command', promptChars: run.text.length}} : buildContext(state, run, nativeSessionId, this.hostId, knowledge);
       const previousUsage = state.runs.findLast(r => r.id !== run.id && r.hostId === this.hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.usage?.sessionTotal)?.usage?.sessionTotal;
       await this.store.mutate(projectId, 'run.context', s => { s.runs.find(r => r.id === runId).context = metadata; });
       this.live.set(runId, live);

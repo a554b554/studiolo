@@ -97,6 +97,8 @@ export class AccountUsage {
   constructor({runner,read=readNativeUsage,now=Date.now,ttlMs=60000}){Object.assign(this,{runner,read,now,ttlMs});this.cache=null;this.pending=null;}
   // After a sign-in the next read must reach the CLI even inside the refresh throttle.
   invalidate(){this.lastAttempt=-Infinity;}
+  // Whatever was read last, however old, without starting a CLI; null before the first read.
+  peek(){return this.cache;}
   async get({refresh=false}={}){
     if(this.pending)return this.pending;
     if(this.cache&&(!refresh||this.now()-this.lastAttempt<5000)&&this.now()-this.lastAttempt<this.ttlMs)return this.cache;

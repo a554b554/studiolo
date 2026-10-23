@@ -13,7 +13,7 @@
 [![Tests](https://img.shields.io/badge/tests-node%20--test-6f42c1)](test)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Quick start](#quick-start) · [Accounts](#accounts-and-sign-in) · [Chat like the CLI](#chat-like-the-cli) · [Multi-machine](#multi-machine) · [Artifacts](#artifacts-and-in-page-comments) · [FAQ](#faq)
+[Quick start](#quick-start) · [Accounts](#accounts-and-sign-in) · [Chat like the CLI](#chat-like-the-cli) · [Subagents](#subagents-and-account-routing) · [Multi-machine](#multi-machine) · [Artifacts](#artifacts-and-in-page-comments) · [FAQ](#faq)
 
 </div>
 
@@ -50,6 +50,7 @@ Studiolo is a self-hosted web workbench that drives the **Claude Code** and **Co
 - **Accounts per machine, managed by Studiolo.** Sign in several Claude and Codex accounts on each computer from the browser. Each account gets its own isolated CLI configuration directory; nothing touches your personal `~/.claude` or `~/.codex`. Quota for every account is shown live.
 - **One project history across machines.** Projects live in a folder you synchronize however you like (Syncthing, for example). Conversation history is an append-only journal that merges deterministically; every machine runs the same server and serves the same history. A conversation executes on the machine you chose for it; you can read and continue it from any of them.
 - **The terminal experience, in the browser.** Stop a turn with Esc, steer a running agent with a follow-up message, type `/` for the CLI's own slash commands — all mapped to the native protocols, not re-implemented.
+- **Subagents across accounts.** An agent can hand a task to any other account signed in on its machine — Claude from Codex, Codex from Claude — as a one-shot subagent, routed by rules you edit in Settings and by live quota.
 - **Artifacts and in-page comments.** Web apps the agents build run as Artifacts with persistent backends and synchronized storage; select something in the preview and send it to an agent as a task.
 
 ---
@@ -99,6 +100,18 @@ Permission requests that the CLI would ask in the terminal appear in the page: a
 
 ---
 
+## Subagents and account routing
+
+An agent in a conversation can hand a task to any other account signed in on its machine — Claude Code or Codex — as a one-shot subagent: a Codex session can call a Claude subagent and vice versa, and work can be spread over the quota of several accounts. This comes on top of the CLI's own subagent tools, which always use the conversation's account.
+
+- **Launcher** `scripts/subagent.mjs`: `node scripts/subagent.mjs --account "<label or id>" --model <model id> [--effort …] [--permissions auto|project-write|read-only] [--cwd <dir>] [--timeout <seconds>] [--verbose] "<task>"` (the task may also come from stdin). It reads this machine's `~/.studio-local/accounts.json`, runs `claude -p` / `codex exec` once with that account's configuration directory and the same CLI arguments the web chat uses, prints the final answer to stdout and a one-line summary (account, model, tokens) to stderr. Exit code 0 means finished, 3 means it stopped at a permission nobody could answer, anything else is a failure. `--list` prints the accounts on this machine with their current quota and the routing rules. Model names accept alias fragments (`haiku`, `sonnet-5-5`); permissions default to auto, or project-write for models without an auto mode.
+- **Shared knowledge** (`src/subagents.mjs`, `src/context.mjs`): the platform prompt of every new conversation's first turn carries a *Subagents* section — how to call the launcher, the accounts available on this machine (label, id, CLI, plan, quota, models) and the routing rules — and asks the agent to follow the request when the user names an account or model, otherwise to choose by the rules and the quota and say which account it used. Quota comes from the usage panel's cache (it never waits for a CLI) and is refreshed in the background when stale. When the rules or the account list change, running conversations receive the section again with their next message; a quota change alone does not resend it. Slash commands and title generation never carry it.
+- **Settings → Subagents**: an on/off switch, the routing rules text, *Restore default*, *Save rules*, and a preview of the section this machine would append. The default rules prefer a team or secondary account for smaller models, keep premium models on the main account, fall back to the main account when the preferred ones have less than 30 % left in any quota window, and let an account or model named in the message override everything. The rules are saved in `projects/.studio-settings.json` and synchronized with the projects to every machine; each machine appends its own accounts and quota at run time. API: `GET` / `PUT /api/settings/subagents`.
+
+A subagent does not inherit the conversation and nobody answers its questions, so the agent has to spell out the files and the expected output in the task. It spends the quota of the account it runs on, whichever account the chat uses.
+
+---
+
 ## Multi-machine
 
 Run the same server on every computer; put `projects/` in a folder you synchronize (Syncthing or any file sync). Each project's `.studio/events/` is an immutable, causally-ordered journal; machines that are online also exchange journals directly so changes appear within seconds. Any machine can show every conversation; execution always happens on the machine the conversation is bound to, and native CLI sessions never migrate.
@@ -141,6 +154,7 @@ In the preview, *select an element, text or a canvas region* and write a comment
 | `projects/<id>/uploads/` | Files dropped into the chat or the resource pane |
 | `projects/.servers/` | Public addresses of servers for discovery (no secrets) |
 | `projects/.deleted/<id>.json` | Tombstones of deleted projects (synchronized); a folder recreated by late sync is removed again |
+| `projects/.studio-settings.json` | Shared settings: subagent routing rules (synchronized) |
 | `~/.studio-local/` | Machine-private: identity, `accounts.json`, `accounts/<id>/`, pairing, Tailscale settings — never synchronize |
 | `~/.studio-local/agent-profiles.json` | Optional: executable path / env per CLI family (`claude`, `codex`) or per account id |
 

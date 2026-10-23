@@ -3,7 +3,9 @@ import {createHash} from 'node:crypto';
 
 // Instructions live in the native transcript. Resuming it must not append another
 // copy of the platform prompt (or replay the conversation) on every user turn.
-export function buildContext(state, run, nativeSessionId, hostId) {
+// `knowledge` ({text, hash}, from subagents.mjs) is machine-specific shared knowledge: sent with the
+// bootstrap turn and again only when its hash differs from the one the previous turn carried.
+export function buildContext(state, run, nativeSessionId, hostId, knowledge = null) {
   // Slash-command runs carry no platform prompt, so they do not count as the bootstrap turn.
   const prior = state.runs.filter(r => r.id !== run.id && r.hostId === hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.status === 'succeeded' && !r.command);
   const bootstrap = !nativeSessionId || !prior.length;
@@ -25,6 +27,8 @@ export function buildContext(state, run, nativeSessionId, hostId) {
     'Do not modify internal files in .studio; the platform maintains them. When generating an interactive webpage or application, maintain studio.artifacts.json at the project root so the platform can register its link. The format is {"artifacts":[{"key":"stable-key","name":"Application name","root":"relative/app/directory","entry":"index.html","command":["node","server.mjs"],"port":4320,"dataPaths":["relative/project/data"]}]}. command, port and dataPaths are optional; omit command and port for static pages. Use project-relative paths and a stable key. Preserve every other existing manifest entry unchanged.',
     'Artifacts are shared across machines. The web server hosting this page runs its Artifact and comment agent locally. Keep backend persistent data inside the project and list its paths in dataPaths; use the same relative paths on every machine, never hostname-specific files, temp folders or home-directory storage for shared app state. In Studio previews, localStorage is persisted by the platform to project files and synchronized by Syncthing. sessionStorage and IndexedDB are not shared; use localStorage for small durable browser state or a backend with project dataPaths for larger data. Syncthing is asynchronous and does not merge concurrent database transactions.'
   );
+  const knowledgeHash = knowledge?.text ? knowledge.hash : undefined;
+  if (knowledgeHash && (bootstrap || prior.at(-1)?.context?.knowledgeHash !== knowledgeHash)) parts.push(knowledge.text);
   const artifact = state.artifacts.find(a => a.id === run.artifactId);
   const annotation = state.annotations.find(a => a.id === run.annotationId);
   let evidenceHash;
@@ -37,5 +41,5 @@ export function buildContext(state, run, nativeSessionId, hostId) {
     else parts.push(`Comment: ${annotation.id}`);
   }
   const prompt = parts.join('\n');
-  return {prompt, metadata:{version:1,mode:bootstrap?'bootstrap':'delta',promptChars:prompt.length,...(evidenceHash?{evidenceHash}:{})}};
+  return {prompt, metadata:{version:1,mode:bootstrap?'bootstrap':'delta',promptChars:prompt.length,...(evidenceHash?{evidenceHash}:{}),...(knowledgeHash?{knowledgeHash}:{})}};
 }

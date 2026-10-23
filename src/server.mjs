@@ -23,6 +23,7 @@ import {Hosts} from './hosts.mjs';
 import {sessionBinding,journalDigest} from './journal.mjs';
 import {validateModelPermission} from '../public/model-permissions.js';
 import {saveUpload,normalizeAttachments,assertAttachmentsExist} from './uploads.mjs';
+import {SubagentPolicy,SubagentKnowledge} from './subagents.mjs';
 
 const here=path.dirname(fileURLToPath(import.meta.url));const publicRoot=path.resolve(here,'../public');
 const localAddress=x=>['127.0.0.1','::1','::ffff:127.0.0.1'].includes(x);
@@ -43,7 +44,11 @@ export async function createStudio(options={}){
   if(tailnet&&(bind!=='127.0.0.1'||(!token&&!tailnet.trustedHosts)))throw new Error('Tailscale Serve requires loopback binding and an explicit access policy');
   let machine;try{machine=JSON.parse(await fs.readFile(path.join(stateDir,'machine.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw new Error('本机配置无法读取，拒绝重建身份：'+error.message);machine={hostId:randomUUID(),name:tailnet?.name||os.hostname(),hosts:[]};await writeJson(path.join(stateDir,'machine.json'),machine);}
   const projectRoot=options.projectRoot||path.resolve(here,'../projects');
-  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const queue=new QueueManager({store,runner,hostId});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
+  const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const accountUsage=options.accountUsage||new AccountUsage({runner});
+  // Subagent routing rules are saved beside the synchronized projects (one copy for every machine);
+  // the accounts of this machine and their quota are appended when a conversation starts.
+  const subagentPolicy=new SubagentPolicy({file:path.join(projectRoot,'.studio-settings.json')});const subagentKnowledge=new SubagentKnowledge({runner,accountUsage,policy:subagentPolicy,helperPath:path.resolve(here,'../scripts/subagent.mjs')});
+  const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe()});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||4311),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
   const hosts=new Hosts({machine,projectRoot,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||4310}`:undefined),profiles:()=>runner.profiles()});await hosts.init();
   // Accounts live per machine; a conversation bound to an account that no longer exists on
   // its machine may continue with another account there (the native transcript is not kept).
@@ -70,7 +75,6 @@ export async function createStudio(options={}){
     const result=await hosts.request(host,pathname,{method,data:input,timeout:30000});
     await hosts.sync(store,host,pid);return result;
   }
-  const accountUsage=options.accountUsage||new AccountUsage({runner});
   // Sign-in runs on the machine that owns the account; pages on other machines reach it through
   // /api/hosts/:id/accounts. Claude subscription sign-in is the pasted-code flow in AccountAuth.
   const accountChanged=()=>{accountUsage.invalidate?.();hosts.cache=null;};
@@ -121,6 +125,12 @@ export async function createStudio(options={}){
     const authFlow=/^\/api\/account-auth\/([^/]+)(\/code)?$/.exec(pathname);
     if(authFlow?.[2]&&req.method==='POST')return send(res,await accountAuth.submit(authFlow[1],(await body(req)).code));
     if(authFlow&&!authFlow[2]&&req.method==='DELETE')return send(res,accountAuth.cancel(authFlow[1]));
+    // Subagent routing rules (shared) plus a preview of the section this machine would append to a new conversation.
+    if(pathname==='/api/settings/subagents'){
+      if(req.method==='GET'){const policy=await subagentPolicy.get();const knowledge=await subagentKnowledge.describe().catch(e=>({error:e.message}));return send(res,{hostId,hostName:machine.name,...policy,helperPath:subagentKnowledge.helperPath,preview:knowledge?.text||null,previewError:knowledge?.error||null});}
+      if(req.method==='PUT'){const input=await body(req);return send(res,{hostId,hostName:machine.name,...await subagentPolicy.set({enabled:input.enabled,rules:input.rules},machine.name)});}
+      throw httpError('Method not allowed',405);
+    }
     if(pathname==='/api/archives'&&req.method==='GET')return send(res,await listArchives(store));
     if(pathname==='/api/identity')return send(res,{protocol:2,hostId,name:machine.name,profiles:await runner.profiles()});
     if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,features:{},projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin))});
