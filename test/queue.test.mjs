@@ -137,7 +137,9 @@ test('failure pauses queue; accounts are fixed within sessions and project histo
   assert.match(calls[2].prompt, /Preserve every other existing manifest entry unchanged/);
   assert.equal(calls[3].prompt, 'codex again');
   const s = await f.read();
-  assert.equal(s.messages.find(m => m.role === 'assistant').text, 'final reply');
+  assert.equal(s.messages.find(m => m.role === 'assistant' && m.kind !== 'narration').text, 'final reply');
+  assert.equal(s.messages.find(m => m.role === 'assistant').kind, 'narration', 'text before a tool call is kept as narration');
+  assert.equal(s.messages.find(m => m.role === 'assistant').text, 'streamed ');
   assert.ok(s.messages.some(m => m.kind === 'tool' && m.text === 'read a file'));
 });
 
@@ -289,14 +291,14 @@ test('streamed output is coalesced into few snapshots, visible live first, with 
   const durable = await f.read();
   assert.equal(durable.messages.some(m => m.role === 'assistant'), false, 'output stays in memory until the commit interval');
   const live = f.queue.overlay(f.project.id, await f.read());
-  assert.deepEqual(live.messages.filter(m => m.runId === run.id).slice(-3).map(m => m.text), ['a'.repeat(1000) + 'b'.repeat(1000), 'middle tool', 'later status']);
+  assert.deepEqual(live.messages.filter(m => m.runId === run.id).slice(-4).map(m => [m.kind, m.text]), [['narration', 'a'.repeat(1000)], ['tool', 'middle tool'], [undefined, 'b'.repeat(1000)], ['status', 'later status']]);
   release();
   await waitFor(async () => (await f.read()).runs[0].status === 'failed');
   const state = await f.read();
-  const assistant = state.messages.find(m => m.role === 'assistant');
-  assert.equal(assistant.text, 'a'.repeat(1000) + 'b'.repeat(1000) + 'last text before error');
-  assert.equal(assistant.id, live.messages.find(m => m.role === 'assistant').id, 'live and durable views share message IDs');
-  assert.deepEqual(state.messages.filter(m => m.kind).map(m => m.text), ['middle tool', 'later status']);
+  const [narration, reply] = state.messages.filter(m => m.role === 'assistant');
+  assert.equal(reply.text, 'b'.repeat(1000) + 'last text before error');
+  assert.deepEqual([narration.id, reply.id], live.messages.filter(m => m.role === 'assistant').map(m => m.id), 'live and durable views share message IDs');
+  assert.deepEqual(state.messages.filter(m => m.kind).map(m => m.text), ['a'.repeat(1000), 'middle tool', 'later status']);
   const eventDir = path.join(f.project.path, '.studio', 'events');
   const events = await Promise.all((await fs.readdir(eventDir)).sort().map(name => fs.readFile(path.join(eventDir, name), 'utf8').then(JSON.parse)));
   assert.equal(events.filter(e => e.type === 'run.output').length, 1, '2001 deltas, a tool and a status event become one snapshot');
@@ -378,4 +380,39 @@ test('legacy waiting continuation is explicit, idempotent and runs before later 
  await f.submit('later');const next=await f.queue.continueWaiting(f.project.id,old.id);const again=await f.queue.continueWaiting(f.project.id,old.id);assert.equal(next.id,again.id);
  await waitFor(async()=>(await f.read()).runs.every(r=>['succeeded','cancelled'].includes(r.status)));
  assert.equal(calls.length,3);assert.match(calls[1].prompt,/原请求：\noriginal/);assert.match(calls[2].prompt,/^later/);assert.equal(calls[1].permissionMode,'auto');
+});
+
+test('replies stream as their own segment; narration and whole-turn texts stay as streamed', async t => {
+  const f = await fixture(t, async ({ prompt, onEvent }) => {
+    onEvent({ type: 'text', text: 'Let me check. ' });
+    onEvent({ type: 'narration', text: '' });
+    onEvent({ type: 'text', text: 'Reading. ' });
+    onEvent({ type: 'tool', text: 'Read: {}' });
+    onEvent({ type: 'tool', text: 'Tool result: ok' });
+    onEvent({ type: 'text', text: 'Done.' });
+    return prompt.includes('INTERRUPT-ME') ? { text: 'Let me check. Reading. Done.', status: 'interrupted' } : { text: 'Done!' };
+  });
+  await f.submit('first');
+  await waitFor(async () => (await f.read()).runs[0]?.status === 'succeeded');
+  let state = await f.read();
+  assert.deepEqual(state.messages.filter(m => m.role === 'assistant').map(m => [m.kind, m.text, m.progressText]), [['narration', 'Let me check. ', undefined], ['narration', 'Reading. ', undefined], [undefined, 'Done!', 'Done.']]);
+  assert.equal(state.project.unread[f.sessions[0]].status, 'succeeded');
+  await f.submit('INTERRUPT-ME', f.sessions[1]);
+  await waitFor(async () => (await f.read()).runs[1]?.status === 'cancelled');
+  state = await f.read();
+  assert.deepEqual(state.messages.filter(m => m.runId === state.runs[1].id && m.role === 'assistant').map(m => m.text), ['Let me check. ', 'Reading. ', 'Done.'], 'an interrupted turn reporting all of its text adds nothing');
+  assert.deepEqual(Object.keys(state.project.unread).sort(), [...f.sessions].sort());
+});
+
+test('unseen marks survive a newer finish and clear when that conversation is archived', async t => {
+  const {markSeen} = await import('../src/unread.mjs');
+  const {changeLifecycle} = await import('../src/lifecycle.mjs');
+  const f = await fixture(t, async () => ({ text: 'ok' }));
+  await f.submit('one');
+  await waitFor(async () => (await f.read()).runs[0]?.status === 'succeeded');
+  const mark = (await f.read()).project.unread[f.sessions[0]];
+  assert.equal(markSeen(structuredClone(await f.read()), f.sessions[0], '2000-01-01T00:00:00.000Z'), false, 'an older view keeps a newer mark');
+  assert.equal(markSeen(structuredClone(await f.read()), f.sessions[0], mark.at), true);
+  await changeLifecycle(f.store, f.project.id, f.sessions[0], 'archive');
+  assert.deepEqual((await f.read()).project.unread, {});
 });

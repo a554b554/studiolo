@@ -62,7 +62,7 @@ export function codexChannel(config,{cwd,prompt,model,reasoningEffort,nativeSess
         const item=p.item;items.set(item.id,item);
         if(item.type==='agentMessage'){
           if(!streamed.has(item.id)){output+=item.text;emit('text',item.text);}
-          if(!item.phase||item.phase==='final_answer')finalText=item.text;
+          if(!item.phase||item.phase==='final_answer')finalText=item.text;else if(item.phase==='commentary')emit('narration','');
         } else if(['commandExecution','fileChange','mcpToolCall','webSearch','dynamicToolCall'].includes(item.type))emit('tool',JSON.stringify(item));
       }
       if(e.method==='error'){emit('status',p.error?.message||'Codex error');}

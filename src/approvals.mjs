@@ -1,4 +1,5 @@
 import {randomUUID} from 'node:crypto';
+import {markUnread} from './unread.mjs';
 
 const fail = message => Object.assign(new Error(message), {status:409});
 // Only the native request callback lives in memory. Durable records are display/audit data,
@@ -26,7 +27,7 @@ export class Approvals {
         const run=s.runs.find(r=>r.id===runId);
         if(signal.aborted||run?.hostId!==this.hostId||!run||!['running','waiting'].includes(run.status))throw fail('执行已结束');
         (run.approvals ||= []).push({...request,id,status:'pending',createdAt:new Date().toISOString()});
-        run.status='waiting';
+        run.status='waiting';markUnread(s,run);
       });
       return await promise;
     } finally {signal.removeEventListener('abort',abort);this.pending.delete(id);}

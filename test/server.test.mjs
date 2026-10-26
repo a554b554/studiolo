@@ -31,6 +31,16 @@ test('conversation rename validates input and persists a manual title',async t=>
  assert.match(await fs.readFile(path.join(p.path,'.studio','sessions',s.id+'.md'),'utf8'),/^# 我的标题/);
  await assert.rejects(api(`/api/projects/${p.id}/sessions/missing`,'PATCH',{title:'test'}),e=>e.status===404);
 });
+test('a finished conversation stays marked until it is viewed',async t=>{
+ const {api,app}=await setup(t);const p=await api('/api/projects','POST',{name:'unread'}),root=`/api/projects/${p.id}`;
+ const s=await api(root+'/sessions','POST',{title:'one'});
+ await api(root+'/messages','POST',{sessionId:s.id,requestId:'unread-1',text:'hello',profileId:'fake',model:'test'});
+ const deadline=Date.now()+8000;while(!(await app.store.read(p.id)).project.unread?.[s.id]&&Date.now()<deadline)await new Promise(r=>setTimeout(r,20));
+ const mark=(await api('/api/projects')).find(x=>x.id===p.id).unread[s.id];assert.equal(mark.status,'succeeded');
+ await api(root+`/sessions/${s.id}/seen`,'POST',{at:'2000-01-01T00:00:00.000Z'});assert.ok((await app.store.read(p.id)).project.unread[s.id],'an older view keeps the mark');
+ await api(root+`/sessions/${s.id}/seen`,'POST',{at:mark.at});assert.deepEqual((await app.store.read(p.id)).project.unread,{});
+ await api(root+`/sessions/${s.id}/seen`,'POST',{at:mark.at});
+});
 test('managed project creation rejects arbitrary paths and no longer exposes host folder browsing',async t=>{
  const {api,dir}=await setup(t);
  const project=await api('/api/projects','POST',{name:'../同名 project'});

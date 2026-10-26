@@ -254,7 +254,7 @@ export class ResidentSession {
       if(e.method==='item/started')t.items.set(p.item.id,p.item);
       if(e.method==='item/completed'){
         const item=p.item;t.items.set(item.id,item);
-        if(item.type==='agentMessage'){if(!t.streamed.has(item.id)){this.text(t,item.text);}if(!item.phase||item.phase==='final_answer')t.finalText=item.text;}
+        if(item.type==='agentMessage'){if(!t.streamed.has(item.id)){this.text(t,item.text);}if(!item.phase||item.phase==='final_answer')t.finalText=item.text;else if(item.phase==='commentary')this.emit('narration','');}
         else if(item.type==='contextCompaction')this.emit('status','Context compacted');
         else if(['commandExecution','fileChange','mcpToolCall','webSearch','dynamicToolCall'].includes(item.type))this.emit('tool',JSON.stringify(item));
       }

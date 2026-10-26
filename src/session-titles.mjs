@@ -34,7 +34,7 @@ export class SessionTitles {
     if (!needsTitle(session) || inactive(session) || inactive(state.project) || run?.hostId !== this.hostId || run?.status !== 'succeeded') return;
     if (state.runs.find(r => r.sessionId === session.id && r.status === 'succeeded')?.id !== runId) return;
     const user = state.messages.find(m => m.runId === runId && m.role === 'user')?.text || run.text;
-    const assistant = state.messages.find(m => m.runId === runId && m.role === 'assistant')?.text || '';
+    const assistant = state.messages.find(m => m.runId === runId && m.role === 'assistant' && m.kind !== 'narration')?.text || '';
     let title, usage;
     try {
       const result = await this.runner.summarizeTitle?.({cwd:state.project.path, profileId:run.profileId, model:run.model, user, assistant, signal:AbortSignal.any([signal, AbortSignal.timeout(45000)])});

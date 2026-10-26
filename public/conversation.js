@@ -10,31 +10,36 @@ function backgroundReply(message) {
   return {...message,role:'assistant',text,kind:'background_reply'};
 }
 // A presentation projection only: original messages and operation records remain intact.
+// What an agent says between tool calls (narration) folds into the raw log with the tools, in
+// the order it happened; replies show where they arrive, and the one an executing run is still
+// writing is marked `streaming` (nothing has happened in that run since it began).
 export function conversationItems(messages, runs = []) {
-  const result = [], emitted = new Set();
+  const result = [], emitted = new Set(), streams = new Map();
+  const reply = message => ({kind:'message',message,...(streams.get(message.runId) === message.id ? {streaming:true} : {})});
   for (const message of messages) {
     if (message.role === 'user') { result.push({kind:'message',message}); continue; }
     const background = backgroundReply(message);
     if (background) { result.push({kind:'message',message:background}); continue; }
     const key = message.runId || message.id;
     const run = runs.find(r => r.id === message.runId);
-    const pending = run && (['running','queued'].includes(run.status) || run.status==='waiting'&&run.approvals?.some(a=>a.status==='pending'));
+    const shown = message.role === 'assistant' && message.kind !== 'narration';
     if (emitted.has(key)) {
-      if (!pending && message.role === 'assistant') result.push({kind:'message',message});
+      if (shown) result.push(reply(message));
       continue;
     }
     emitted.add(key);
     const group = messages.filter(m => (m.runId || m.id) === key && m.role !== 'user');
-    const activity = group.filter(m => m.role === 'system');
     const answers = group.filter(m => m.role === 'assistant' && m.kind !== 'background_reply');
-    for (const answer of answers) {
-      if (pending) activity.push({...answer,role:'assistant'});
-      else if (answer.progressText) activity.push({...answer,text:answer.progressText});
-    }
+    const activity = group.filter(m => m.role === 'system' || m.kind === 'narration');
+    for (const answer of answers) if (answer.progressText) activity.push({...answer,text:answer.progressText});
+    // Stable sort; a record without a time (the run error below) stays last.
+    activity.sort((a,b) => (a.createdAt || '￿') < (b.createdAt || '￿') ? -1 : (a.createdAt || '￿') > (b.createdAt || '￿') ? 1 : 0);
+    const current = run?.status === 'running' ? answers.filter(m => m.kind !== 'narration').at(-1) : null;
+    if (current && !messages.some(m => m.runId === key && ['tool','steer','narration'].includes(m.kind) && m.createdAt > current.createdAt)) streams.set(key, current.id);
     if (run?.error && !activity.some(m => m.text === run.error)) activity.push({role:'system',text:run.error});
-    if (activity.length) result.push({kind:'activity',key,activity,status:run?.status});
+    if (activity.length) result.push({kind:'activity',key,activity,status:run?.status,replying:streams.has(key)});
     if (run?.error) result.push({kind:'notice',key,text:run.error});
-    if (!pending && message.role === 'assistant') result.push({kind:'message',message});
+    if (shown) result.push(reply(message));
   }
   return result;
 }

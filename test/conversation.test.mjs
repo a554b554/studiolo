@@ -44,5 +44,20 @@ test('background answers stay visible while a newer user request runs',()=>{
   {id:'b',role:'assistant',kind:'background_reply',runId:'r',text:'Background report'},
   {id:'a2',role:'assistant',runId:'r2',text:'Working'}];
  const items=conversationItems(records,[{id:'r',status:'succeeded'},{id:'r2',status:'running'}]);
- assert.deepEqual(items.filter(i=>i.kind==='message').map(i=>i.message.text),['question','Final answer','next','Background report']);
+ assert.deepEqual(items.filter(i=>i.kind==='message').map(i=>[i.message.text,Boolean(i.streaming)]),[['question',false],['Final answer',false],['next',false],['Background report',false],['Working',true]]);
+});
+
+test('narration folds into the raw log in order while the reply being written streams',()=>{
+ const records=[{id:'u',role:'user',runId:'r',text:'fix it',createdAt:'1'},{id:'s',role:'system',runId:'r',text:'正在处理。',createdAt:'2'},
+  {id:'n',role:'assistant',kind:'narration',runId:'r',text:'Let me look.',createdAt:'3'},{id:'t',role:'system',kind:'tool',runId:'r',text:'Read: {}',createdAt:'3'},
+  {id:'a',role:'assistant',runId:'r',text:'Fixed',createdAt:'5'}];
+ const running=conversationItems(records,[{id:'r',status:'running'}]);
+ assert.deepEqual(running.map(i=>i.kind),['message','activity','message']);
+ assert.deepEqual(running[1].activity.map(m=>m.id),['s','n','t']);assert.equal(running[1].replying,true);
+ assert.equal(running[2].streaming,true);
+ // A step after the reply began means the text was narration after all (it folds on the next tick).
+ const stepped=conversationItems([...records,{id:'t2',role:'system',kind:'tool',runId:'r',text:'Bash: {}',createdAt:'6'}],[{id:'r',status:'running'}]);
+ assert.equal(stepped.at(-1).streaming,undefined);assert.equal(stepped[1].replying,false);
+ const done=conversationItems(records,[{id:'r',status:'succeeded'}]);
+ assert.deepEqual(done.filter(i=>i.kind==='message').map(i=>[i.message.text,Boolean(i.streaming)]),[['fix it',false],['Fixed',false]]);
 });

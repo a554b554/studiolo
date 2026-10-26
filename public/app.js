@@ -200,17 +200,44 @@ async function createProjectSession(projectId) {
     renderNavigation();
   }
 }
+// Conversations whose agent finished or needs an answer since anyone last looked; the open
+// project's own copy is the freshest.
+const unreadOf = project => (project.id === view.projectId && view.project ? view.project.project.unread : project.unread) || {};
+const attention = mark => ['failed','interrupted','waiting'].includes(mark.status);
+function unreadDot(marks) {
+  if (!marks.length) return null;
+  const urgent = marks.some(attention), dot = node('span',`unread-dot${urgent ? ' attention' : ''}`);
+  dot.title = t(urgent ? '需要你查看' : '有新结果'); dot.setAttribute('role','img'); dot.setAttribute('aria-label',dot.title);
+  return dot;
+}
+// The open conversation counts as seen while the page is visible. The mark is dropped locally
+// at once (refreshes racing the request must not bring the dot back) and on the server.
+const seenRequests = new Set();
+function markSeen() {
+  const projectId = view.projectId, sessionId = view.sessionId, mark = view.project?.project.unread?.[sessionId];
+  if (!mark || document.hidden) return;
+  delete view.project.project.unread[sessionId];
+  const listed = view.bootstrap.projects.find(p => p.id === projectId)?.unread;
+  if (listed?.[sessionId] && listed[sessionId].at <= mark.at) delete listed[sessionId];
+  renderNavigation();
+  const key = `${projectId}:${sessionId}:${mark.at}`;
+  if (seenRequests.has(key)) return;
+  seenRequests.add(key);
+  post(`${projectURL(projectId)}/sessions/${encodeURIComponent(sessionId)}/seen`,{at:mark.at}).catch(() => {}).finally(() => seenRequests.delete(key));
+}
+document.addEventListener('visibilitychange', markSeen);
 function renderNavigation() {
   const projects = visibleItems(view.bootstrap.projects);
   // Rebuilding on every refresh would swallow clicks and orphan an open menu.
-  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
+  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name,unreadOf(p)]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
   if (signature === navigationSignature) return;
   navigationSignature = signature;
   const list = $('#project-list'); list.replaceChildren();
   for (const project of projects) {
-    const selected = project.id === view.projectId;
+    const selected = project.id === view.projectId, unread = unreadOf(project);
     const el = button('', () => attempt(() => selectProject(project.id)), `project-button${selected ? ' active' : ''}`);
     el.append(node('span','muted','▧'),node('span','',project.name));
+    const projectDot = unreadDot(Object.values(unread)); if (projectDot) el.append(projectDot);
     const add = button('＋', () => attempt(() => createProjectSession(project.id)), 'project-session-new');
     add.setAttribute('aria-label',t('在 {name} 中新建会话',{name:project.name}));
     add.title = t('新建会话'); add.disabled = creatingSessions.has(project.id);
@@ -220,8 +247,9 @@ function renderNavigation() {
     if (selected && view.project) {
       const sessions = node('div','session-list');
       for (const session of visibleItems(view.project.sessions)) {
-        const sessionButton = button(session.title, () => selectSession(session.id), `session${session.id === view.sessionId ? ' active' : ''}`);
-        sessionButton.title = session.title;
+        const sessionButton = button('', () => selectSession(session.id), `session${session.id === view.sessionId ? ' active' : ''}`);
+        sessionButton.title = session.title; sessionButton.append(node('span','session-name',session.title));
+        const sessionDot = unreadDot(unread[session.id] ? [unread[session.id]] : []); if (sessionDot) sessionButton.append(sessionDot);
         const row = node('div','navigation-row');
         row.append(sessionButton,moreButton(t('对话 {name}',{name:session.title}),lifecycleActions(project,session)));
         sessions.append(row);
@@ -343,6 +371,7 @@ function renderConversation() {
   const queueId = `session:${view.sessionId}`;
   renderRuns($('#queue'), runs, view.project?.queues?.[queueId], runId => attempt(async () => { await post(`${path()}/runs/${runId}/cancel`); await reloadProject(); }), () => attempt(async () => { await post(`${path()}/queues/resume`,{queueId}); await reloadProject(); }), async (runId,id,input)=>{await post(`${path()}/runs/${runId}/approvals/${id}`,input);await reloadProject();},runId=>attempt(async()=>{await post(`${path()}/runs/${runId}/continue`);await reloadProject();}),`${view.projectId}:${queueId}`,
     runId => attempt(async () => { if (!stopRequests.has(runId)) stopRequests.set(runId, Date.now()); await post(`${path()}/runs/${runId}/interrupt`); await reloadProject(); }), stopRequests);
+  markSeen();
 }
 function selectSession(id) {
   view.drafts.set(draftKey(),$('#prompt').value); view.sessionId = id; $('#prompt').value = view.drafts.get(draftKey()) || ''; messageSignature = ''; renderNavigation(); renderConversation(); rememberSelection(); closeDrawer(); $('#messages').scrollTop = $('#messages').scrollHeight;

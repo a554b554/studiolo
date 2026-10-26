@@ -17,6 +17,8 @@ export async function changeLifecycle(store, projectId, sessionId, action) {
     if (target.deletedAt) throw httpError('已删除，不能恢复',410);
     if (sessionId && inactive(state.project)) throw httpError('请先恢复项目',409);
     if (action !== 'restore' && pendingWork(state, sessionId)) throw busy();
+    // A hidden conversation must not keep its project marked as having unseen results.
+    if (sessionId && action !== 'restore' && state.project.unread?.[sessionId]) delete state.project.unread[sessionId];
     if (action === 'archive') {
       target.archivedAt ||= new Date().toISOString();
     } else if (action === 'delete' && sessionId) {

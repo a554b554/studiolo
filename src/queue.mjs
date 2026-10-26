@@ -5,6 +5,7 @@ import {Approvals} from './approvals.mjs';
 import {SessionTitles} from './session-titles.mjs';
 import {sessionBinding} from './journal.mjs';
 import {parseCommand} from './commands.mjs';
+import {markUnread} from './unread.mjs';
 
 const now = () => new Date().toISOString();
 const noActiveTurn = e => e?.message === 'no_active_turn';
@@ -66,6 +67,9 @@ export class QueueManager {
     const done = current.outputSeq || 0;
     // Text streams into the current assistant segment; a steer (a user message delivered
     // mid-turn) is recorded in order and opens a new segment for what the agent says next.
+    // So does a tool call (or Codex marking a message as commentary): the text before it was the
+    // agent narrating its work, which belongs with the operation records, and the reply that
+    // follows streams as a segment of its own.
     let text = '', textAt, assistantId = live.assistantId;
     const appendText = () => {
       if (!text) return;
@@ -84,6 +88,10 @@ export class QueueManager {
       if (event.type === 'reply') {
         if (event.text) s.messages.push({...this._message(current, 'assistant', event.text), id:event.id, createdAt:event.at, kind:'background_reply'});
         continue;
+      }
+      if ((event.type === 'tool' || event.type === 'narration') && event.assistantId) {
+        const segment = s.messages.find(m => m.id === assistantId);
+        if (segment) { segment.kind = 'narration'; assistantId = event.assistantId; }
       }
       if (event.type === 'status') rememberNative(s, current, this.hostId, event.raw);
       if (!event.text) continue;
@@ -110,6 +118,7 @@ export class QueueManager {
             for(const a of run.approvals||[])if(a.status==='pending')a.status='expired';
             run.status = 'interrupted'; run.endedAt = now(); run.error = 'Execution interrupted by service restart; it will not be replayed automatically.';
             s.queues[run.queueId] = { ...s.queues[run.queueId], paused: true, reason: run.error };
+            markUnread(s, run);
           }
         });
         state = await this.store.read(project.id);
@@ -293,12 +302,12 @@ export class QueueManager {
       this.live.set(runId, live);
       // Runners emit without awaiting. The returned promise settles when the event is durable.
       const onEvent = event => {
-        if (this.closed || controller.signal.aborted || !['text', 'tool', 'status', 'reply', 'steer'].includes(event?.type)) return Promise.resolve();
+        if (this.closed || controller.signal.aborted || !['text', 'tool', 'status', 'reply', 'steer', 'narration'].includes(event?.type)) return Promise.resolve();
         const text = typeof event.text === 'string' ? event.text : '';
         if ((event.type === 'text' || event.type === 'steer') && !text) return Promise.resolve();
         const item = { type: event.type, text, raw: event.raw, seq: ++live.seq, at: now() };
         if (event.type !== 'text') item.id = randomUUID();
-        if (event.type === 'steer') item.assistantId = randomUUID();
+        if (['steer', 'tool', 'narration'].includes(event.type)) item.assistantId = randomUUID();
         live.events.push(item); live.chars += text.length;
         live.next ||= deferred();
         const durable = live.next.promise;
@@ -334,13 +343,19 @@ export class QueueManager {
         rememberNative(s, item, this.hostId, result);
         if (result.usage) item.usage = result.usage;
         if (result.runtime) item.nativeRuntime = result.runtime;
-        // The final text replaces the last streamed segment (the one after the latest steer).
-        const message = s.messages.filter(m => m.runId === runId && m.role === 'assistant' && m.kind !== 'background_reply').at(-1);
-        if (result.text) {
+        // The final text replaces the last streamed segment (the one after the latest steer or
+        // tool call). A transport that reports the whole turn's text instead (an interrupted
+        // turn) matches the segments already, so they stay as streamed.
+        const segments = s.messages.filter(m => m.runId === runId && m.role === 'assistant' && m.kind !== 'background_reply');
+        const message = segments.at(-1)?.kind === 'narration' ? null : segments.at(-1);
+        const steeredAt = s.messages.findLast(m => m.runId === runId && m.kind === 'steer')?.createdAt || '';
+        const squash = value => value.replace(/\s+/g, ''), turn = squash(segments.filter(m => m.createdAt > steeredAt).map(m => m.text).join(''));
+        if (result.text && (!turn || squash(scrub(result.text)) !== turn)) {
           if (message) { if (message.text !== scrub(result.text)) message.progressText = message.text; message.text = scrub(result.text); }
           else s.messages.push(this._message(item, 'assistant', result.text));
         }
         if (item.status !== 'waiting') item.endedAt = now();
+        markUnread(s, item);
         if (stopped) {
           // Hold later queued messages until the user decides; a plain stop needs no resume click.
           const pending = s.runs.some(r => r.queueId === item.queueId && r.status === 'queued');
@@ -361,6 +376,7 @@ export class QueueManager {
         run.error = scrub(e.message); run.endedAt = now();
         s.queues[run.queueId] = { paused: true, reason: run.error };
         s.messages.push(this._message(run, 'system', run.error));
+        markUnread(s, run);
       });
     } finally { clearTimeout(live.timer); live.timer = undefined; this.live.delete(runId); this.controllers.delete(runId); await this.approvals.expire(projectId,runId); }
   }

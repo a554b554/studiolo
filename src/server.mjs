@@ -18,6 +18,7 @@ import {AccountAuth} from './account-auth.mjs';
 import {Accounts} from './accounts.mjs';
 import {AccountLogin} from './account-login.mjs';
 import {renameSession,needsTitle} from './session-titles.mjs';
+import {markSeen} from './unread.mjs';
 import {loadTailnet} from './tailnet.mjs';
 import {Hosts} from './hosts.mjs';
 import {sessionBinding,journalDigest} from './journal.mjs';
@@ -177,6 +178,9 @@ export async function createStudio(options={}){
     if(sessionLifecycle)target=sessionBinding(state,sessionLifecycle[1])?.hostId||hostId;
     if(target!==hostId){if(req.headers['x-studio-hop'])throw httpError('Machine binding has not synchronized yet',409);return send(res,await forward(target,pid,pathname+url.search,req.method,input,origin));}
     const readBody=async()=>input||{};
+    // Viewing a conversation clears its unseen-result mark on whichever machine the browser uses.
+    const seen=/^\/sessions\/([^/]+)\/seen$/.exec(tail);
+    if(seen&&req.method==='POST'){const {at}=await readBody();if(markSeen({project:{unread:{...state.project.unread}}},seen[1],at))await store.mutate(pid,'session.seen',s=>{markSeen(s,seen[1],at);});return send(res,{ok:true});}
     const lifecycle=/^\/(?:lifecycle|sessions\/([^/]+)\/lifecycle)$/.exec(tail);
     if(lifecycle&&req.method==='POST'){
       const {action}=await readBody();

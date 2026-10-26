@@ -290,6 +290,7 @@ export class CliRunner {
               // exec JSON on older CLIs omits phase: its last agent_message is the final answer.
               // Explicit commentary must never overwrite an explicit final answer.
               if (!item.phase || item.phase === 'final_answer') resultText = item.text ?? '';
+              else if (item.phase === 'commentary') emit('narration', '');
               if (/workspace is read-only|approvals are disabled|(?:write|edit|operation|action).{0,90}(?:requires? approval|permission (?:denied|required))/i.test(item.text ?? '')) emit('status', 'CLI reported a permission limitation. A completed response does not confirm the requested file operation succeeded; inspect the reply.');
             }
             if (['command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'tool_call'].includes(item.type)) {

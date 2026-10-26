@@ -3,22 +3,108 @@ import { api, post } from './api.js';
 import { conversationItems, runNotice, agentLabel, accountName, familyName } from './conversation.js';
 import { markdown } from './markdown.js';
 import {supportsAuto,validateModelPermission} from './model-permissions.js';
-function renderItem(item, runs, previous) {
+import { describeActivity, duration } from './activity.js';
+// Executing runs show how long they have been working; one ticker updates every counter on the page.
+let ticker;
+function tick() {
+  const counters = document.querySelectorAll('[data-since]');
+  for (const el of counters) el.textContent = duration(Date.now() - Date.parse(el.dataset.since));
+  if (!counters.length) { clearInterval(ticker); ticker = undefined; }
+}
+function elapsed(since) {
+  const el = node('span','activity-elapsed',duration(Date.now() - Date.parse(since)));
+  el.dataset.since = since; ticker ||= setInterval(tick,1000); return el;
+}
+const stepNodes = step => { const target = node('code','activity-target',step.target || ''); if (step.title) target.title = step.title; return [node('span','activity-verb',t(step.verb)),target]; };
+// While a run executes, the collapsed raw log reads as a status line: the step the agent is on,
+// elapsed time and step count, and below it the last thing the agent said between steps.
+function activitySummary(item, run) {
+  const summary = node('summary');
+  if (!['running','waiting'].includes(item.status)) {
+    summary.textContent = t('Raw log · {status} · {count} 条',{status:statuses[item.status] || t('记录'),count:item.activity.length});
+    if (run?.startedAt && run.endedAt) summary.append(node('span','activity-duration',` · ${duration(Date.parse(run.endedAt) - Date.parse(run.startedAt))}`));
+    return summary;
+  }
+  const approval = run?.approvals?.find(a => a.status === 'pending');
+  const info = describeActivity(item.activity,{replying:item.replying,waiting:item.status === 'waiting'});
+  summary.className = 'activity-live';
+  const now = node('span','activity-now');
+  now.append(node('span',`activity-pulse state-${info.state}`));
+  if (info.state === 'step') now.append(...stepNodes(info.step));
+  else {
+    now.append(node('span','activity-state',t({replying:'正在回复',waiting:'等待你处理',thinking:'思考中',starting:'启动中'}[info.state])));
+    if (approval?.title) now.append(node('span','activity-target',approval.title));
+    else if (info.state === 'thinking' && info.step) now.append(node('span','activity-previous',t('上一步')),...stepNodes(info.step));
+  }
+  const meta = node('span','activity-meta');
+  if (run?.startedAt) meta.append(elapsed(run.startedAt));
+  if (info.steps) meta.append(node('span','',t('{count} 步',{count:info.steps})));
+  meta.append(node('span','activity-toggle','Raw log'));
+  summary.append(now,meta);
+  if (info.said) summary.append(node('span','activity-said',info.said));
+  return summary;
+}
+// Reveals streamed text at an even pace that spreads each batch over about the time until the
+// next one (the server sends every ~0.4 s), so it reads as continuous writing; the final batch
+// drains faster. Progress follows elapsed time, not frames, and a timer backs up the animation
+// frame: an embedded pane that is not on screen can report itself visible yet fire few or no
+// frames, and the reply must still appear. Markdown re-renders as it grows.
+function streamingBody(text, fresh) {
+  const body = node('div','message-body markdown streaming');
+  const reduced = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  let target = text, shown = fresh && !reduced ? 0 : text.length, painted = -1, frame = 0, done = false, last = 0, rate = text.length / 500;
+  const paint = () => {
+    if (painted === shown) return;
+    const scroller = body.closest('.messages'), stick = scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 100;
+    body.replaceChildren(markdown(target.slice(0,shown))); painted = shown;
+    if (stick) scroller.scrollTop = scroller.scrollHeight;
+  };
+  const step = now => {
+    frame = 0;
+    const elapsed = last && now ? now - last : 16; last = now || 0;
+    if (target.length > shown) shown = reduced ? target.length : Math.min(target.length, shown + Math.max(1, Math.round(rate * elapsed)));
+    paint();
+    if (shown < target.length) later();
+    else { last = 0; body.classList.toggle('streaming',!done); }
+  };
+  const later = () => {
+    let raf, timer;
+    const run = now => { cancelAnimationFrame(raf); clearTimeout(timer); step(now); };
+    raf = requestAnimationFrame(run); timer = setTimeout(() => run(performance.now()), 100); frame = 1;
+  };
+  // A final text that does not extend what is on screen (the transport replaced it) shows at once.
+  body.studioSet = (next, finished) => {
+    done = finished; if (!next.startsWith(target.slice(0,shown))) shown = next.length;
+    target = next; rate = (target.length - shown) / (finished ? 250 : 500);
+    if (!frame) step();
+  };
+  step();
+  return body;
+}
+function speaker(message, runs) { return message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId)); }
+function renderItem(item, runs, previous, animate = false) {
   if (item.kind === 'notice') return node('p','run-error',runNotice(item.text));
   if (item.kind === 'activity') {
     const details = node('details','run-activity');
     details.dataset.runId = item.key;
-    details.append(node('summary','',t('Raw log · {status} · {count} 条',{status:statuses[item.status] || t('记录'),count:item.activity.length})));
+    details.append(activitySummary(item,runs?.find(run => run.id === item.key)));
     // Raw logs are collapsed by default and can hold large tool output: build records on first open.
     let filled = false;
-    const fill = () => { if (filled || !details.open) return; filled = true; for (const record of item.activity) details.append(node('pre','raw-record',record.text)); };
+    const fill = () => { if (filled || !details.open) return; filled = true; for (const record of item.activity) details.append(node(record.role === 'assistant' ? 'p' : 'pre',record.role === 'assistant' ? 'raw-said' : 'raw-record',record.text)); };
     details.addEventListener('toggle', fill);
-    if (previous?.open) { details.open = true; fill(); }
+    // An open log follows new records when it was scrolled to the end, else keeps its place.
+    if (previous?.open) { details.open = true; fill(); details.studioScroll = previous.scrollHeight - previous.scrollTop - previous.clientHeight < 40 ? Infinity : previous.scrollTop; }
     return details;
   }
   const message = item.message, article = node('article',`message message-${message.role}`);
-  const head = node('div','message-header');
-  head.append(node('strong','',message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId))),node('time','',time(message.createdAt)));
+  const head = node('div','message-header'), name = node('strong','',speaker(message,runs));
+  head.append(name,node('time','',time(message.createdAt)));
+  if (animate && item.streaming) {
+    const body = streamingBody(message.text || '', Date.now() - Date.parse(message.createdAt) < 5000);
+    // Later refreshes update this element in place instead of rebuilding it.
+    article.studioStream = (next, nextRuns) => { name.textContent = speaker(next.message,nextRuns); body.studioSet(next.message.text || '',!next.streaming); };
+    article.append(head,body); return article;
+  }
   article.append(head,messageContent(message)); return article;
 }
 export function renderMessages(container, messages, runs) {
@@ -40,11 +126,15 @@ export function syncMessages(container, messages, runs, trailing = []) {
     const run = item.message && runs?.find(run => run.id === item.message.runId);
     const signature = JSON.stringify([item, run && [run.profileId, run.model, run.actualModel, run.reasoningEffort, run.actualReasoningEffort]]);
     let entry = previous.get(key);
-    if (entry?.signature !== signature) entry = { signature, element: renderItem(item, runs, entry?.element) };
+    if (entry?.signature !== signature) {
+      if (entry?.element.studioStream && item.kind === 'message') { entry.element.studioStream(item, runs); entry = { ...entry, signature }; }
+      else entry = { signature, element: renderItem(item, runs, entry?.element, true) };
+    }
     items.set(key, entry); nodes.push(entry.element);
   }
   container.studioItems = { language, items };
   reconcileChildren(container, [...nodes, ...trailing]);
+  for (const el of nodes) if (el.studioScroll !== undefined) { el.scrollTop = el.studioScroll === Infinity ? el.scrollHeight : el.studioScroll; delete el.studioScroll; }
 }
 // Mirrors how the server folds a machine's live runtime into project state: executing runs are
 // replaced, their messages upserted, and this machine's native runtime entries refreshed. Streamed

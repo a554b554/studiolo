@@ -473,8 +473,9 @@ export class Store {
       const name = `sessions/${session.id}.md`;
       if (!session.deletedAt) lines.push(`- [${String(session.title).replace(/[\[\]\r\n]/g, ' ')}](${name})${session.archivedAt ? ' · archived' : ''}`);
       const messages = bySession.get(session.id) || [];
-      await this._writeDerived(path.join(root, name), `# ${session.title}\n\nOperation records: [${session.id}.operations.md](${session.id}.operations.md)\n\n${format(messages.filter(m => m.role !== 'system'))}`);
-      await this._writeDerived(path.join(root, 'sessions', `${session.id}.operations.md`), `# Operation records — ${session.title}\n\n${format(messages.filter(m => m.role === 'system' || m.progressText).map(m => m.progressText ? {...m,text:m.progressText} : m))}`);
+      await this._writeDerived(path.join(root, name), `# ${session.title}\n\nOperation records: [${session.id}.operations.md](${session.id}.operations.md)\n\n${format(messages.filter(m => m.role !== 'system' && m.kind !== 'narration'))}`);
+      // What agents said between tool calls is part of the operation record, not the conversation.
+      await this._writeDerived(path.join(root, 'sessions', `${session.id}.operations.md`), `# Operation records — ${session.title}\n\n${format(messages.filter(m => m.role === 'system' || m.progressText || m.kind === 'narration').map(m => m.progressText ? {...m,text:m.progressText} : m))}`);
     }
     lines.push('', '## Artifact comments', '');
     for (const artifact of state.artifacts) {
