@@ -59,7 +59,7 @@ Studiolo là một bàn làm việc web tự host, điều khiển các CLI **Cl
 1. **Yêu cầu** — Node.js 22.14+, và CLI `claude` và/hoặc `codex` đã được cài trên máy (`claude --version`, `codex --version`).
 2. **Chạy** `node src/server.mjs` và mở <http://127.0.0.1:4310>.
 3. **Thêm tài khoản** — Settings → *Hosts & accounts* → *Add account*. Chọn máy, loại (Claude Code / Codex) và phương thức đăng nhập, rồi làm theo các bước hiển thị (xem bên dưới).
-4. **Tạo dự án, bắt đầu trò chuyện** — khung soạn tin chọn **máy → tài khoản → mô hình → effort → chế độ quyền**. Tin nhắn đầu tiên cố định máy, tài khoản và mô hình cho cuộc trò chuyện đó; effort và quyền có thể thay đổi theo từng tin nhắn.
+4. **Tạo dự án, bắt đầu trò chuyện** — khung soạn tin chọn **máy → tài khoản → mô hình → effort → chế độ quyền**. Tin nhắn đầu tiên cố định máy và tài khoản cho cuộc trò chuyện đó; mô hình, effort và quyền có thể thay đổi theo từng tin nhắn. Mô hình mới tiếp tục cùng phiên gốc, và lượt đầu tiên của nó đọc lại ngữ cảnh mà không có bộ nhớ đệm prompt.
 
 Biến môi trường: `STUDIO_STATE_DIR` (trạng thái riêng của máy, mặc định `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (byte, mặc định 100 MB). Mỗi thư mục trạng thái một server.
 

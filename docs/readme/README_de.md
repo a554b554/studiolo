@@ -59,7 +59,7 @@ Studiolo ist eine selbst gehostete Web-Werkbank, die die bereits auf deinen Comp
 1. **Voraussetzungen** – Node.js 22.14+ sowie die CLI `claude` und/oder `codex` auf dem Rechner installiert (`claude --version`, `codex --version`).
 2. **Starte** `node src/server.mjs` und öffne <http://127.0.0.1:4310>.
 3. **Konten hinzufügen** – Settings → *Hosts & accounts* → *Add account*. Wähle den Rechner, den Typ (Claude Code / Codex) und die Anmeldemethode und folge dann den angezeigten Schritten (siehe unten).
-4. **Projekt anlegen, Gespräch beginnen** – im Eingabefeld wählst du **Rechner → Konto → Modell → Effort → Berechtigungsmodus**. Die erste Nachricht legt Rechner, Konto und Modell für dieses Gespräch fest; Effort und Berechtigungen lassen sich pro Nachricht ändern.
+4. **Projekt anlegen, Gespräch beginnen** – im Eingabefeld wählst du **Rechner → Konto → Modell → Effort → Berechtigungsmodus**. Die erste Nachricht legt Rechner und Konto für dieses Gespräch fest; Modell, Effort und Berechtigungen lassen sich pro Nachricht ändern. Ein anderes Modell setzt dieselbe native Sitzung fort; seine erste Runde liest den Kontext ohne Prompt-Cache neu ein.
 
 Umgebungsvariablen: `STUDIO_STATE_DIR` (rechnerprivater Zustand, Standard `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (Bytes, Standard 100 MB). Ein Server pro Zustandsverzeichnis.
 

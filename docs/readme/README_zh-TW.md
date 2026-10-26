@@ -59,7 +59,7 @@ Studiolo 是一個自行架設的網頁工作台，驅動的是你電腦上已�
 1. **事前準備**——Node.js 22.14+，以及機器上已安裝的 `claude` 和/或 `codex` CLI（`claude --version`、`codex --version`）。
 2. **執行** `node src/server.mjs`，然後開啟 <http://127.0.0.1:4310>。
 3. **新增帳號**——Settings → *Hosts & accounts* → *Add account*。選擇機器、類型（Claude Code／Codex）與登入方式，再依照畫面上的步驟操作（見下文）。
-4. **建立專案、開始對話**——輸入框依序選擇 **機器 → 帳號 → 模型 → effort → 權限模式**。第一則訊息會固定該對話的機器、帳號與模型；effort 與權限可以逐則訊息調整。
+4. **建立專案、開始對話**——輸入框依序選擇 **機器 → 帳號 → 模型 → effort → 權限模式**。第一則訊息會固定該對話的機器與帳號；模型、effort 與權限可以逐則訊息調整。換成其他模型時會延續同一個原生工作階段，換模型後的第一輪沒有提示快取，會重新讀取整段上下文。
 
 環境變數：`STUDIO_STATE_DIR`（機器私有狀態，預設為 `~/.studio-local`）、`STUDIO_BIND`、`STUDIO_PORT`（4310）、`STUDIO_PREVIEW_PORT`（4311）、`STUDIO_TOKEN`、`STUDIO_UPLOAD_LIMIT`（位元組，預設 100 MB）。每個狀態目錄只能執行一個伺服器。
 

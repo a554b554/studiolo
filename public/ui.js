@@ -1,6 +1,6 @@
 import { t, getLanguage, onLanguageChange } from './i18n.js';
 import { api, post } from './api.js';
-import { conversationItems, runNotice, agentLabel, accountName, familyName } from './conversation.js';
+import { conversationItems, runNotice, agentLabel, accountName, familyName, modelName } from './conversation.js';
 import { markdown } from './markdown.js';
 import {supportsAuto,validateModelPermission} from './model-permissions.js';
 import { describeActivity, duration } from './activity.js';
@@ -84,6 +84,7 @@ function streamingBody(text, fresh) {
 function speaker(message, runs) { return message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId)); }
 function renderItem(item, runs, previous, animate = false) {
   if (item.kind === 'notice') return node('p','run-error',runNotice(item.text));
+  if (item.kind === 'switch') return node('p','model-switch',t('已切换到 {model}',{model:modelName(item.model,item.profileId)}));
   if (item.kind === 'activity') {
     const details = node('details','run-activity');
     details.dataset.runId = item.key;
@@ -197,7 +198,7 @@ export async function bootstrap() {
 }
 export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
   const profiles=$(`#${prefix}profile`),models=$(`#${prefix}model`),hosts=$(`#${prefix}host`),efforts=$(`#${prefix}effort`),permission=$(`#${prefix}permission`);
-  let available=data.hosts||[],bound=null,sessionId=null,loading=false,generation=0,current=[];
+  let available=data.hosts||[],bound=null,sessionId=null,loading=false,generation=0,current=[],notify=()=>{};
   const selectedProfile=()=>current.find(p=>p.id===profiles.value);
   const familyOf=p=>p?.family||(p?.id?.startsWith('codex')?'codex':p?.id?.startsWith('claude')?'claude':null);
   const modeLabels=()=>{if(permission){const profile=selectedProfile(),codex=familyOf(profile)==='codex';const auto=permission.querySelector('[value="auto"]');auto.disabled=!supportsAuto(profile||profiles.value,models.value);auto.textContent=auto.disabled?t('Auto · 此模型不支持'):codex?'Approve for me':'Auto';permission.querySelector('[value="read-only"]').textContent=codex?t('只读'):'Plan';}};
@@ -206,11 +207,12 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
     const old=selection?.model||models.value;models.replaceChildren();
     for(const m of list.find(p=>p.id===profiles.value)?.models||[])models.add(new Option(m.label||m.id,m.id));
     if(Array.from(models.options).some(o=>o.value===old))models.value=old;
-    if(bound?.model&&(!bound.profileId||list.some(p=>p.id===bound.profileId)))setValue(models,bound.model);
+    // Opening a conversation selects the model it last used; the user may pick another for the next message.
+    if(selection&&bound?.model&&(!bound.profileId||list.some(p=>p.id===bound.profileId)))setValue(models,selection.model||bound.model);
     const model=list.find(p=>p.id===profiles.value)?.models?.find(m=>m.id===models.value);
     const effort=selection?.reasoningEffort??efforts?.value??'';
     if(efforts){efforts.replaceChildren(new Option(t('Effort · CLI 默认'),''));for(const e of model?.efforts||[])efforts.add(new Option(e,e));efforts.value=model?.efforts?.includes(effort)?effort:model?.defaultEffort||'';efforts.disabled=!model?.efforts?.length;}
-    models.disabled=loading||Boolean(bound?.model)&&(!bound.profileId||list.some(p=>p.id===bound.profileId));modeLabels();
+    models.disabled=loading;modeLabels();notify();
   };
   const load=async(selection)=>{
     const version=++generation,selected=hosts.value;loading=true;profiles.disabled=models.disabled=true;
@@ -236,11 +238,14 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
     if(bound?.hostId&&!available.some(h=>h.id===bound.hostId)){const option=new Option(t('执行电脑离线'),bound.hostId);option.disabled=true;hosts.add(option);}
     hosts.value=Array.from(hosts.options).some(o=>o.value===selected)?selected:data.hostId;
     hosts.disabled=Boolean(fixedHostId||bound?.hostId);
-    hosts.title=fixedHostId?t('批注由当前 Artifact 运行服务器执行。'):bound?.hostId?t('电脑、账号和模型已固定；更换请新建对话。'):'';
+    hosts.title=fixedHostId?t('批注由当前 Artifact 运行服务器执行。'):bound?.hostId?t('电脑和账号已固定；更换请新建对话。'):'';
   };
   hosts.onchange=()=>load();fillHosts();load();
   const choose=()=>{const choice={hostId:hosts.value,profileId:loading||!available.some(h=>h.id===hosts.value)?'':profiles.value,model:models.value,reasoningEffort:efforts?.value||null,permissionMode:permission?.value||'auto'};validateModelPermission(selectedProfile()||choice.profileId,choice.model,choice.permissionMode);return choice;};
   choose.profile=selectedProfile;
+  // The label of the model the next message switches the conversation to, or null when it stays.
+  choose.switching=()=>!loading&&bound?.model&&models.value&&models.value!==bound.model?models.selectedOptions[0]?.textContent||models.value:null;
+  choose.onUpdate=fn=>{notify=fn;};
   choose.bindSession=(session,runs=[])=>{
     const last=runs.at(-1),next=session?{hostId:session.hostId||last?.hostId,profileId:session.profileId||last?.profileId,model:session.model||session.selection?.model||last?.model}:null;
     const changed=sessionId!==(session?.id||null)||JSON.stringify(next)!==JSON.stringify(bound);sessionId=session?.id||null;bound=next;

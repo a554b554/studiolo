@@ -130,6 +130,17 @@ function note(text) {
   el.textContent = text; el.classList.add('flash');
   noteTimer = setTimeout(() => { el.textContent = t(el.dataset.i18n); el.classList.remove('flash'); }, 6000);
 }
+// Picking another model keeps the conversation (its native session continues on that model), but
+// the first turn on it reads the whole context again without the prompt cache: say so before sending.
+function renderModelNote() {
+  let el = $('#model-note');
+  if (!el) { el = node('span','model-note'); el.id = 'model-note'; $('#compose-note').after(el); }
+  const next = currentSession() && choices.switching?.();
+  el.hidden = !next;
+  el.textContent = next ? t('下一条消息起改用 {model}，对话继续；这一轮会重新读取全部上下文，额度消耗更多。',{model:next}) : '';
+}
+const watchChoices = picker => { picker.onUpdate?.(renderModelNote); return picker; };
+$('#model').addEventListener('change', renderModelNote);
 function availableCommands() {
   const session = currentSession(), native = nativeOf(session)?.commands;
   // Before the native session connects, the account's own command list (read at sign-in) is used.
@@ -342,7 +353,7 @@ function renderConversation() {
   $('#send-label').textContent = t(steering ? '插话 ↑' : '发送 ↑');
   $('#prompt').placeholder = steering ? t('输入插话内容，Ctrl / ⌘ + Enter 发送给正在执行的 agent…') : $('#prompt').placeholder;
   for (const [id, at] of stopRequests) if (!runs.some(r => r.id === id && ['running','waiting'].includes(r.status)) && Date.now() - at > 60000) stopRequests.delete(id);
-  choices.bindSession?.(session,runs);
+  choices.bindSession?.(session,runs); renderModelNote();
   // The quota panel follows the composer's machine only when that changes (switching
   // conversations); a machine picked in the panel itself stays until then.
   const composerHost = $('#host').value || view.bootstrap?.hostId;
@@ -524,7 +535,7 @@ async function submitForm(form, fn) {
 }
 $('#project-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { const project = await post('/api/projects',body); view.bootstrap.projects = await api('/api/projects'); $('#project-dialog').close(); event.target.reset(); if(category(project)!=='active')throw new Error(project.deletedAt?t('项目已删除，不能从平台恢复。'):t('项目已归档，请在设置中恢复。')); await selectProject(project.id); }); });
 $('#artifact-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { const command = body.command.trim() ? JSON.parse(body.command) : undefined; if (command && (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== 'string'))) throw new Error(t('启动命令必须是非空字符串数组，例如 ["node", "server.mjs"]')); await post(`${path()}/artifacts`,{...body,command,port:body.port ? Number(body.port) : undefined,dataPaths:body.dataPaths.split('\n').map(value => value.trim()).filter(Boolean)}); await reloadProject(); $('#artifact-dialog').close(); event.target.reset(); }); });
-$('#host-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { await post('/api/hosts',body); view.bootstrap = await api('/api/bootstrap'); choices = initChoices(view.bootstrap); renderHosts(); event.target.reset(); }); });
+$('#host-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { await post('/api/hosts',body); view.bootstrap = await api('/api/bootstrap'); choices = watchChoices(initChoices(view.bootstrap)); renderHosts(); event.target.reset(); }); });
 $('#takeover').addEventListener('click', () => attempt(async () => { if (!confirm(t('确认原电脑已停止执行和 Artifact 写入，并且项目数据已同步。现在由本机接管此项目？'))) return; await post(`${path()}/takeover`,{confirm:true}); await reloadProject(); }));
 $('#prompt').addEventListener('input', () => view.drafts.set(draftKey(),$('#prompt').value));
 $('#prompt').addEventListener('keydown', event => {
@@ -551,7 +562,7 @@ $('#composer').addEventListener('submit', event => { event.preventDefault(); con
 }); });
 
 async function start() {
-  view.bootstrap = await bootstrap(); setAccountDirectory(view.bootstrap.hosts); choices = initChoices(view.bootstrap);
+  view.bootstrap = await bootstrap(); setAccountDirectory(view.bootstrap.hosts); choices = watchChoices(initChoices(view.bootstrap));
   const refreshAccounts = async () => { view.bootstrap = await api('/api/bootstrap'); setAccountDirectory(view.bootstrap.hosts); choices.updateHosts(view.bootstrap.hosts); choices.reloadProfiles?.(); usage.reload(); renderHosts(); messageSignature = ''; renderConversation(); };
   accountsUI = initAccounts({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, onChange: () => attempt(refreshAccounts) });
   usage = initAccountUsage({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, openAccounts: (hostId, accountId) => accountsUI.open(hostId, accountId) });

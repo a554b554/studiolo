@@ -42,12 +42,12 @@ test('late resident answers are durable chat messages without replacing the orig
  assert.deepEqual((await reloaded.read(f.project.id)).messages.filter(m=>m.role==='assistant'),answers);
 });
 
-test('model is fixed, effort stays per message; waiting replies survive restart without replay', async t => {
+test('account is fixed, model and effort may change per message; waiting replies survive restart without replay', async t => {
   const calls=[];
   const f=await fixture(t,async args=>{calls.push(args);return {text:'Permission was denied',status:'waiting',error:'Permission or user input required: Edit'};});
   await f.submit('first',undefined,{model:'a',reasoningEffort:'low'});
   await waitFor(async()=> (await f.read()).runs[0].status==='waiting');
-  await assert.rejects(f.submit('wrong model',undefined,{model:'b'}),e=>e.status===409);
+  await assert.rejects(f.submit('other account',undefined,{profileId:'claude',model:'a'}),e=>e.status===409);
   await f.submit('second',undefined,{model:'a',reasoningEffort:'high'});
   await f.queue.close();
   const restarted=await new QueueManager({store:f.store,hostId:'a',runner:{execute:()=>{throw new Error('must not replay');}}}).init();
@@ -415,4 +415,20 @@ test('unseen marks survive a newer finish and clear when that conversation is ar
   assert.equal(markSeen(structuredClone(await f.read()), f.sessions[0], mark.at), true);
   await changeLifecycle(f.store, f.project.id, f.sessions[0], 'archive');
   assert.deepEqual((await f.read()).project.unread, {});
+});
+
+test('switching models keeps the conversation: same native session and delta context, new model on the runner', async t => {
+  const calls = [];
+  const f = await fixture(t, async args => { calls.push(args); return { text: `answer ${calls.length}`, nativeSessionId: 'native-1' }; });
+  await f.submit('first', undefined, { model: 'a' });
+  await waitFor(async () => (await f.read()).runs[0]?.status === 'succeeded');
+  await f.submit('second', undefined, { model: 'b', reasoningEffort: 'high' });
+  await waitFor(async () => (await f.read()).runs[1]?.status === 'succeeded');
+  assert.deepEqual(calls.map(c => [c.model, c.nativeSessionId]), [['a', undefined], ['b', 'native-1']]);
+  assert.equal(calls[1].sessionKey, calls[0].sessionKey, 'the resident CLI process is reused');
+  assert.equal(calls[1].prompt, 'second', 'the continued native session gets only the new message');
+  const state = await f.read(), session = state.sessions.find(s => s.id === f.sessions[0]);
+  assert.deepEqual([session.model, session.selection.model, session.selection.reasoningEffort], ['b', 'b', 'high']);
+  const switches = conversationItems(state.messages.filter(m => m.sessionId === session.id), state.runs).filter(i => i.kind === 'switch');
+  assert.deepEqual(switches.map(i => i.model), ['b']);
 });

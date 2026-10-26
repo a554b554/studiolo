@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {conversationItems,agentLabel,runNotice} from '../public/conversation.js';
+import {conversationItems,agentLabel,runNotice,modelName} from '../public/conversation.js';
 const messages=[{id:'u',role:'user',runId:'r',text:'question'},{id:'s',role:'system',runId:'r',text:'Started'},{id:'a',role:'assistant',runId:'r',text:'Final answer'},{id:'t',role:'system',runId:'r',kind:'tool',text:'long tool output'},{id:'e',role:'system',runId:'r',text:'finished'}];
 test('legacy tool and status records fold before the final answer without changing storage',()=>{
  const original=JSON.stringify(messages),items=conversationItems(messages,[{id:'r',status:'succeeded'}]);
@@ -60,4 +60,15 @@ test('narration folds into the raw log in order while the reply being written st
  assert.equal(stepped.at(-1).streaming,undefined);assert.equal(stepped[1].replying,false);
  const done=conversationItems(records,[{id:'r',status:'succeeded'}]);
  assert.deepEqual(done.filter(i=>i.kind==='message').map(i=>[i.message.text,Boolean(i.streaming)]),[['fix it',false],['Fixed',false]]);
+});
+
+test('a request on a different model than the previous one is preceded by a switch marker',()=>{
+ const records=[{id:'u1',role:'user',runId:'r1',text:'one'},{id:'a1',role:'assistant',runId:'r1',text:'1'},
+  {id:'u2',role:'user',runId:'r2',text:'two'},{id:'s2',role:'user',kind:'steer',runId:'r2',text:'also'},{id:'a2',role:'assistant',runId:'r2',text:'2'},
+  {id:'u3',role:'user',runId:'r3',text:'three'},{id:'a3',role:'assistant',runId:'r3',text:'3'}];
+ const runs=[{id:'r1',status:'succeeded',model:'claude-opus-5-5',profileId:'p'},{id:'r2',status:'succeeded',model:'claude-sonnet-5-5',profileId:'p'},{id:'r3',status:'succeeded',model:'claude-sonnet-5-5',profileId:'p'}];
+ const items=conversationItems(records,runs);
+ assert.deepEqual(items.filter(i=>i.kind==='switch').map(i=>[i.key,i.model]),[['u2','claude-sonnet-5-5']]);
+ assert.equal(items[items.findIndex(i=>i.kind==='switch')+1].message.id,'u2','the marker precedes the request');
+ assert.equal(modelName('claude-sonnet-5-5','p'),'Sonnet 5.5');
 });

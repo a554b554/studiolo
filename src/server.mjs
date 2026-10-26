@@ -63,8 +63,8 @@ export async function createStudio(options={}){
       const old=sessionBinding(s,id);if(!old)throw httpError('Session not found',404);
       if(old.hostId){
         const rebind=old.hostId===host.id&&accountGone(host,old.profileId);
-        if(old.hostId!==host.id||!rebind&&(old.profileId!==input.profileId||old.model!==input.model))throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
-        if(!rebind)return old;
+        if(old.hostId!==host.id||!rebind&&old.profileId!==input.profileId)throw httpError('Conversation machine and account are fixed. Create a new conversation to change them.',409);
+        if(!rebind&&old.model===input.model)return old;
         const target=s.sessions.find(x=>x.id===id);Object.assign(target,{profileId:input.profileId,model:input.model,selection:{model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode:input.permissionMode||'auto'}});return target;
       }
       if((old.createdHostId||s.project.ownerHostId)!==hostId)throw httpError('Bind on the conversation creation server',409);
@@ -163,10 +163,12 @@ export async function createStudio(options={}){
     if(tail==='/messages'&&input?.sessionId){
       let bound=sessionBinding(state,input.sessionId);if(!bound)throw httpError('Session not found',404);
       if(!bound.hostId){const creator=bound.createdHostId||project.ownerHostId||hostId;bound=creator===hostId?await bindSession(pid,input.sessionId,input,origin):await forward(creator,pid,`/api/projects/${pid}/sessions/${input.sessionId}/bind`,'POST',input,origin);}
-      if(input.hostId&&input.hostId!==bound.hostId)throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
-      if(input.profileId!==bound.profileId||input.model!==bound.model){
+      if(input.hostId&&input.hostId!==bound.hostId)throw httpError('Conversation machine and account are fixed. Create a new conversation to change them.',409);
+      // The model may change between messages: the executing machine checks it and records it on the
+      // conversation, and the native session continues on the new model (as /model does in the CLI).
+      if(input.profileId!==bound.profileId){
         // Only a conversation whose account disappeared from its machine may switch accounts.
-        if(!accountGone(await hosts.get(bound.hostId,origin),bound.profileId))throw httpError('Conversation machine, account and model are fixed. Create a new conversation to change them.',409);
+        if(!accountGone(await hosts.get(bound.hostId,origin),bound.profileId))throw httpError('Conversation machine and account are fixed. Create a new conversation to change them.',409);
         bound=bound.hostId===hostId?await bindSession(pid,input.sessionId,input,origin):await forward(bound.hostId,pid,`/api/projects/${pid}/sessions/${input.sessionId}/bind`,'POST',input,origin);
       }
       target=bound.hostId;

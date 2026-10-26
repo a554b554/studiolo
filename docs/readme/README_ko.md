@@ -59,7 +59,7 @@ Studiolo는 컴퓨터에 이미 설치된 **Claude Code**와 **Codex** CLI를 �
 1. **사전 요구 사항** — Node.js 22.14 이상, 그리고 머신에 설치된 `claude` 및/또는 `codex` CLI(`claude --version`, `codex --version`).
 2. `node src/server.mjs`를 **실행**하고 <http://127.0.0.1:4310>을 엽니다.
 3. **계정 추가** — Settings → *Hosts & accounts* → *Add account*. 머신, 종류(Claude Code / Codex), 로그인 방식을 고른 뒤 화면에 표시되는 단계를 따릅니다(아래 참고).
-4. **프로젝트를 만들고 대화 시작** — 입력창에서 **머신 → 계정 → 모델 → effort → 권한 모드**를 선택합니다. 첫 메시지가 해당 대화의 머신, 계정, 모델을 고정하며, effort와 권한은 메시지마다 바꿀 수 있습니다.
+4. **프로젝트를 만들고 대화 시작** — 입력창에서 **머신 → 계정 → 모델 → effort → 권한 모드**를 선택합니다. 첫 메시지가 해당 대화의 머신과 계정을 고정하며, 모델, effort, 권한은 메시지마다 바꿀 수 있습니다. 다른 모델로 바꿔도 같은 네이티브 세션이 이어지고, 바꾼 뒤 첫 턴은 프롬프트 캐시 없이 컨텍스트를 다시 읽습니다.
 
 환경 변수: `STUDIO_STATE_DIR`(머신 전용 상태, 기본값 `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT`(4310), `STUDIO_PREVIEW_PORT`(4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT`(바이트, 기본값 100 MB). 상태 디렉터리 하나당 서버 하나만 실행합니다.
 

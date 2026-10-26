@@ -13,11 +13,17 @@ function backgroundReply(message) {
 // What an agent says between tool calls (narration) folds into the raw log with the tools, in
 // the order it happened; replies show where they arrive, and the one an executing run is still
 // writing is marked `streaming` (nothing has happened in that run since it began).
+// A request that runs on a different model than the one before it is preceded by a `switch` marker.
 export function conversationItems(messages, runs = []) {
   const result = [], emitted = new Set(), streams = new Map();
   const reply = message => ({kind:'message',message,...(streams.get(message.runId) === message.id ? {streaming:true} : {})});
+  let model = null;
   for (const message of messages) {
-    if (message.role === 'user') { result.push({kind:'message',message}); continue; }
+    if (message.role === 'user') {
+      const run = message.kind === 'steer' ? null : runs.find(r => r.id === message.runId);
+      if (run?.model) { if (model && run.model !== model) result.push({kind:'switch',key:message.id,model:run.model,profileId:run.profileId}); model = run.model; }
+      result.push({kind:'message',message}); continue;
+    }
     const background = backgroundReply(message);
     if (background) { result.push({kind:'message',message:background}); continue; }
     const key = message.runId || message.id;
@@ -61,10 +67,12 @@ export function accountName(profileId, run) {
   const known = run?.account || directory.get(profileId);
   return known?.label || profileId || 'Agent';
 }
+const modelNames = {'claude-fable-5-1':'Fable 5.1','claude-opus-5-5':'Opus 5.5','claude-sonnet-5-5':'Sonnet 5.5','claude-haiku-4-5-20251001':'Haiku 4.5'};
+// Display name of a model: known names first, then the label its account's machine reports.
+export function modelName(model, profileId) {
+  return modelNames[model] || directory.get(profileId)?.model?.find(m => m.id === model)?.label || model;
+}
 export function agentLabel(message, run = {}) {
   const model = run.actualModel || run.model || message.model;
-  const names = {'claude-fable-5-1':'Fable 5.1','claude-opus-5-5':'Opus 5.5','claude-sonnet-5-5':'Sonnet 5.5','claude-haiku-4-5-20251001':'Haiku 4.5'};
-  const known = run.account || directory.get(message.profileId || run.profileId);
-  const modelLabel = names[model] || known?.model?.find(m => m.id === model)?.label || model;
-  return [accountName(message.profileId || run.profileId, run), modelLabel, run.actualReasoningEffort || run.reasoningEffort || t('effort: CLI 默认')].filter(Boolean).join(' · ');
+  return [accountName(message.profileId || run.profileId, run), modelName(model, message.profileId || run.profileId), run.actualReasoningEffort || run.reasoningEffort || t('effort: CLI 默认')].filter(Boolean).join(' · ');
 }

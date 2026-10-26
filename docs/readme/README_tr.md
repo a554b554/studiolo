@@ -59,7 +59,7 @@ Studiolo, bilgisayarlarınızda zaten kurulu olan **Claude Code** ve **Codex** C
 1. **Ön koşullar** — Node.js 22.14+ ve makinede kurulu `claude` ve/veya `codex` CLI'ı (`claude --version`, `codex --version`).
 2. `node src/server.mjs` komutunu **çalıştırın** ve <http://127.0.0.1:4310> adresini açın.
 3. **Hesap ekleyin** — Settings → *Hosts & accounts* → *Add account*. Makineyi, türü (Claude Code / Codex) ve oturum açma yöntemini seçin, ardından gösterilen adımları izleyin (aşağıya bakın).
-4. **Bir proje oluşturun, sohbet başlatın** — mesaj kutusunda sırasıyla **makine → hesap → model → effort → izin modu** seçilir. İlk mesaj, o sohbetin makinesini, hesabını ve modelini sabitler; effort ve izinler mesaj başına değiştirilebilir.
+4. **Bir proje oluşturun, sohbet başlatın** — mesaj kutusunda sırasıyla **makine → hesap → model → effort → izin modu** seçilir. İlk mesaj, o sohbetin makinesini ve hesabını sabitler; model, effort ve izinler mesaj başına değiştirilebilir. Başka bir model aynı yerel oturumu sürdürür; onun ilk turu bağlamı istem önbelleği olmadan yeniden okur.
 
 Ortam değişkenleri: `STUDIO_STATE_DIR` (makineye özel durum, varsayılan `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (bayt, varsayılan 100 MB). Her durum dizini için bir sunucu.
 

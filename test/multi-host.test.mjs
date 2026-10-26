@@ -44,7 +44,7 @@ async function servers(t){
  await a.api('/api/hosts','POST',{url:b.base,name:'B'});await b.api('/api/hosts','POST',{url:a.base,name:'A'});
  return {a,b,p,calls};
 }
-test('both entrypoints route a conversation to its fixed machine and preserve native session, account and model',async t=>{
+test('both entrypoints route a conversation to its fixed machine and account, keeping the native session across model changes',async t=>{
  const {a,b,p,calls}=await servers(t),url=`/api/projects/${p.id}`;
  const s=await a.api(url+'/sessions','POST',{title:'Remote'});
  const input={sessionId:s.id,requestId:randomUUID(),text:'first',profileId:'codex',model:'test',hostId:b.app.hostId};
@@ -53,10 +53,13 @@ test('both entrypoints route a conversation to its fixed machine and preserve na
  assert.equal(calls[0].label,'B');
  await a.api(url+'/messages','POST',{...input,requestId:randomUUID(),text:'second'});
  await wait(()=>calls.length===2);assert.equal(calls[1].nativeSessionId,'native-B');assert.equal(calls[1].label,'B');
- await assert.rejects(a.api(url+'/messages','POST',{...input,requestId:randomUUID(),model:'other'}),e=>e.status===409);
+ // Another model continues the same native session on the conversation's machine; another account does not.
+ await a.api(url+'/messages','POST',{...input,requestId:randomUUID(),text:'third',model:'other'});
+ await wait(()=>calls.length===3);assert.deepEqual([calls[2].label,calls[2].model,calls[2].nativeSessionId],['B','other','native-B']);
+ await assert.rejects(a.api(url+'/messages','POST',{...input,requestId:randomUUID(),profileId:'claude'}),e=>e.status===409);
  await assert.rejects(b.api(url+'/messages','POST',{...input,requestId:randomUUID(),hostId:a.app.hostId}),e=>e.status===409);
  const local=await b.api(url+'/sessions','POST',{title:'On A'});
- await b.api(url+'/messages','POST',{...input,sessionId:local.id,requestId:randomUUID(),hostId:a.app.hostId});await wait(()=>calls.length===3);assert.equal(calls[2].label,'A');
+ await b.api(url+'/messages','POST',{...input,sessionId:local.id,requestId:randomUUID(),hostId:a.app.hostId});await wait(()=>calls.length===4);assert.equal(calls[3].label,'A');
 });
 test('first-message races bind once, and artifacts run on the web entrypoint independently',async t=>{
  const {a,b,p,calls}=await servers(t),url=`/api/projects/${p.id}`;

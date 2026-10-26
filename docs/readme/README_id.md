@@ -59,7 +59,7 @@ Studiolo adalah meja kerja web yang di-host sendiri yang menjalankan CLI **Claud
 1. **Prasyarat**: Node.js 22.14+, dan CLI `claude` dan/atau `codex` terinstal di mesin (`claude --version`, `codex --version`).
 2. **Jalankan** `node src/server.mjs` lalu buka <http://127.0.0.1:4310>.
 3. **Tambahkan akun**: Settings → *Hosts & accounts* → *Add account*. Pilih mesin, jenis (Claude Code / Codex), dan metode masuk, lalu ikuti langkah-langkah yang ditampilkan (lihat di bawah).
-4. **Buat proyek, mulai percakapan**: kotak penulisan memilih **mesin → akun → model → effort → mode izin**. Pesan pertama menetapkan mesin, akun, dan model untuk percakapan tersebut; effort dan izin dapat diubah per pesan.
+4. **Buat proyek, mulai percakapan**: kotak penulisan memilih **mesin → akun → model → effort → mode izin**. Pesan pertama menetapkan mesin dan akun untuk percakapan tersebut; model, effort, dan izin dapat diubah per pesan. Model lain melanjutkan sesi native yang sama, dan giliran pertamanya membaca ulang konteks tanpa cache prompt.
 
 Variabel lingkungan: `STUDIO_STATE_DIR` (state privat mesin, default `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (byte, default 100 MB). Satu server per direktori state.
 

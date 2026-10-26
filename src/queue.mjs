@@ -159,7 +159,8 @@ export class QueueManager {
         const bound=sessionBinding(state,session.id);
         // An account removed from this machine releases its conversations to another account here.
         const gone=Boolean(bound.profileId)&&profiles!==null&&!profiles.some(p=>p.id===bound.profileId);
-        if(bound.hostId&&bound.hostId!==this.hostId||!gone&&(bound.profileId&&bound.profileId!==input.profileId||bound.model&&bound.model!==input.model))throw error('This conversation is fixed to its machine, account and model. Create a new conversation to change them.',409);
+        // The model may change from one message to the next; machine and account stay.
+        if(bound.hostId&&bound.hostId!==this.hostId||!gone&&bound.profileId&&bound.profileId!==input.profileId)throw error('This conversation is fixed to its machine and account. Create a new conversation to change them.',409);
         session.hostId=this.hostId;session.profileId=input.profileId;session.model=input.model;
         session.selection={model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode};
       }

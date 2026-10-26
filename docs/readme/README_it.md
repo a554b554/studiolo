@@ -59,7 +59,7 @@ Studiolo è un banco di lavoro web self-hosted che pilota le CLI **Claude Code**
 1. **Prerequisiti** — Node.js 22.14+ e la CLI `claude` e/o `codex` installata sulla macchina (`claude --version`, `codex --version`).
 2. **Esegui** `node src/server.mjs` e apri <http://127.0.0.1:4310>.
 3. **Aggiungi account** — Settings → *Hosts & accounts* → *Add account*. Scegli la macchina, il tipo (Claude Code / Codex) e il metodo di accesso, poi segui i passaggi mostrati (vedi sotto).
-4. **Crea un progetto, avvia una conversazione** — il compositore sceglie **macchina → account → modello → sforzo → modalità di permesso**. Il primo messaggio fissa macchina, account e modello per quella conversazione; sforzo e permessi possono cambiare a ogni messaggio.
+4. **Crea un progetto, avvia una conversazione** — il compositore sceglie **macchina → account → modello → sforzo → modalità di permesso**. Il primo messaggio fissa macchina e account per quella conversazione; modello, sforzo e permessi possono cambiare a ogni messaggio. Un altro modello prosegue la stessa sessione nativa, e il suo primo turno rilegge il contesto senza la cache del prompt.
 
 Variabili d'ambiente: `STUDIO_STATE_DIR` (stato privato della macchina, predefinito `~/.studio-local`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (byte, predefinito 100 MB). Un server per directory di stato.
 
