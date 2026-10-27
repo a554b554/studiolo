@@ -14,12 +14,17 @@ foreach ($listener in $listeners) {
     if ($process.CommandLine -notlike '*src*server.mjs*') { throw 'Port 4310 does not belong to the expected Studio process.' }
 }
 Stop-ScheduledTask -TaskName 'Studio Local - Login'
+# Stopping the task ends only its headless conhost. End the supervising launcher
+# (and its server child) first, or it would start a replacement under the old launcher.
+foreach ($launcher in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*\start-studio-windows.ps1*' })) {
+    & taskkill.exe /PID $launcher.ProcessId /T /F | Out-Null
+}
 foreach ($listener in $listeners) {
     if (Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue) {
         & taskkill.exe /PID $listener.OwningProcess /T /F | Out-Null
     }
 }
-# Stopping the task ends only its headless conhost; let the old launcher release its lock first.
+# Let the old launcher exit and release its lock before starting a new one.
 for ($attempt=0; $attempt -lt 20; $attempt++) {
     if (-not @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*\start-studio-windows.ps1*' }).Count) { break }
     Start-Sleep -Milliseconds 500
