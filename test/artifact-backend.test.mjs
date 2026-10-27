@@ -92,15 +92,18 @@ test('real Artifact backend persists SQLite scores across restart and restores a
 test('runtime child process does not inherit the Studio access token', {timeout:30000}, async t => {
   const original = process.env.STUDIO_TOKEN;
   process.env.STUDIO_TOKEN = 'test-only-platform-secret';
-  t.after(() => { if (original === undefined) delete process.env.STUDIO_TOKEN; else process.env.STUDIO_TOKEN = original; });
+  // OS identity must pass through: on macOS Claude Code resolves its Keychain credentials by user name.
+  const identity = {USER:process.env.USER, LOGNAME:process.env.LOGNAME, SHELL:process.env.SHELL};
+  Object.assign(process.env, {USER:'studio-test-user', LOGNAME:'studio-test-user', SHELL:'/bin/studio-test-shell'});
+  t.after(() => { if (original === undefined) delete process.env.STUDIO_TOKEN; else process.env.STUDIO_TOKEN = original; for (const [k,v] of Object.entries(identity)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
   const {api} = await setup(t);
   const project = await api('/api/projects',{name:'Runtime environment boundary'});
   await fs.mkdir(path.join(project.path,'web'));
-  await fs.writeFile(path.join(project.path,'web','server.mjs'), `import http from 'node:http'; http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({hasStudioToken:process.env.STUDIO_TOKEN !== undefined,port:process.env.PORT,host:process.env.HOST}));}).listen(Number(process.env.PORT),process.env.HOST);`);
+  await fs.writeFile(path.join(project.path,'web','server.mjs'), `import http from 'node:http'; http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({hasStudioToken:process.env.STUDIO_TOKEN !== undefined,port:process.env.PORT,host:process.env.HOST,user:process.env.USER,logname:process.env.LOGNAME,shell:process.env.SHELL}));}).listen(Number(process.env.PORT),process.env.HOST);`);
   const port = await freePort();
   const artifact = await api(`/api/projects/${project.id}/artifacts`,{name:'Environment check',root:'web',command:['node','server.mjs'],port});
   const live = await api(`/api/projects/${project.id}/artifacts/${artifact.id}/start`,{});
   const response = await (await previewClient(live)).request();
   assert.equal(response.status,200);
-  assert.deepEqual(await response.json(),{hasStudioToken:false,port:String(port),host:'127.0.0.1'});
+  assert.deepEqual(await response.json(),{hasStudioToken:false,port:String(port),host:'127.0.0.1',user:'studio-test-user',logname:'studio-test-user',shell:'/bin/studio-test-shell'});
 });

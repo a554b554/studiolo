@@ -9,7 +9,10 @@ import {gunzipSync,inflateSync,brotliDecompressSync} from 'node:zlib';
 import {safePath,inside,writeJson} from './paths.mjs';
 import {ArtifactStorage} from './artifact-storage.mjs';
 
-const runtimeEnv=()=>Object.fromEntries(Object.entries(process.env).filter(([key])=>['PATH','SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','TEMP','TMP','HOME','USERPROFILE','APPDATA','LOCALAPPDATA','LANG','TZ'].includes(key.toUpperCase())));
+// Backend artifacts get a minimal environment: no platform token, no provider keys. USER/LOGNAME/SHELL
+// stay in because CLIs the backend spawns need them: on macOS Claude Code looks up its OAuth credentials
+// in the login Keychain by user name and reports "Not logged in" without USER (seen 2026-10-27).
+const runtimeEnv=()=>Object.fromEntries(Object.entries(process.env).filter(([key])=>['PATH','SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','HOME','USER','LOGNAME','SHELL','USERPROFILE','APPDATA','LOCALAPPDATA','LANG','TZ'].includes(key.toUpperCase())));
 const mime={'.html':'text/html; charset=utf-8','.htm':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json','.map':'application/json','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.avif':'image/avif','.webp':'image/webp','.wasm':'application/wasm','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf','.otf':'font/otf','.mp4':'video/mp4','.webm':'video/webm','.mp3':'audio/mpeg','.wav':'audio/wav','.ogg':'audio/ogg','.pdf':'application/pdf','.txt':'text/plain; charset=utf-8','.csv':'text/csv; charset=utf-8'};
 const hopHeaders=new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
 const cookiePairs=header=>(header||'').split(';').map(v=>v.trim().split(/=(.*)/s)).filter(v=>v[0]&&v[1]!==undefined);
