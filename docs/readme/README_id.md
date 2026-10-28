@@ -97,6 +97,8 @@ Setiap percakapan memiliki proses native yang tetap berjalan, Claude Code melalu
 
 Permintaan izin yang akan ditanyakan CLI di terminal muncul di halaman: setujui sekali atau tolak, dan eksekusi yang sama berlanjut. Mode otomatis adalah milik CLI sendiri (Claude `auto`, Codex `auto_review`); Studiolo tidak pernah menambahkan flag bypass atau aturan izin permanen. Tingkat effort penalaran dan model dapat diubah per pesan dalam satu percakapan (Claude `set_model` / `apply_flag_settings`, parameter `turn/start` di Codex).
 
+Selama sebuah giliran berjalan, percakapan menampilkan pekerjaan seperti CLI: apa yang dikatakan agent di antara langkah tetap tampil utuh, panggilan alat yang berurutan dilipat menjadi satu baris yang bisa dibuka, dan langkah yang sedang berjalan serta waktu yang berlalu tetap terlihat; saat balasan tiba, seluruh eksekusi terlipat ke dalam raw log-nya. Pesan yang Anda kirim langsung muncul dan dikirim di latar belakang (jika gagal, bisa dicoba lagi). Di bilah samping, indikator berputar menandai percakapan dan proyek yang sedang bekerja, dan titik menandai hasil yang belum Anda lihat.
+
 ---
 
 ## Multi-mesin

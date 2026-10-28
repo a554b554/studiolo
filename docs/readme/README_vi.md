@@ -97,6 +97,8 @@ Mỗi cuộc trò chuyện sở hữu một tiến trình gốc thường trú �
 
 Các yêu cầu cấp quyền mà CLI sẽ hỏi trong terminal xuất hiện ngay trong trang: chấp thuận một lần hoặc từ chối, và cùng lần thực thi đó tiếp tục. Chế độ tự động là chế độ riêng của CLI (Claude `auto`, Codex `auto_review`); Studiolo không bao giờ thêm cờ bỏ qua hay quy tắc cho phép vĩnh viễn. Effort suy luận và mô hình có thể thay đổi theo từng tin nhắn trong một cuộc trò chuyện (Claude `set_model` / `apply_flag_settings`, tham số `turn/start` của Codex).
 
+Trong khi một lượt đang chạy, cuộc trò chuyện hiển thị quá trình làm việc giống như CLI: những gì agent nói giữa các bước được giữ nguyên, các lệnh gọi công cụ liên tiếp được gộp thành một dòng có thể mở ra, bước đang chạy và thời gian đã trôi qua luôn hiển thị; khi câu trả lời đến, toàn bộ lượt chạy được thu gọn vào raw log. Tin nhắn bạn gửi xuất hiện ngay và được chuyển đi ở chế độ nền (nếu thất bại có thể thử lại). Ở thanh bên, biểu tượng xoay đánh dấu các cuộc trò chuyện và dự án đang làm việc, còn dấu chấm đánh dấu kết quả bạn chưa xem.
+
 ---
 
 ## Nhiều máy

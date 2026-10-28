@@ -97,6 +97,8 @@ Jedes Gespräch besitzt einen residenten nativen Prozess – Claude Code über b
 
 Berechtigungsanfragen, die die CLI im Terminal stellen würde, erscheinen in der Seite: einmal erlauben oder ablehnen, und dieselbe Ausführung läuft weiter. Der Auto-Modus ist der eigene der CLI (Claude `auto`, Codex `auto_review`); Studiolo fügt nie Bypass-Flags oder dauerhafte Erlaubnisregeln hinzu. Reasoning-Effort und Modell lassen sich innerhalb eines Gesprächs pro Nachricht ändern (Claude `set_model` / `apply_flag_settings`, Codex-Parameter von `turn/start`).
 
+Während ein Durchlauf läuft, zeigt die Unterhaltung die Arbeit wie die CLIs: Was der Agent zwischen den Schritten sagt, bleibt vollständig stehen, aufeinanderfolgende Tool-Aufrufe werden zu einer aufklappbaren Zeile zusammengefasst, und der laufende Schritt sowie die verstrichene Zeit bleiben sichtbar; sobald die Antwort eintrifft, klappt der ganze Durchlauf in sein Raw log ein. Gesendete Nachrichten erscheinen sofort und werden im Hintergrund zugestellt (nach einem Fehler mit Wiederholen). In der Seitenleiste markiert ein Drehsymbol Unterhaltungen und Projekte, die gerade arbeiten, und ein Punkt Ergebnisse, die Sie noch nicht gesehen haben.
+
 ---
 
 ## Mehrere Rechner

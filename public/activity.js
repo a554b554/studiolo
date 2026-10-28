@@ -72,6 +72,38 @@ export function describeActivity(activity = [], {replying = false, waiting = fal
   const state = waiting ? 'waiting' : replying ? 'replying' : last === 'step' && !done ? 'step' : steps || last === 'said' ? 'thinking' : 'starting';
   return {state, step, steps, said:lastSaid(said)};
 }
+// The work of an executing run as the CLIs show it: what the agent said between steps, in full,
+// and each stretch of consecutive tool calls as one group. Results complete the oldest open step
+// of their group (parallel calls answer in order); Codex reports steps already completed.
+export function timeline(activity = []) {
+  const entries = [];
+  for (const record of activity) {
+    if (record.role === 'assistant') { if (String(record.text || '').trim()) entries.push({type:'said', key:record.id, text:record.text}); continue; }
+    const read = readRecord(record);
+    if (!read) continue;
+    let group = entries.at(-1);
+    if (read.result) { const open = group?.type === 'steps' && group.steps.find(step => !step.done); if (open) open.done = true; continue; }
+    if (group?.type !== 'steps') entries.push(group = {type:'steps', key:record.id, steps:[]});
+    group.steps.push({...read.step, done:Boolean(read.done)});
+  }
+  return entries;
+}
+// A group of steps in a few words: "ran 2 commands, edited 3 files". Edits count distinct files.
+const kinds = {'运行':'command','读取':'read','编辑':'edit','写入':'edit','搜索':'search','查找':'search','搜索网页':'web','打开':'web','子任务':'task','调用':'tool','技能':'tool','待办':'todo'};
+const phrases = {
+  command:['运行了 1 条命令','运行了 {count} 条命令'], read:['读取了 1 个文件','读取了 {count} 个文件'], edit:['编辑了 1 个文件','编辑了 {count} 个文件'],
+  search:['搜索了 1 次','搜索了 {count} 次'], web:['浏览了网页','浏览了网页'], task:['启动了 1 个子任务','启动了 {count} 个子任务'],
+  tool:['调用了 1 次工具','调用了 {count} 次工具'], todo:['更新了待办','更新了待办'],
+};
+export function stepSummary(steps = []) {
+  const counts = new Map();
+  for (const step of steps) {
+    const kind = kinds[step.verb] || 'tool';
+    if (!counts.has(kind)) counts.set(kind, new Set());
+    counts.get(kind).add(kind === 'edit' ? step.title || step.target : counts.get(kind).size);
+  }
+  return [...counts].map(([kind, seen]) => ({key:phrases[kind][seen.size === 1 ? 0 : 1], count:seen.size}));
+}
 export function duration(ms) {
   const total = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = String(total % 60).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;

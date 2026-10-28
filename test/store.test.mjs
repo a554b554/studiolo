@@ -194,3 +194,15 @@ test('metadata guard rejects both directory layers before a read or commit', asy
   forbidden = path.join(root, 'events');
   await assert.rejects(store.mutate(project.id, 'forbidden', s => s.project.name = 'bad'), /symbolic links or junctions/);
 });
+
+test('the project list names conversations with a run executing now', async t => {
+  const { store, project } = await fixture(t);
+  assert.equal((await store.listProjects())[0].running, undefined);
+  await store.mutate(project.id, 'test.runs', s => {
+    s.runs.push({ id: 'r1', sessionId: 'a', status: 'running' }, { id: 'r2', sessionId: 'a', status: 'running' }, { id: 'r3', sessionId: 'b', status: 'queued' }, { id: 'r4', sessionId: 'c', status: 'succeeded' }, { id: 'r5', artifactId: 'x', status: 'running' });
+  });
+  const [listed] = await store.listProjects();
+  assert.deepEqual(listed.running, ['a']);
+  assert.equal(listed.path, project.path);
+  assert.equal((await store.getProject(project.id)).running, undefined, 'only the list carries it');
+});

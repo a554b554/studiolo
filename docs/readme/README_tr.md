@@ -97,6 +97,8 @@ Her sohbetin kalıcı bir yerel süreci vardır — Claude Code çift yönlü `s
 
 CLI'ın terminalde soracağı izin istekleri sayfada görünür: bu seferlik onaylayın ya da reddedin, aynı yürütme devam eder. Auto modu CLI'ın kendi modudur (Claude `auto`, Codex `auto_review`); Studiolo asla atlama bayrakları veya kalıcı izin kuralları eklemez. Akıl yürütme effort'u ve model, bir sohbet içinde mesaj başına değiştirilebilir (Claude `set_model` / `apply_flag_settings`, Codex `turn/start` parametreleri).
 
+Bir tur çalışırken konuşma, işi CLI'lar gibi gösterir: agent'ın adımlar arasında söyledikleri olduğu gibi kalır, art arda gelen araç çağrıları açılabilen tek bir satırda toplanır, süren adım ve geçen süre görünür kalır; yanıt geldiğinde tüm çalışma kendi raw log'una katlanır. Gönderdiğiniz mesaj hemen görünür ve arka planda iletilir (başarısız olursa yeniden denenebilir). Kenar çubuğunda dönen bir gösterge çalışmakta olan konuşmaları ve projeleri, bir nokta ise henüz görmediğiniz sonuçları işaretler.
+
 ---
 
 ## Çoklu makine

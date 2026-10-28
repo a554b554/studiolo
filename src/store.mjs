@@ -203,10 +203,16 @@ export class Store {
     return this.registry.projects.map(entry => entry.id);
   }
 
+  // Each project also names its conversations with a run executing now (on any machine), so the
+  // project list can show them working without loading every project's messages.
   async listProjects() {
     await this.discoverProjects();
     return Promise.all(this.registry.projects.map(async entry => {
-      try { return await this.getProject(entry.id); }
+      try {
+        const { entry: current, event } = await this._loadEntry(entry.id);
+        const running = [...new Set(event.state.runs.filter(r => r.status === 'running' && r.sessionId).map(r => r.sessionId))];
+        return { ...clone(event.state.project), path: current.path, ...(running.length ? { running } : {}) };
+      }
       catch (e) { return { ...clone(entry), unavailable: true, error: e.message }; }
     }));
   }

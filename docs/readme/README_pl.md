@@ -97,6 +97,8 @@ Każda rozmowa ma własny rezydentny proces natywny — Claude Code przez dwukie
 
 Prośby o uprawnienia, o które CLI zapytałoby w terminalu, pojawiają się na stronie: zatwierdź jednorazowo lub odmów, a to samo wykonanie będzie kontynuowane. Tryb automatyczny to tryb samego CLI (Claude `auto`, Codex `auto_review`); Studiolo nigdy nie dodaje flag omijających ani stałych reguł zezwoleń. Wysiłek rozumowania i model można zmieniać przy każdej wiadomości w obrębie rozmowy (Claude `set_model` / `apply_flag_settings`, parametry `turn/start` w Codex).
 
+Podczas wykonywania tury rozmowa pokazuje pracę tak jak CLI: to, co agent mówi między krokami, pozostaje w całości, kolejne wywołania narzędzi składają się w jeden rozwijany wiersz, a bieżący krok i upływający czas są stale widoczne; gdy nadejdzie odpowiedź, całe wykonanie zwija się do swojego raw log. Wysłana wiadomość pojawia się od razu i jest dostarczana w tle (po błędzie można ponowić). Na pasku bocznym obracający się wskaźnik oznacza rozmowy i projekty, które właśnie pracują, a kropka — wyniki, których jeszcze nie widziałeś.
+
 ---
 
 ## Wiele maszyn

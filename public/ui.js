@@ -3,7 +3,7 @@ import { api, post } from './api.js';
 import { conversationItems, runNotice, agentLabel, accountName, familyName, modelName } from './conversation.js';
 import { markdown } from './markdown.js';
 import {supportsAuto,validateModelPermission} from './model-permissions.js';
-import { describeActivity, duration } from './activity.js';
+import { describeActivity, duration, timeline, stepSummary } from './activity.js';
 // Executing runs show how long they have been working; one ticker updates every counter on the page.
 let ticker;
 function tick() {
@@ -81,17 +81,126 @@ function streamingBody(text, fresh) {
   step();
   return body;
 }
+const reducedMotion = () => globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+// Arrivals ease in once; the class goes so a later move in the DOM does not replay it.
+const easeIn = el => { el.classList.add('enter'); el.addEventListener('animationend',() => el.classList.remove('enter'),{once:true}); return el; };
+const rawRecord = record => node(record.role === 'assistant' ? 'p' : 'pre',record.role === 'assistant' ? 'raw-said' : 'raw-record',record.text);
+// What the agent said between steps. A segment it is still writing streams in place and keeps its
+// element when a tool call turns it into narration, so the text never jumps or restarts.
+function liveSaid(entry) {
+  const body = streamingBody(entry.text, entry.type === 'stream' && Date.now() - Date.parse(entry.at) < 5000);
+  body.classList.add('live-said');
+  body.studioUpdate = next => body.studioSet(next.text, next.type !== 'stream');
+  if (entry.type !== 'stream') body.studioSet(entry.text, true);
+  return body;
+}
+// Consecutive tool calls as one line ("ran 2 commands, read a file") that opens to list them; the
+// step still running shows under it until its result arrives.
+function liveSteps(entry) {
+  const group = node('div','live-steps'), list = node('ol','live-step-list'), now = node('div','live-step-now');
+  let current = entry, shown = null;
+  const toggle = button('', () => { toggle.setAttribute('aria-expanded',String(list.hidden)); list.hidden = !list.hidden; group.studioUpdate(current); }, 'live-steps-toggle');
+  toggle.setAttribute('aria-expanded','false'); list.hidden = true;
+  group.append(toggle,now,list);
+  group.studioUpdate = next => {
+    current = next;
+    const english = getLanguage() === 'en', text = stepSummary(next.steps).map(part => t(part.key,{count:part.count})).join(english ? ', ' : '，');
+    const label = english ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+    if (toggle.textContent !== label) toggle.textContent = label;
+    // The running step shows under the line, or marked in the list while it is open.
+    const running = next.last ? next.steps.findLast(step => !step.done) : null;
+    now.hidden = !running || !list.hidden;
+    if (running && JSON.stringify(running) !== JSON.stringify(shown)) now.replaceChildren(node('span','live-spinner'),...stepNodes(running));
+    shown = running;
+    list.replaceChildren(...next.steps.map(step => { const li = node('li'); if (step === running) li.append(node('span','live-spinner')); li.append(...stepNodes(step)); return li; }));
+  };
+  group.studioUpdate(entry);
+  return group;
+}
+const liveLabels = {replying:'正在回复',waiting:'等待你处理',thinking:'思考中',starting:'启动中',step:'正在执行'};
+// While a run executes, its work reads the way the CLIs show it: what the agent says stays in
+// place in full, tool calls fold into one-line groups, the reply streams at the end and a status
+// bar keeps the elapsed time, the step count and the raw log. Refreshes patch this element entry
+// by entry, so nothing re-animates and opened groups stay open. When the run ends the timeline
+// folds away into the raw log, and the reply continues as a message of its own below it.
+function liveRun(item, runs) {
+  const section = node('section','run-live'), head = node('div','message-header'), name = node('strong'), when = node('time');
+  const list = node('div','live-timeline'), details = node('details','run-activity'), summary = node('summary','activity-live');
+  const pulse = node('span','activity-pulse'), label = node('span','activity-state live-shimmer'), target = node('span','activity-target');
+  const now = node('span','activity-now'), meta = node('span','activity-meta'), counter = node('span','activity-elapsed'), steps = node('span');
+  now.append(pulse,label,target); meta.append(counter,steps,node('span','activity-toggle','Raw log'));
+  summary.append(now,meta,node('span','live-progress')); details.append(summary); head.append(name,when); section.append(head,list,details);
+  const entries = new Map(); let current = item, filled = 0, ended = false;
+  const fill = () => {
+    if (!details.open) return;
+    if (current.activity.length < filled) { details.replaceChildren(summary); filled = 0; }
+    const stick = details.scrollHeight - details.scrollTop - details.clientHeight < 40;
+    for (const record of current.activity.slice(filled)) details.append(rawRecord(record));
+    filled = current.activity.length; if (stick) details.scrollTop = details.scrollHeight;
+  };
+  details.addEventListener('toggle',fill);
+  const end = (run, animate) => {
+    summary.className = ''; summary.replaceChildren(...activitySummary(current,run).childNodes);
+    if (ended) return; ended = true; section.classList.add('ended');
+    if (!animate || reducedMotion()) { head.remove(); list.remove(); return; }
+    for (const el of [head,list]) {
+      el.style.overflow = 'hidden';
+      el.animate([{height:`${el.offsetHeight}px`,opacity:1,marginBottom:getComputedStyle(el).marginBottom},{height:'0px',opacity:0,marginBottom:'0px'}],{duration:460,easing:'cubic-bezier(.3,.7,.2,1)'}).finished.finally(() => el.remove());
+    }
+  };
+  section.studioLive = (next, nextRuns, animate = true) => {
+    const run = nextRuns?.find(r => r.id === next.key);
+    current = next; section.dataset.runId = details.dataset.runId = next.key;
+    if (!next.live) { end(run,animate); fill(); return; }
+    const agent = run || next.agent || {};
+    name.textContent = agentLabel(agent,agent); when.textContent = time(run?.startedAt || next.since);
+    const wanted = timeline(next.activity);
+    if (next.stream) wanted.push({type:'stream',key:next.stream.id,text:next.stream.text || '',at:next.stream.createdAt});
+    const nodes = wanted.map((entry, index) => {
+      entry.last = index === wanted.length - 1;
+      let el = entries.get(entry.key);
+      if (el) el.studioUpdate(entry);
+      else { el = entry.type === 'steps' ? liveSteps(entry) : liveSaid(entry); if (animate) easeIn(el); entries.set(entry.key,el); }
+      return el;
+    });
+    for (const key of [...entries.keys()]) if (!wanted.some(entry => entry.key === key)) entries.delete(key);
+    reconcileChildren(list,nodes); list.hidden = !nodes.length;
+    const info = describeActivity(next.activity,{replying:next.replying,waiting:next.status === 'waiting'}), approval = run?.approvals?.find(a => a.status === 'pending');
+    pulse.className = `activity-pulse state-${info.state}`;
+    if (label.textContent !== t(liveLabels[info.state])) label.textContent = t(liveLabels[info.state]);
+    target.textContent = approval?.title || ''; target.hidden = !approval?.title;
+    const since = run?.startedAt || next.since;
+    if (since && counter.dataset.since !== since) { counter.dataset.since = since; counter.textContent = duration(Date.now() - Date.parse(since)); ticker ||= setInterval(tick,1000); }
+    steps.textContent = info.steps ? t('{count} 步',{count:info.steps}) : '';
+    fill();
+  };
+  section.studioLive(item,runs,false);
+  return section;
+}
 function speaker(message, runs) { return message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId)); }
+// A message sent from this page that the server has not recorded yet; a failed one offers to
+// send it again or to put it back into the composer (handled by the page via `studio:outbox`).
+function pendingState(article, head, message) {
+  const failed = message.pending === 'failed';
+  article.classList.add('message-pending',`message-${message.pending}`);
+  head.querySelector('time').replaceWith(node('span','message-state',t(failed ? '发送失败' : '发送中')));
+  if (!failed) return;
+  const outbox = action => () => article.dispatchEvent(new CustomEvent('studio:outbox',{bubbles:true,detail:{requestId:message.requestId,action}}));
+  const actions = node('div','message-actions');
+  actions.append(button(t('重试'),outbox('retry'),'quiet'),button(t('放回输入框'),outbox('edit'),'quiet'));
+  article.append(actions);
+}
 function renderItem(item, runs, previous, animate = false) {
   if (item.kind === 'notice') return node('p','run-error',runNotice(item.text));
   if (item.kind === 'switch') return node('p','model-switch',t('已切换到 {model}',{model:modelName(item.model,item.profileId)}));
+  if (item.kind === 'activity' && item.live) return liveRun(item,runs);
   if (item.kind === 'activity') {
     const details = node('details','run-activity');
     details.dataset.runId = item.key;
     details.append(activitySummary(item,runs?.find(run => run.id === item.key)));
     // Raw logs are collapsed by default and can hold large tool output: build records on first open.
     let filled = false;
-    const fill = () => { if (filled || !details.open) return; filled = true; for (const record of item.activity) details.append(node(record.role === 'assistant' ? 'p' : 'pre',record.role === 'assistant' ? 'raw-said' : 'raw-record',record.text)); };
+    const fill = () => { if (filled || !details.open) return; filled = true; for (const record of item.activity) details.append(rawRecord(record)); };
     details.addEventListener('toggle', fill);
     // An open log follows new records when it was scrolled to the end, else keeps its place.
     if (previous?.open) { details.open = true; fill(); details.studioScroll = previous.scrollHeight - previous.scrollTop - previous.clientHeight < 40 ? Infinity : previous.scrollTop; }
@@ -106,7 +215,9 @@ function renderItem(item, runs, previous, animate = false) {
     article.studioStream = (next, nextRuns) => { name.textContent = speaker(next.message,nextRuns); body.studioSet(next.message.text || '',!next.streaming); };
     article.append(head,body); return article;
   }
-  article.append(head,messageContent(message)); return article;
+  article.append(head,messageContent(message));
+  if (message.pending) pendingState(article,head,message);
+  return article;
 }
 export function renderMessages(container, messages, runs) {
   for (const item of conversationItems(messages,runs)) container.append(renderItem(item, runs));
@@ -118,22 +229,31 @@ export function reconcileChildren(container, nodes) {
   while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
 }
 // Keyed render for the live conversation: unchanged items keep their DOM nodes, so streaming
-// refreshes do not rebuild every message, collapse open logs or reset text selection.
-export function syncMessages(container, messages, runs, trailing = []) {
-  const language = getLanguage(), previous = container.studioItems?.language === language ? container.studioItems.items : new Map();
+// refreshes do not rebuild every message, collapse open logs or reset text selection. Items keyed
+// by a request `slot` keep their place when the server's record replaces the page's own. Within
+// one conversation (`scope`), what arrives after the first render eases in.
+export function syncMessages(container, messages, runs, trailing = [], {pending = [], scope = ''} = {}) {
+  const language = getLanguage(), same = container.studioItems?.language === language && container.studioItems.scope === scope;
+  const previous = container.studioItems?.language === language ? container.studioItems.items : new Map();
   const items = new Map(), nodes = [];
-  for (const item of conversationItems(messages,runs)) {
-    const key = `${item.kind}:${item.key || item.message.id}`;
+  for (const item of conversationItems(messages,runs,pending)) {
+    const key = `${item.kind}:${item.slot || item.key || item.message.id}`;
     const run = item.message && runs?.find(run => run.id === item.message.runId);
     const signature = JSON.stringify([item, run && [run.profileId, run.model, run.actualModel, run.reasoningEffort, run.actualReasoningEffort]]);
     let entry = previous.get(key);
     if (entry?.signature !== signature) {
-      if (entry?.element.studioStream && item.kind === 'message') { entry.element.studioStream(item, runs); entry = { ...entry, signature }; }
-      else entry = { signature, element: renderItem(item, runs, entry?.element, true) };
+      if (entry?.element.studioLive && item.kind === 'activity') { entry.element.studioLive(item, runs); entry = { ...entry, signature }; }
+      else if (entry?.element.studioStream && item.kind === 'message') { entry.element.studioStream(item, runs); entry = { ...entry, signature }; }
+      else {
+        const element = renderItem(item, runs, entry?.element, true);
+        // A recorded user message replaces the page's own copy silently; agent output eases in.
+        if (!entry && same && (item.message?.role !== 'user' || item.message.pending)) easeIn(element);
+        entry = { signature, element };
+      }
     }
     items.set(key, entry); nodes.push(entry.element);
   }
-  container.studioItems = { language, items };
+  container.studioItems = { language, scope, items };
   reconcileChildren(container, [...nodes, ...trailing]);
   for (const el of nodes) if (el.studioScroll !== undefined) { el.scrollTop = el.studioScroll === Infinity ? el.scrollHeight : el.studioScroll; delete el.studioScroll; }
 }

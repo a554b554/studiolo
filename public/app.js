@@ -9,7 +9,7 @@ import { markdown, isMarkdownPath } from './markdown.js';
 import { $, node, button, empty, time, showError, clearError, attempt, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
 import { platformCommands, codexCommands, parseSlash, mergeCommands, createSlashMenu } from './commands.js';
 import { initAccounts } from './accounts.js';
-import { setAccountDirectory, accountName, familyName } from './conversation.js';
+import { setAccountDirectory, accountName, familyName, recorded, steerCount } from './conversation.js';
 let usage = { setHost() {}, reload() {} }, accountsUI = null, lastComposerHost = null;
 
 initLanguage(); initTheme(); initDialogs();
@@ -215,6 +215,13 @@ async function createProjectSession(projectId) {
 // project's own copy is the freshest.
 const unreadOf = project => (project.id === view.projectId && view.project ? view.project.project.unread : project.unread) || {};
 const attention = mark => ['failed','interrupted','waiting'].includes(mark.status);
+// Conversations with a run executing now. The open project's own runs are the freshest; others
+// come from the project list (a server without this field shows none).
+const runningOf = project => project.id === view.projectId && view.project ? [...new Set(view.project.runs.filter(r => r.status === 'running' && r.sessionId).map(r => r.sessionId))] : project.running || [];
+function runningMark() {
+  const el = node('span','nav-spinner'); el.title = t('运行中'); el.setAttribute('role','img'); el.setAttribute('aria-label',el.title);
+  return el;
+}
 function unreadDot(marks) {
   if (!marks.length) return null;
   const urgent = marks.some(attention), dot = node('span',`unread-dot${urgent ? ' attention' : ''}`);
@@ -240,14 +247,15 @@ document.addEventListener('visibilitychange', markSeen);
 function renderNavigation() {
   const projects = visibleItems(view.bootstrap.projects);
   // Rebuilding on every refresh would swallow clicks and orphan an open menu.
-  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name,unreadOf(p)]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
+  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name,unreadOf(p),runningOf(p)]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
   if (signature === navigationSignature) return;
   navigationSignature = signature;
   const list = $('#project-list'); list.replaceChildren();
   for (const project of projects) {
-    const selected = project.id === view.projectId, unread = unreadOf(project);
+    const selected = project.id === view.projectId, unread = unreadOf(project), running = runningOf(project);
     const el = button('', () => attempt(() => selectProject(project.id)), `project-button${selected ? ' active' : ''}`);
     el.append(node('span','muted','▧'),node('span','',project.name));
+    if (running.length) el.append(runningMark());
     const projectDot = unreadDot(Object.values(unread)); if (projectDot) el.append(projectDot);
     const add = button('＋', () => attempt(() => createProjectSession(project.id)), 'project-session-new');
     add.setAttribute('aria-label',t('在 {name} 中新建会话',{name:project.name}));
@@ -260,7 +268,9 @@ function renderNavigation() {
       for (const session of visibleItems(view.project.sessions)) {
         const sessionButton = button('', () => selectSession(session.id), `session${session.id === view.sessionId ? ' active' : ''}`);
         sessionButton.title = session.title; sessionButton.append(node('span','session-name',session.title));
-        const sessionDot = unreadDot(unread[session.id] ? [unread[session.id]] : []); if (sessionDot) sessionButton.append(sessionDot);
+        // A working conversation shows the spinner; its result mark follows once it finishes.
+        const sessionDot = unreadDot(unread[session.id] ? [unread[session.id]] : []);
+        if (running.includes(session.id)) sessionButton.append(runningMark()); else if (sessionDot) sessionButton.append(sessionDot);
         const row = node('div','navigation-row');
         row.append(sessionButton,moreButton(t('对话 {name}',{name:session.title}),lifecycleActions(project,session)));
         sessions.append(row);
@@ -338,7 +348,7 @@ function renderConversation() {
   $('#project-title').textContent = view.project?.project.name || '';
   const writable=session && category(session)==='active' && category(view.project.project)==='active';
   const machineOnline=!session?.hostId||view.bootstrap.hosts.some(h=>h.id===session.hostId);
-  $('#prompt').disabled = !writable; $('#send').disabled = !writable || !machineOnline || view.submitting; $('#attach').disabled = !writable;
+  $('#prompt').disabled = !writable; $('#send').disabled = !writable || !machineOnline; $('#attach').disabled = !writable;
   renderAttachments();
   $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):t('输入消息…');
   $('#takeover').hidden = true;
@@ -366,7 +376,8 @@ function renderConversation() {
   const boundRun=runs.at(-1),boundAccount=session?.profileId||boundRun?.profileId;
   const who=session&&boundAccount?[view.bootstrap.hosts.find(h=>h.id===(session.hostId||boundRun?.hostId))?.name,`${familyName(boundRun?.account?.family||view.bootstrap.hosts.flatMap(h=>h.profiles||[]).find(p=>p.id===boundAccount)?.family)} ${accountName(boundAccount,boundRun)}`.trim()].filter(Boolean).join(' · '):'';
   nativeStatus.textContent=session?[who,!machineOnline?t('执行电脑离线'):native?.connected?t('原生会话 · {status}',{status:native.busy?t('执行中'):t('已连接')}):t('原生会话 · 待连接')].filter(Boolean).join(' · '):'';
-  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,messages,runs]);
+  const pending = view.project ? outboxFor(view.sessionId) : [];
+  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,messages,runs,pending.map(p => [p.requestId,p.failed,Boolean(p.sentAt)])]);
   if (signature !== messageSignature) {
     messageSignature = signature; const container = $('#messages');
     const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
@@ -375,7 +386,7 @@ function renderConversation() {
     for (const run of runs.filter(run => ['running','waiting'].includes(run.status))) {
       if (!messages.some(message => message.runId === run.id && message.role === 'assistant') && (run.output || run.partialText)) { const article = node('article','message message-assistant'); article.append(node('div','message-header',`${run.profileId} · ${statuses[run.status]}`),node('div','message-body',run.output || run.partialText)); trailing.push(article); }
     }
-    syncMessages(container,messages,runs,trailing);
+    syncMessages(container,messages,runs,trailing,{pending,scope:`${view.projectId}:${view.sessionId}`});
     if (!container.childNodes.length) container.append(empty(session ? writable ? t('发送消息开始这个会话。') : t('恢复后可继续这个对话。') : view.project ? category(view.project.project)==='active' ? t('新建会话后选择 agent 发送消息。') : t('暂无对话。') : t('打开一个项目以开始。')));
     if (nearBottom || !messages.length) container.scrollTop = container.scrollHeight;
   }
@@ -544,21 +555,67 @@ $('#prompt').addEventListener('keydown', event => {
   // Esc stops the executing turn, like the terminal CLIs; the drawer handler only runs otherwise.
   if (event.key === 'Escape' && activeRunOf(currentSession()) && !$('#stop').hidden) { event.preventDefault(); event.stopPropagation(); attempt(stopActiveRun); }
 });
+// Sending is optimistic: the message shows at once (with a live status for a new turn) and the
+// request follows in the background, in the order sent. The server's record later takes the
+// message's place; a failed send stays in the conversation with retry and edit. Requests keep
+// their id until accepted, so a retry never runs twice.
+view.outbox = new Map();
+function outboxFor(sessionId) {
+  const {messages, runs} = view.project, list = [];
+  for (const [id, request] of view.outbox) {
+    if (request.projectId !== view.projectId) continue;
+    const run = runs.find(r => r.requestId === id);
+    const started = run && (!['queued','running'].includes(run.status) || messages.some(m => m.runId === run.id && m.role !== 'user'));
+    if (recorded(request, messages, runs) && (!request.placeholder || !run || started) || request.sentAt && Date.now() - request.sentAt > 120000) { view.outbox.delete(id); continue; }
+    if (request.sessionId === sessionId) list.push(request);
+  }
+  return list;
+}
+let sending = Promise.resolve();
+async function deliver(request) {
+  request.failed = null; request.sentAt = null; showOutbox(request);
+  const send = () => post(`${projectURL(request.projectId)}/messages`,request.body), result = sending.then(send,send);
+  sending = result.catch(() => {});
+  try { await result; }
+  catch (error) { request.failed = error.message || String(error); showOutbox(request); throw error; }
+  request.sentAt = Date.now(); pendingRequests.delete(request.pendingKey);
+  if (view.projectId === request.projectId) await reloadProject();
+}
+function showOutbox(request) { if (view.projectId === request.projectId && view.sessionId === request.sessionId) renderConversation(); }
+$('#messages').addEventListener('studio:outbox', event => {
+  const request = view.outbox.get(event.detail.requestId); if (!request) return;
+  if (event.detail.action === 'retry') { attempt(() => deliver(request)); return; }
+  // Back into the composer, ahead of anything typed since; attachments return with it.
+  view.outbox.delete(request.requestId);
+  const prompt = $('#prompt'), draft = draftKey() === request.draftKey ? prompt.value : view.drafts.get(request.draftKey) || '';
+  const value = draft.trim() ? `${request.text}\n\n${draft}` : request.text;
+  view.drafts.set(request.draftKey,value);
+  if (request.attachmentItems.length) view.attachments.set(request.draftKey,[...request.attachmentItems,...(view.attachments.get(request.draftKey) || [])]);
+  if (draftKey() === request.draftKey) { prompt.value = value; prompt.focus(); }
+  renderAttachments(); renderConversation();
+});
 $('#composer').addEventListener('submit', event => { event.preventDefault(); const mode = sendMode; sendMode = 'auto'; attempt(async () => {
-  const text = $('#prompt').value.trim(), chosen = choices(); if (!text || !view.sessionId || view.submitting) return;
+  const text = $('#prompt').value.trim(), chosen = choices(); if (!text || !view.sessionId) return;
   const command = parseSlash(text);
   if (command && await runLocalCommand(command)) { $('#prompt').value = ''; view.drafts.delete(draftKey()); return; }
   if (!chosen.profileId) throw new Error(t('所选电脑没有可用的 CLI 入口。'));
   const pendingUploads = attachmentList().filter(item => item.status === 'uploading');
   if (pendingUploads.length) throw new Error(t('附件仍在上传，请稍候再发送。'));
-  const attachments = attachmentList().filter(item => item.status === 'ready').map(item => item.path);
+  const attachmentItems = attachmentList().filter(item => item.status === 'ready'), attachments = attachmentItems.map(item => item.path);
   // Steer by default while a run executes; attachments and commands always queue.
-  const steer = mode !== 'queue' && !command && !attachments.length && Boolean(activeRunOf(currentSession()));
-  view.submitting = true; $('#send').disabled = true; const originalKey = draftKey(), sessionId = view.sessionId, projectId = view.projectId;
+  const active = activeRunOf(currentSession()), steer = mode !== 'queue' && !command && !attachments.length && Boolean(active);
+  const originalKey = draftKey(), sessionId = view.sessionId, projectId = view.projectId;
   const signature = JSON.stringify({sessionId,text,attachments,steer,...chosen}), pendingKey = `${originalKey}:${signature}`;
   if (!pendingRequests.has(pendingKey)) pendingRequests.set(pendingKey,requestId());
-  try { await post(`${projectURL(projectId)}/messages`,{requestId:pendingRequests.get(pendingKey),sessionId,text,...(attachments.length ? {attachments} : {}),...(steer ? {steer:true} : {}),...chosen}); pendingRequests.delete(pendingKey); view.drafts.delete(originalKey); view.attachments.delete(originalKey); if (draftKey() === originalKey && $('#prompt').value.trim() === text) $('#prompt').value = ''; renderAttachments(); await reloadProject(); $('#messages').scrollTop = $('#messages').scrollHeight; }
-  finally { view.submitting = false; $('#send').disabled = !view.sessionId; }
+  const id = pendingRequests.get(pendingKey); if (view.outbox.has(id) && !view.outbox.get(id).failed) return;
+  const request = {requestId:id,projectId,sessionId,text,steer,attachments,attachmentItems,pendingKey,draftKey:originalKey,createdAt:new Date().toISOString(),
+    agent:{profileId:chosen.profileId,model:chosen.model,reasoningEffort:chosen.reasoningEffort},placeholder:!steer && !active,steers:steer ? steerCount(view.project.messages,{sessionId,text}) : 0,
+    body:{requestId:id,sessionId,text,...(attachments.length ? {attachments} : {}),...(steer ? {steer:true} : {}),...chosen}};
+  view.outbox.set(id,request);
+  $('#prompt').value = ''; view.drafts.delete(originalKey); view.attachments.delete(originalKey); renderAttachments();
+  renderConversation();
+  const messages = $('#messages'); messages.scrollTo({top:messages.scrollHeight,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
+  await deliver(request);
 }); });
 
 async function start() {
@@ -572,10 +629,11 @@ async function start() {
   const previous = previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
   if (project) await selectProject(project.id,previous.sessionId); else { renderNavigation(); renderConversation(); }
   // Run output and conversation events only touch their own project; the project list
-  // changes only on reconnect or project-level events, so most refreshes skip it.
+  // changes only on reconnect, project-level events or a run starting or ending in another
+  // project (its spinner), so most refreshes skip it.
   let listStale = false, fullStale = false;
   listenChanges(change => {
-    const listChanged = !change.projectId || change.reconnect || String(change.type || '').startsWith('project.');
+    const listChanged = !change.projectId || change.reconnect || String(change.type || '').startsWith('project.') || change.projectId !== view.projectId && /^run\.(started|finished|failed|cancelled)$/.test(change.type);
     if (!listChanged && change.projectId !== view.projectId) return;
     listStale ||= listChanged;
     fullStale ||= listChanged || change.type !== 'run.live';

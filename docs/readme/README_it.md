@@ -97,6 +97,8 @@ Ogni conversazione possiede un processo nativo residente — Claude Code tramite
 
 Le richieste di permesso che la CLI farebbe nel terminale compaiono nella pagina: approva una volta o nega, e la stessa esecuzione continua. La modalità automatica è quella della CLI stessa (Claude `auto`, Codex `auto_review`); Studiolo non aggiunge mai flag di bypass né regole di autorizzazione permanenti. Lo sforzo di ragionamento e il modello possono cambiare a ogni messaggio all'interno di una conversazione (Claude `set_model` / `apply_flag_settings`, parametri `turn/start` di Codex).
 
+Mentre un turno è in esecuzione, la conversazione mostra il lavoro come fanno le CLI: ciò che l'agente dice tra un passo e l'altro resta visibile per intero, le chiamate di strumenti consecutive si raccolgono in una riga espandibile e il passo in corso e il tempo trascorso restano in vista; quando arriva la risposta, l'intera esecuzione si ripiega nel suo raw log. Un messaggio inviato compare subito e viene recapitato in background (in caso di errore si può riprovare). Nella barra laterale un indicatore rotante segna le conversazioni e i progetti al lavoro, e un punto i risultati che non hai ancora visto.
+
 ---
 
 ## Più macchine

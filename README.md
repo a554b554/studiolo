@@ -98,6 +98,8 @@ Each conversation owns a resident native process — Claude Code over bidirectio
 
 Permission requests that the CLI would ask in the terminal appear in the page: approve this once or deny, and the same execution continues. Auto mode is the CLI's own (Claude `auto`, Codex `auto_review`); Studiolo never adds bypass flags or permanent allow rules. Reasoning effort and model can change per message within a conversation (Claude `set_model` / `apply_flag_settings`, Codex `turn/start` parameters).
 
+While a turn runs, the conversation shows the work the way the CLIs do: what the agent says between steps stays in full, consecutive tool calls fold into one line you can open, and the step in progress and the elapsed time stay in view; when the reply arrives, the whole run folds into its raw log. A message you send appears at once and is delivered in the background (a failed send offers retry). In the sidebar a spinner marks conversations and projects that are working, and a dot marks results you have not seen yet.
+
 ---
 
 ## Subagents and account routing
