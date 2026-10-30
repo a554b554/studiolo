@@ -89,6 +89,10 @@ test('registry creates isolated account directories seeded from the default CLI 
   assert.equal((await f.accounts.env(b,{})).ANTHROPIC_API_KEY,'sk-ant-xyz');
   assert.equal((await f.accounts.env(c,{OPENAI_API_KEY:'ambient'})).OPENAI_API_KEY,undefined);
   assert.equal((await f.accounts.env(c,{})).CODEX_HOME,f.accounts.dir(c.id));
+  // A linked account directory (a symlink or junction) reaches the CLI as its real path, which
+  // names the macOS Keychain login.
+  const real=path.join(f.stateDir,'elsewhere');await fs.rename(f.accounts.dir(c.id),real);await fs.symlink(real,f.accounts.dir(c.id),'junction');
+  assert.equal((await f.accounts.env(c,{})).CODEX_HOME,await fs.realpath(real));
   assert.ok(!(await fs.readFile(path.join(f.stateDir,'accounts.json'),'utf8')).includes('sk-ant-xyz'),'keys never enter the registry');
   const before=f.accounts.version;await f.accounts.remove(b.id);assert.ok(f.accounts.version>before);
   await assert.rejects(fs.access(f.accounts.dir(b.id)));

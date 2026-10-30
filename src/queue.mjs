@@ -1,4 +1,4 @@
-import {buildContext} from './context.mjs';
+import {buildContext,forkTranscript,forkSummaryPrompt} from './context.mjs';
 import { randomUUID } from 'node:crypto';
 import {inactive} from './lifecycle.mjs';
 import {Approvals} from './approvals.mjs';
@@ -31,8 +31,10 @@ export class QueueManager {
   // every outputCommitMs; clients see uncommitted output through overlay() meanwhile.
   // `knowledge` resolves the machine-specific shared knowledge ({text, hash} or null) appended to
   // platform prompts; see subagents.mjs. A failure there never blocks the run.
-  constructor({ store, runner, hostId, knowledge = null, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
-    this.knowledge = knowledge;
+  // `hooks.beforeRun(projectId, run, say, signal)` may refuse or delay a started run (synced projects pull
+  // files first); `hooks.afterRun(projectId, run)` runs once it ended (auto-commit). See sync-engine.mjs.
+  constructor({ store, runner, hostId, knowledge = null, hooks = {}, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
+    this.knowledge = knowledge; this.hooks = hooks;
     this.store = store;
     this.runner = runner;
     this.hostId = hostId;
@@ -161,6 +163,8 @@ export class QueueManager {
         const gone=Boolean(bound.profileId)&&profiles!==null&&!profiles.some(p=>p.id===bound.profileId);
         // The model may change from one message to the next; machine and account stay.
         if(bound.hostId&&bound.hostId!==this.hostId||!gone&&bound.profileId&&bound.profileId!==input.profileId)throw error('This conversation is fixed to its machine and account. Create a new conversation to change them.',409);
+        // The sent text leaves the draft other devices would otherwise still show.
+        if(session.draft?.text)session.draft={text:'',at:new Date().toISOString(),hostId:this.hostId};
         session.hostId=this.hostId;session.profileId=input.profileId;session.model=input.model;
         session.selection={model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode};
       }
@@ -227,6 +231,21 @@ export class QueueManager {
     return run;
   }
 
+  // First run of a forked conversation: the executing host's chosen account summarizes
+  // the source conversation from replicated messages, so the source host may be offline. The
+  // summary is a visible message and the bootstrap prompt carries it; a failure fails the run.
+  async _forkSummary(projectId, run, signal) {
+    const state = await this.store.read(projectId), session = state.sessions.find(s => s.id === run.sessionId);
+    if (!session?.forkOf || state.messages.some(m => m.sessionId === session.id && m.kind === 'fork_summary')) return;
+    const source = state.sessions.find(s => s.id === session.forkOf.sessionId);
+    const transcript = forkTranscript(state.messages.filter(m => m.sessionId === session.forkOf.sessionId));
+    if (!transcript.turns) return;
+    const result = await this.runner.execute({ cwd: state.project.path, prompt: forkSummaryPrompt(source?.title || '', transcript), profileId: run.profileId, model: run.model, reasoningEffort: run.reasoningEffort, permissionMode: 'read-only', onApproval: async () => ({ decision: 'deny' }), signal });
+    const text = scrub(result.text || '').trim();
+    if (result.error || !text) throw error(`Could not summarize the forked conversation: ${scrub(result.error || 'empty answer')}`, 502);
+    await this.store.mutate(projectId, 'session.fork-summary', s => { s.messages.push({ ...this._message(run, 'system', text), kind: 'fork_summary' }); });
+  }
+
   _assertRun(run) { if(run?.hostId!==this.hostId)throw error('Run belongs to another machine',409); }
 
   _message(run, role, text) {
@@ -282,6 +301,7 @@ export class QueueManager {
       live.tail.catch(() => {});
       return live.tail;
     };
+    let started = false;
     try {
       const run = await this.store.mutate(projectId, 'run.started', state => {
 
@@ -293,6 +313,9 @@ export class QueueManager {
         return item;
       });
       if (!run) return;
+      started = true;
+      await this.hooks.beforeRun?.(projectId, run, text => this.store.mutate(projectId, 'run.note', s => { s.messages.push({ ...this._message(run, 'system', text), kind: 'status' }); }), controller.signal);
+      await this._forkSummary(projectId, run, controller.signal);
       const state = await this.store.read(projectId);
       const nativeSessionId = state.nativeSessions[mappingKey(this.hostId, run)];
       // Slash commands go to the CLI verbatim: no platform prompt, no attachment notes.
@@ -379,7 +402,10 @@ export class QueueManager {
         s.messages.push(this._message(run, 'system', run.error));
         markUnread(s, run);
       });
-    } finally { clearTimeout(live.timer); live.timer = undefined; this.live.delete(runId); this.controllers.delete(runId); await this.approvals.expire(projectId,runId); }
+    } finally {
+      clearTimeout(live.timer); live.timer = undefined; this.live.delete(runId); this.controllers.delete(runId); await this.approvals.expire(projectId,runId);
+      if (started && this.hooks.afterRun) await this.hooks.afterRun(projectId, runId).catch(e => this.store.mutate(projectId, 'run.after-failed', s => { const r = s.runs.find(r => r.id === runId); if (r) s.messages.push({ ...this._message(r, 'system', e.message), kind: 'status' }); }).catch(() => {}));
+    }
   }
 
   // Stop like Esc in the CLIs: the current turn ends, the process and native session stay.

@@ -26,6 +26,8 @@ export function conversationItems(messages, runs = [], pending = []) {
   const waiting = new Map(pending.filter(request => request.placeholder).map(request => [request.requestId, request]));
   let model = null;
   for (const message of messages) {
+    // A fork's handoff summary reads as its own block, not inside the run's activity.
+    if (message.kind === 'fork_summary') { result.push({kind:'message',message}); continue; }
     if (message.role === 'user') {
       const run = message.kind === 'steer' ? null : runs.find(r => r.id === message.runId);
       if (run?.model) { if (model && run.model !== model) result.push({kind:'switch',key:message.id,model:run.model,profileId:run.profileId}); model = run.model; }

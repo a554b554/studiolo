@@ -1,14 +1,18 @@
 import { promises as fs, realpath as resolveRealpath } from 'node:fs';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import os from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import {changes,applyChanges} from './journal.mjs';
+import {defaultStateDir} from './defaults.mjs';
+import {migrateProject} from '../public/project-hosts.js';
 
 const clone = value => structuredClone(value);
 const now = () => new Date().toISOString();
 const realpath = promisify(resolveRealpath);
 const digest = text => createHash('sha1').update(text).digest('hex');
+const journalName = /^(?:v2-)?\d{12}-[\da-f-]+\.json$/;
+// A metadata stub holds a project's journal but none of its files.
+const isStub = directory => fs.access(path.join(directory, '.studio', 'stub')).then(() => true, () => false);
 function error(message, status = 400) { return Object.assign(new Error(message), { status, statusCode: status }); }
 async function fingerprint(root, name) {
   const info = await fs.stat(path.join(root, 'events', name));
@@ -63,7 +67,7 @@ function validateState(state) {
 
 /** Immutable transaction files are authoritative; state.json and Markdown are rebuildable. */
 export class Store {
-  constructor({ stateDir = path.join(os.homedir(), '.studio-local'), hostId, projectRoot } = {}) {
+  constructor({ stateDir = defaultStateDir(), hostId, projectRoot } = {}) {
     if (!hostId) throw error('hostId is required');
     this.stateDir = path.resolve(stateDir);
     this.hostId = hostId;
@@ -96,7 +100,8 @@ export class Store {
         const root = path.join(entry.path, '.studio');
         const event = await this._load(root);
         if (event.state.project.id !== entry.id) throw error('Project identity mismatch', 409);
-        if (!this.projectRoot || event.state.project.ownerHostId === this.hostId) await this._derive(root, event.state);
+        // Each host derives its own readable views; a metadata stub has no working tree to put them in.
+        if (!entry.stub) await this._derive(root, event.state);
       } catch (e) { this.lastDerivedError = e.message; this.derivedErrors.set(entry.id, e.message); }
     }
     return this;
@@ -114,8 +119,8 @@ export class Store {
   // Lets the queue announce uncommitted live output without writing an event.
   notify(projectId, type) { this._notify(projectId, type); }
 
-  // Hard-deleted project IDs: one tombstone per project in the synced projects/.deleted
-  // folder. Names are parsed, not contents, so Syncthing conflict copies count as well.
+  // Hard-deleted project IDs: one tombstone per project in projects/.deleted (exchanged with
+  // peers in the host index). Names are parsed, not contents, so stray copies count as well.
   async deletedIds() {
     if (!this.projectRoot) return new Set();
     const names = await fs.readdir(path.join(this.projectRoot, '.deleted')).catch(e => { if (e.code === 'ENOENT') return []; throw e; });
@@ -177,12 +182,14 @@ export class Store {
         try {
           if (!entry.isDirectory() || entry.isSymbolicLink()) throw error('Managed project must be a real directory',409);
           if(cached && !cached.unavailable){found.push(cached);continue;}
+          const stub=cached ? Boolean(cached.stub) : await isStub(directory);
           const event=await this._load(path.join(directory,'.studio'));
           if(event.state.project.id!==entry.name)throw error('Project folder ID does not match history',409);
-          found.push({...event.state.project,path:directory});
+          found.push({...event.state.project,path:directory,...(stub?{stub:true}:{})});
         } catch(e) {
-          // Partial Syncthing arrivals are visible as unavailable, never initialized or overwritten.
-          found.push({id:entry.name,name:cached?.name||entry.name,path:directory,unavailable:true,error:e.message});
+          // A stub whose journal has not arrived yet is visible as unavailable, never initialized or overwritten.
+          const stub=cached ? Boolean(cached.stub) : await isStub(directory);
+          found.push({id:entry.name,name:cached?.name||entry.name,path:directory,unavailable:true,error:e.message,...(stub?{stub:true}:{})});
         }
       }
       found.sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||'')||a.id.localeCompare(b.id));
@@ -211,16 +218,16 @@ export class Store {
       try {
         const { entry: current, event } = await this._loadEntry(entry.id);
         const running = [...new Set(event.state.runs.filter(r => r.status === 'running' && r.sessionId).map(r => r.sessionId))];
-        return { ...clone(event.state.project), path: current.path, ...(running.length ? { running } : {}) };
+        return { ...clone(event.state.project), path: current.path, replica: !current.stub, ...(running.length ? { running } : {}) };
       }
-      catch (e) { return { ...clone(entry), unavailable: true, error: e.message }; }
+      catch (e) { const { stub, ...rest } = clone(entry); return { ...rest, replica: !stub, unavailable: true, error: e.message }; }
     }));
   }
 
   // Same checks as read(), but clones only the project record instead of every message.
   async getProject(id) {
     const { entry, event } = await this._loadEntry(id);
-    return { ...clone(event.state.project), path: entry.path };
+    return { ...clone(event.state.project), path: entry.path, replica: !entry.stub };
   }
 
   async createProject({ name, path: directory, group = '' } = {}) {
@@ -242,7 +249,7 @@ export class Store {
         const duplicate = this.registry.projects.find(p => p.id === project.id);
         if (duplicate && duplicate.path !== actual) throw error('This project ID is already mapped to another local directory', 409);
       } else {
-        project = { id, name: name.trim(), group: String(group), ownerHostId: this.hostId, createdAt: now(), path: actual };
+        project = migrateProject({ id, name: name.trim(), group: String(group), ownerHostId: this.hostId, createdAt: now(), path: actual });
         const state = { schemaVersion: 1, project, sessions: [], messages: [], runs: [], artifacts: [], annotations: [], queues: {}, nativeSessions: {} };
         await this._commit(root, state, 'project.created', null);
       }
@@ -311,6 +318,7 @@ export class Store {
       previous = event;
     }
     validateState(previous.state);
+    migrateProject(previous.state.project);
     this.eventCache.set(cacheKey, { fingerprints, event: previous });
     return previous;
   }
@@ -338,16 +346,17 @@ export class Store {
       applyChanges(state,event.changes);seen.set(event.id,event.sequence);
       for(const id of event.parents)tips.delete(id);tips.add(event.id);
     }
-    validateState(state);if(state.project.id!==base.state.project.id)throw error('Project identity changed in journal',409);
+    validateState(state);if(state.project.id!==base.state.project.id)throw error('Project identity changed in journal',409);migrateProject(state.project);
     const last=events.at(-1),result={...last,state,tips:[...tips].sort()};
     this.eventCache.set(root,{signature,event:result});return result;
   }
 
-  // Sorted v2 journal file names only: peers compare these every few seconds, so no event
-  // body is read or parsed here.
+  // Sorted journal file names, the root snapshot events (v1) first: peers compare these every
+  // few seconds, so no event body is read or parsed here. A metadata stub on another server
+  // starts from nothing, so the root events travel too.
   async journalNames(id) {
     const entry=this._entry(id);await this._checkManagedEntry(entry);const root=path.join(entry.path,'.studio','events');await assertMetadataDirectories(path.dirname(root));
-    return (await fs.readdir(root)).filter(n=>/^v2-\d{12}-[\da-f-]+\.json$/.test(n)).sort();
+    return (await fs.readdir(root).catch(e=>{if(e.code==='ENOENT')return [];throw e;})).filter(n=>journalName.test(n)).sort();
   }
   async journal(id, known=[]) {
     const names=await this.journalNames(id),root=path.join(this._entry(id).path,'.studio','events');
@@ -362,7 +371,10 @@ export class Store {
       const root=path.join(entry.path,'.studio');await assertMetadataDirectories(root);
       let written=0;
       for(const {name,event} of events){
-        if(!/^v2-\d{12}-[\da-f-]+\.json$/.test(name)||event.schemaVersion!==2||event.projectId!==id||name!==`v2-${String(event.sequence).padStart(12,'0')}-${event.id}.json`||!Array.isArray(event.changes)||!Array.isArray(event.parents))throw error('Invalid journal');
+        const valid=name.startsWith('v2-')
+          ? event?.schemaVersion===2&&event.projectId===id&&name===`v2-${String(event.sequence).padStart(12,'0')}-${event.id}.json`&&Array.isArray(event.changes)&&Array.isArray(event.parents)
+          : event?.schemaVersion===1&&event.state?.project?.id===id&&name===`${String(event.sequence).padStart(12,'0')}-${event.id}.json`;
+        if(!journalName.test(name)||!valid)throw error('Invalid journal');
         const file=path.join(root,'events',name),text=JSON.stringify(event);
         try{const old=await fs.readFile(file,'utf8');if(old!==text)throw error('Journal identity collision',409);}catch(e){if(e.code!=='ENOENT')throw e;await atomicWrite(file,text);written++;}
       }
@@ -370,7 +382,41 @@ export class Store {
       // landed on disk invalidates in-flight reads and wakes every connected browser tab.
       if(!written)return;
       this.eventLoads.delete(`${root}:false`);this.eventLoads.delete(`${root}:true`);
+      // Replicas keep their own readable history views current; a journal still missing parents is skipped.
+      if(!entry.stub)try{await this._derive(root,(await this._load(root)).state);}catch{}
       this._notify(id,'journal.synced');
+    });
+  }
+
+  // A project known only from a peer's index: an empty journal plus the stub marker, filled by
+  // the next journal exchange. Tombstoned or already known projects are left alone.
+  async adoptProject(id, name = id) {
+    if (!this.projectRoot || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) throw error('Only managed projects can be adopted');
+    return this._serial('registry', async () => {
+      if (this.registry.projects.some(p => p.id === id) || (await this.deletedIds()).has(id)) return false;
+      const directory = path.join(this.projectRoot, id);
+      // A folder already there (copied in, not yet discovered) is a real copy: discovery registers it.
+      if (await fs.stat(directory).then(() => true, () => false)) return false;
+      await fs.mkdir(path.join(directory, '.studio', 'events'), { recursive: true });
+      await atomicWrite(path.join(directory, '.studio', 'stub'), JSON.stringify({ adoptedAt: now(), hostId: this.hostId }));
+      this.registry.projects.push({ id, name: String(name), path: directory, unavailable: true, stub: true });
+      await atomicWrite(path.join(this.stateDir, 'registry.json'), JSON.stringify(this.registry, null, 2));
+      this._notify(id, 'project.adopted');
+      return true;
+    });
+  }
+
+  // A replica gains its working tree (pull) or gives it up (drop): the stub marker follows.
+  async setStub(id, stub) {
+    return this._serial('registry', async () => {
+      const entry = this._entry(id); await this._checkManagedEntry(entry);
+      const marker = path.join(entry.path, '.studio', 'stub');
+      if (stub) await atomicWrite(marker, JSON.stringify({ droppedAt: now(), hostId: this.hostId })); else await fs.rm(marker, { force: true });
+      if (Boolean(entry.stub) === Boolean(stub)) return;
+      if (stub) entry.stub = true; else delete entry.stub;
+      await atomicWrite(path.join(this.stateDir, 'registry.json'), JSON.stringify(this.registry, null, 2));
+      if (!stub) try { const root = path.join(entry.path, '.studio'); await this._derive(root, (await this._load(root)).state); } catch {}
+      this._notify(id, stub ? 'replica.dropped' : 'replica.ready');
     });
   }
 
@@ -387,6 +433,7 @@ export class Store {
     const { entry, event } = await this._loadEntry(id);
     const state = clone(event.state);
     state.project.path = entry.path;
+    state.project.replica = !entry.stub;
     return this.derivedErrors.has(id) ? { ...state, storageWarning: this.derivedErrors.get(id) } : state;
   }
 
@@ -400,12 +447,13 @@ export class Store {
       const state = clone(previous.state);
       state.project.path = entry.path;
       const result = fn(state);
+      delete state.project.replica;
       if (result && typeof result.then === 'function') throw error('Store mutation callback must be synchronous');
       if (state.project.id !== id) throw error('Project identity cannot change');
       // _commit serializes before writing. Failed callbacks never publish an event.
       const event = await this._commit(root, state, type, previous);
       // Once the authority committed, a failed derived view must not report a failed transaction.
-      try { await this._derive(root, event.state); this.derivedErrors.delete(id); }
+      try { if (!entry.stub) await this._derive(root, event.state); this.derivedErrors.delete(id); }
       catch (e) { this.lastDerivedError = e.message; this.derivedErrors.set(id, e.message); }
       this._notify(id, type);
       return clone(result);

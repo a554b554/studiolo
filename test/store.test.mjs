@@ -206,3 +206,14 @@ test('the project list names conversations with a run executing now', async t =>
   assert.equal(listed.path, project.path);
   assert.equal((await store.getProject(project.id)).running, undefined, 'only the list carries it');
 });
+
+test('a project folder copied in before discovery is never turned into a stub by adoption',async t=>{
+ const root=await fs.mkdtemp(path.join((await import('node:os')).tmpdir(),'studio-adopt-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const a=await new Store({stateDir:path.join(root,'a'),hostId:'a',projectRoot:path.join(root,'a-projects')}).init();
+ const p=await a.createProject({name:'Copied'});await fs.writeFile(path.join(p.path,'notes.txt'),'real');
+ const b=await new Store({stateDir:path.join(root,'b'),hostId:'b',projectRoot:path.join(root,'b-projects')}).init();
+ await fs.cp(p.path,path.join(root,'b-projects',p.id),{recursive:true});
+ assert.equal(await b.adoptProject(p.id,'Copied'),false);
+ await assert.rejects(fs.stat(path.join(root,'b-projects',p.id,'.studio','stub')));
+ await b.discoverProjects();assert.equal((await b.read(p.id)).project.replica,true);
+});

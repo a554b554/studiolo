@@ -37,4 +37,4 @@ for ($attempt=0; $attempt -lt 45; $attempt++) {
         if ($identity.protocol -eq 2) { Write-Host 'Studio multi-server protocol 2 is running.'; exit 0 }
     } catch { }
 }
-throw 'Studiolo has not become ready. Inspect ~/.studio-local/server-*.stderr.log.'
+throw 'Studiolo has not become ready. Inspect ~/.studiolo/server-*.stderr.log.'

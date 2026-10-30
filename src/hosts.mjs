@@ -1,17 +1,11 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import {writeJson,httpError} from './paths.mjs';
+import {httpError} from './paths.mjs';
 import {journalDigest} from './journal.mjs';
 
 export class Hosts {
-  constructor({machine,projectRoot,publicUrl,profiles}) {Object.assign(this,{machine,projectRoot,publicUrl,profiles});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
-  async init(){
-    this.directory=path.join(this.projectRoot,'.servers');await fs.mkdir(this.directory,{recursive:true});
-    if(this.publicUrl)await writeJson(path.join(this.directory,this.machine.hostId+'.json'),{id:this.machine.hostId,name:this.machine.name,url:this.publicUrl});
-  }
-  async request(host,url,{method='GET',data,timeout=5000}={}){
+  constructor({machine,publicUrl,profiles,files=null}) {Object.assign(this,{machine,publicUrl,profiles,files});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
+  async request(host,url,{method='GET',data,timeout=5000,headers={}}={}){
     try{
-      const response=await fetch(new URL(url,host.url),{method,headers:{...(host.token?{Authorization:'Bearer '+host.token}:{}),'X-Studio-Hop':'1',...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined,signal:AbortSignal.timeout(timeout),redirect:'error'});
+      const response=await fetch(new URL(url,host.url),{method,headers:{...headers,...(host.token?{Authorization:'Bearer '+host.token}:{}),'X-Studio-Hop':'1',...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined,signal:AbortSignal.timeout(timeout),redirect:'error'});
       const result=await response.json();if(!response.ok)throw httpError(result.error||'Remote request failed',response.status);return result;
     }catch(e){if(e.status)throw e;throw httpError(`${host.name||host.id}: server unavailable`,503);}
   }
@@ -19,17 +13,16 @@ export class Hosts {
     if(this.cache&&Date.now()-this.cache.at<4000)return this.cache.hosts;
     if(this.inflight)return this.inflight;
     this.inflight=(async()=>{
+      // Peers come from machine.json alone (registered in Settings, mutually through /api/peer/hello).
       const candidates=new Map((this.machine.hosts||[]).map(h=>[h.id,h]));
-      for(const name of await fs.readdir(this.directory)){
-        if(!/^[\da-f-]+\.json$/.test(name))continue;
-        try{const h=JSON.parse(await fs.readFile(path.join(this.directory,name),'utf8'));const u=new URL(h.url);if(['http:','https:'].includes(u.protocol)&&!u.username&&!u.password&&!candidates.has(h.id))candidates.set(h.id,h);}catch{}
-      }
       candidates.delete(this.machine.hostId);
-      const remote=await Promise.all([...candidates.values()].map(async h=>{try{const info=await this.request(h,'/api/identity');return info.protocol===2&&info.hostId===h.id?{...h,profiles:info.profiles}:null;}catch{return null;}}));
-      const hosts=[{id:this.machine.hostId,name:this.machine.name,local:true,url:this.publicUrl||origin,profiles:await this.profiles()},...remote.filter(Boolean)];
+      const remote=await Promise.all([...candidates.values()].map(async h=>{try{const info=await this.request(h,'/api/identity');return info.protocol===2&&info.hostId===h.id?{...h,profiles:info.profiles,files:info.files||null}:null;}catch{return null;}}));
+      const hosts=[{id:this.machine.hostId,name:this.machine.name,local:true,url:this.publicUrl||origin,profiles:await this.profiles(),files:this.files},...remote.filter(Boolean)];
       this.cache={at:Date.now(),hosts};return hosts;
     })();try{return await this.inflight;}finally{this.inflight=null;}
   }
+  // Every registered peer with its last probe result, for the Settings list (offline ones included).
+  async configured(origin){const online=new Set((await this.online(origin)).map(h=>h.id));return (this.machine.hosts||[]).map(({token,...h})=>({...h,online:online.has(h.id)}));}
   async get(id,origin){const h=(await this.online(origin)).find(h=>h.id===id);if(!h)throw httpError('Conversation machine is offline or not yet upgraded. It cannot be changed; create another conversation to use an online machine.',503);return h;}
   visible(hosts){return hosts.map(({token,...h})=>h);}
   // Journals are exchanged every few seconds for every project and peer. While both sides
@@ -56,6 +49,32 @@ export class Hosts {
         remote=next;
       }
     })();this.syncing.set(key,pending);try{return await pending;}finally{this.syncing.delete(key);}
+  }
+  // Host index exchange. After a full exchange both sides hold the union, so while
+  // neither changes, a probe with the peer's last digest replaces sending the whole index.
+  async syncIndex(index,host){
+    const key='index:'+host.id;if(this.syncing.has(key))return this.syncing.get(key);
+    const pending=(async()=>{
+      const local=await index.build(),last=this.digests.get(key);
+      if(last?.local===local.digest){const probe=await this.request(host,'/api/peer/index',{method:'POST',data:{digest:last.remote}});if(probe.same===true)return false;}
+      const remote=await this.request(host,'/api/peer/index',{method:'POST',data:local,timeout:30000});
+      const changed=await index.merge(remote);
+      this.digests.set(key,{local:changed?(await index.build()).digest:local.digest,remote:remote.digest});
+      return changed;
+    })();this.syncing.set(key,pending);try{return await pending;}finally{this.syncing.delete(key);}
+  }
+  // Streams a request whose body or answer is not JSON (uploads, images) to the host that holds
+  // the files, and its answer back to the browser.
+  async proxy(host,req,res,url,{timeout=300000}={}){
+    const forwarded=Object.fromEntries(['content-type','content-length','if-none-match'].filter(k=>req.headers[k]).map(k=>[k,req.headers[k]]));
+    let response;
+    try{response=await fetch(new URL(url,host.url),{method:req.method,headers:{...forwarded,...(host.token?{Authorization:'Bearer '+host.token}:{}),'X-Studio-Hop':'1'},body:['GET','HEAD'].includes(req.method)?undefined:req,duplex:'half',signal:AbortSignal.timeout(timeout),redirect:'error'});}
+    catch{throw httpError(`${host.name||host.id}: server unavailable`,503);}
+    // fetch already decoded any compression, so length and encoding are not passed on.
+    const headers=Object.fromEntries(['content-type','cache-control','etag','x-content-type-options','content-security-policy'].filter(k=>response.headers.has(k)).map(k=>[k,response.headers.get(k)]));
+    res.writeHead(response.status,headers);
+    if(response.body&&req.method!=='HEAD')for await(const chunk of response.body)res.write(chunk);
+    res.end();
   }
   // Only a peer that reports a digest equal to our own set is probed next time.
   _remember(key,names,remoteDigest){if(typeof remoteDigest==='string'&&remoteDigest===journalDigest(names))this.digests.set(key,remoteDigest);}

@@ -5,7 +5,7 @@ import {safePath,httpError} from './paths.mjs';
 
 // Every upload lands in the project's uploads/ folder, whether it came from the chat
 // composer or the resource pane. Browsers send the original name; only its last path
-// segment survives, with characters Windows, macOS and Syncthing cannot store removed.
+// segment survives, with characters Windows or macOS cannot store removed.
 export const UPLOAD_DIR='uploads';
 const reserved=/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 export function safeUploadName(input){

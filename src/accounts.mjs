@@ -108,7 +108,9 @@ export class Accounts {
   async env(account,base={}){
     const env={...base};
     delete env.STUDIO_TOKEN;delete env.ANTHROPIC_API_KEY;delete env.OPENAI_API_KEY;delete env.CLAUDE_CODE_OAUTH_TOKEN;delete env.CLAUDE_CODE_OAUTH_REFRESH_TOKEN;
-    env[FAMILIES[account.family].dirEnv]=this.dir(account.id);
+    // The resolved path: on macOS Claude Code names its Keychain login after a hash of
+    // CLAUDE_CONFIG_DIR as given, so a linked account directory must keep its real path.
+    env[FAMILIES[account.family].dirEnv]=await fs.realpath(this.dir(account.id)).catch(()=>this.dir(account.id));
     if(account.family==='claude'&&account.auth==='api_key'){const key=await this.readKey(account.id);if(key)env.ANTHROPIC_API_KEY=key;}
     return env;
   }

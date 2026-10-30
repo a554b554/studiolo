@@ -177,7 +177,7 @@ function liveRun(item, runs) {
   section.studioLive(item,runs,false);
   return section;
 }
-function speaker(message, runs) { return message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId)); }
+function speaker(message, runs) { if (message.kind === 'fork_summary') return t('分叉摘要'); return message.role === 'user' ? (message.kind === 'steer' ? t('你 · 插话') : t('你')) : agentLabel(message,runs?.find(run => run.id === message.runId)); }
 // A message sent from this page that the server has not recorded yet; a failed one offers to
 // send it again or to put it back into the composer (handled by the page via `studio:outbox`).
 function pendingState(article, head, message) {
@@ -318,8 +318,9 @@ export async function bootstrap() {
 }
 export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
   const profiles=$(`#${prefix}profile`),models=$(`#${prefix}model`),hosts=$(`#${prefix}host`),efforts=$(`#${prefix}effort`),permission=$(`#${prefix}permission`);
-  let available=data.hosts||[],bound=null,sessionId=null,loading=false,generation=0,current=[],notify=()=>{};
+  let available=data.hosts||[],allowed=null,bound=null,sessionId=null,loading=false,generation=0,current=[],notify=()=>{};
   const selectedProfile=()=>current.find(p=>p.id===profiles.value);
+  const hostNames={},hostLabel=id=>available.find(h=>h.id===id)?.name||hostNames[id]||id;
   const familyOf=p=>p?.family||(p?.id?.startsWith('codex')?'codex':p?.id?.startsWith('claude')?'claude':null);
   const modeLabels=()=>{if(permission){const profile=selectedProfile(),codex=familyOf(profile)==='codex';const auto=permission.querySelector('[value="auto"]');auto.disabled=!supportsAuto(profile||profiles.value,models.value);auto.textContent=auto.disabled?t('Auto · 此模型不支持'):codex?'Approve for me':'Auto';permission.querySelector('[value="read-only"]').textContent=codex?t('只读'):'Plan';}};
   const setValue=(select,value)=>{if(value&&!Array.from(select.options).some(o=>o.value===value))select.add(new Option(value,value));if(value)select.value=value;};
@@ -354,11 +355,15 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
   };
   const fillHosts=()=>{
     const selected=fixedHostId||bound?.hostId||hosts.value||data.hostId;hosts.replaceChildren();
-    for(const h of available)hosts.add(new Option(h.name||h.id,h.id));
+    // A new conversation may only pick a host that holds the project's files; those offline are shown, not selectable.
+    const usable=allowed&&!fixedHostId&&!bound?.hostId?available.filter(h=>allowed.includes(h.id)):available;
+    for(const h of usable)hosts.add(new Option(h.name||h.id,h.id));
+    if(allowed&&!fixedHostId&&!bound?.hostId)for(const id of allowed.filter(id=>!available.some(h=>h.id===id))){const option=new Option(t('{name} · 离线',{name:hostLabel(id)}),id);option.disabled=true;hosts.add(option);}
     if(bound?.hostId&&!available.some(h=>h.id===bound.hostId)){const option=new Option(t('执行电脑离线'),bound.hostId);option.disabled=true;hosts.add(option);}
-    hosts.value=Array.from(hosts.options).some(o=>o.value===selected)?selected:data.hostId;
+    const enabled=Array.from(hosts.options).filter(o=>!o.disabled);
+    hosts.value=enabled.some(o=>o.value===selected)||Array.from(hosts.options).some(o=>o.value===selected&&(bound?.hostId||fixedHostId))?selected:enabled.some(o=>o.value===data.hostId)?data.hostId:enabled[0]?.value||selected;
     hosts.disabled=Boolean(fixedHostId||bound?.hostId);
-    hosts.title=fixedHostId?t('批注由当前 Artifact 运行服务器执行。'):bound?.hostId?t('电脑和账号已固定；更换请新建对话。'):'';
+    hosts.title=fixedHostId?t('批注由运行此 Artifact 的电脑执行。'):bound?.hostId?t('电脑和账号已固定；更换请新建对话。'):'';
   };
   hosts.onchange=()=>load();fillHosts();load();
   const choose=()=>{const choice={hostId:hosts.value,profileId:loading||!available.some(h=>h.id===hosts.value)?'':profiles.value,model:models.value,reasoningEffort:efforts?.value||null,permissionMode:permission?.value||'auto'};validateModelPermission(selectedProfile()||choice.profileId,choice.model,choice.permissionMode);return choice;};
@@ -372,6 +377,8 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
     if(changed){fillHosts();const selection=session?.selection||last;load(selection);if(permission)permission.value=selection?.permissionMode||'auto';}
   };
   choose.updateHosts=next=>{if(JSON.stringify(next)===JSON.stringify(available))return;available=next;fillHosts();load();};
+  // Hosts this project may run on (null: any); see public/project-hosts.js.
+  choose.allowHosts=(ids,names={})=>{const next=ids?[...ids]:null;Object.assign(hostNames,names);if(JSON.stringify(next)===JSON.stringify(allowed))return;allowed=next;const before=hosts.value;fillHosts();if(hosts.value!==before)load();};
   choose.reloadProfiles=()=>load();
   onLanguageChange(()=>{fillHosts();modeLabels();});return choose;
 }

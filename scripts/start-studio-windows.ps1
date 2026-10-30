@@ -1,7 +1,7 @@
 param(
     [string]$StudioRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$NodePath = 'C:\Program Files\nodejs\node.exe',
-    [string]$StateDirectory = (Join-Path $env:USERPROFILE '.studio-local')
+    [string]$StateDirectory = (Join-Path $env:USERPROFILE '.studiolo')
 )
 $ErrorActionPreference = 'Stop'
 $studioLock = $null

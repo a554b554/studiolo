@@ -17,8 +17,8 @@ function apply(data,touched,ops){
   }
 }
 
-// Each save is an immutable file: Syncthing can merge independent keys from both hosts
-// without two writers replacing the same JSON file. Causal sequence + UUID is deterministic.
+// Each save is an immutable file, so copies made on different replica hosts merge by file
+// instead of two writers replacing the same JSON file. Causal sequence + UUID is deterministic.
 export class ArtifactStorage {
   constructor(){this.tails=new Map();this.cache=new Map();}
   async directory(projectPath,aid){

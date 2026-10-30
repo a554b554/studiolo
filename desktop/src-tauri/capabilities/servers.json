@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "servers",
+  "description": "Studiolo servers opened in the main window may only show notifications (public/notify.js).",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://*", "https://*", "http://*:*", "https://*:*"]
+  },
+  "permissions": ["notification:default"]
+}

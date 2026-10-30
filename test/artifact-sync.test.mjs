@@ -28,74 +28,79 @@ async function fixture(t){
   }
   const a=await make('A'),b=await make('B'),p=await a.api('/api/projects',{name:'Synced Artifact'}),base=`/api/projects/${p.id}`,copy=path.join(b.app.store.projectRoot,p.id);
   async function sync(from=a,to=b){const source=from===a?p.path:copy,dest=to===a?p.path:copy;await copyPublished(source,dest);await to.app.store.discoverProjects();}
-  await sync();return {a,b,p,base,copy,sync,calls,root};
+  // Both hosts hold the files (a synced project); the artifact runs on one artifact host at a time.
+  await a.app.store.mutate(p.id,'project.synced',s=>{s.project.sync.enabled=true;s.project.replicas[b.app.hostId]={state:'ready',version:null,at:new Date().toISOString()};});
+  const host=async target=>{await a.app.store.mutate(p.id,'artifact.host',s=>{s.project.sync.artifactHostId=target.app.hostId;});await sync(a,b);};
+  await sync();return {a,b,p,base,copy,sync,host,calls,root};
 }
 const save=(client,ops,id=randomUUID())=>client.request('/__studio/storage',{method:'POST',headers:{'Content-Type':'application/json','X-Studio-Storage':'1'},body:JSON.stringify({id,ops})});
 const read=async client=>(await(await client.request('/__studio/storage')).json()).data;
 
 test('manifest metadata is visible on both hosts before assets arrive and becomes runnable without re-registration',async t=>{
-  const {a,b,p,base,copy,sync}=await fixture(t);
+  const {a,b,p,base,copy,sync,host}=await fixture(t);await host(b);
   await fs.mkdir(path.join(p.path,'ready'));await fs.writeFile(path.join(p.path,'ready/index.html'),'<h1>Ready</h1>');
   await fs.writeFile(path.join(p.path,'studio.artifacts.json'),JSON.stringify({artifacts:[{key:'ready',name:'Ready',root:'ready'},{key:'later',name:'Later',root:'not-yet-synced/deep'}]}));
   const state=await a.api(base);assert.equal(state.artifacts.length,2);assert.equal(state.artifactDiscoveryError,undefined);
   const later=state.artifacts.find(a=>a.manifestKey==='later'),route=`${base}/artifacts/${later.id}`;
   await sync();assert.deepEqual((await b.api(base)).artifacts,state.artifacts);
   assert.equal((await b.api(route+'/status')).filesReady,false);
-  await assert.rejects(b.api(route+'/start',{}),e=>e.status===409&&/Syncthing/.test(e.message));
+  await assert.rejects(b.api(route+'/start',{}),e=>e.status===409&&/尚未到达/.test(e.message));
   await fs.mkdir(path.join(p.path,'not-yet-synced/deep'),{recursive:true});await fs.writeFile(path.join(p.path,'not-yet-synced/deep/index.html'),'<h1>Arrived</h1>');await sync();
   assert.equal((await b.api(route+'/status')).filesReady,true);
   const live=await b.api(route+'/start',{});assert.equal(live.hostId,b.app.hostId);assert.match(await(await(await previewClient(live)).request()).text(),/Arrived/);
-  assert.equal((await a.api(route+'/status')).running,false);
+  assert.equal(a.app.artifacts.active.size,0,'only the artifact host runs it');
   for(const input of [{root:'../escape'},{root:'C:\\escape'},{root:'.',entry:'../escape'},{root:'.',dataPaths:['.studio/events']}])await assert.rejects(a.api(base+'/artifacts',{name:'bad',...input}));
 });
 
-test('manual Artifact, code edits, browser saves, deletes and snapshots survive file synchronization in both directions',async t=>{
-  const {a,b,p,base,copy,sync}=await fixture(t);
+test('manual Artifact, code edits, browser saves, deletes and snapshots survive handing the artifact host back and forth',async t=>{
+  const {a,b,p,base,copy,sync,host}=await fixture(t);
   await fs.mkdir(path.join(p.path,'web'));await fs.writeFile(path.join(p.path,'web/index.html'),'<h1>Version A</h1>');
   const artifact=await a.api(base+'/artifacts',{name:'Manual',root:'web'}),route=`${base}/artifacts/${artifact.id}`;
   await sync();assert.equal((await b.api(base)).artifacts[0].id,artifact.id);
-  const liveA=await a.api(route+'/start',{}),liveB=await b.api(route+'/start',{});let ca=await previewClient(liveA),cb=await previewClient(liveB);
-  assert.notEqual(liveA.previewPort,liveB.previewPort);
+  let ca=await previewClient(await a.api(route+'/start',{}));
   const requestId=randomUUID();assert.equal((await save(ca,[{type:'set',key:'progress',value:'A'}],requestId)).status,200);
   assert.equal((await save(ca,[{type:'set',key:'progress',value:'A'}],requestId)).status,200);
   assert.equal((await save(ca,[{type:'set',key:'progress',value:'wrong'}],requestId)).status,409);
-  await sync();assert.deepEqual(await read(cb),{progress:'A'});
-  await save(cb,[{type:'set',key:'progress',value:'B'}]);await fs.writeFile(path.join(copy,'web/index.html'),'<h1>Version B</h1>');await sync(b,a);
-  assert.deepEqual(await read(ca),{progress:'B'});assert.match(await(await ca.request()).text(),/Version B/);
-  await save(ca,[{type:'set',key:'fromA',value:'one'}]);await save(cb,[{type:'set',key:'fromB',value:'two'}]);await sync();await sync(b,a);
-  assert.deepEqual(await read(ca),await read(cb));assert.deepEqual(await read(ca),{progress:'B',fromA:'one',fromB:'two'});
-  await save(cb,[{type:'remove',key:'progress'}]);await sync(b,a);await save(ca,[{type:'import',key:'progress',value:'old browser'}]);assert.equal((await read(ca)).progress,undefined);
+  await a.api(route+'/stop',{});await sync();await host(b);
+  const liveB=await b.api(route+'/start',{});let cb=await previewClient(liveB);assert.equal(liveB.hostId,b.app.hostId);assert.deepEqual(await read(cb),{progress:'A'});
+  await save(cb,[{type:'set',key:'progress',value:'B'}]);await save(cb,[{type:'set',key:'fromB',value:'two'}]);await fs.writeFile(path.join(copy,'web/index.html'),'<h1>Version B</h1>');
+  await b.api(route+'/stop',{});await sync(b,a);await host(a);
+  ca=await previewClient(await a.api(route+'/start',{}));
+  assert.deepEqual(await read(ca),{progress:'B',fromB:'two'});assert.match(await(await ca.request()).text(),/Version B/);
+  await save(ca,[{type:'set',key:'fromA',value:'one'}]);await save(ca,[{type:'remove',key:'progress'}]);await save(ca,[{type:'import',key:'progress',value:'old browser'}]);assert.equal((await read(ca)).progress,undefined);
   const snap=await a.api(route+'/snapshot',{});ca=await previewClient(await a.api(route+'/start',{}));await save(ca,[{type:'clear'}]);
-  await a.api(route+'/restore',snap);ca=await previewClient(await a.api(route+'/start',{}));assert.deepEqual(await read(ca),{fromA:'one',fromB:'two'});
-  await sync();assert.deepEqual(await read(cb),{fromA:'one',fromB:'two'});
+  await a.api(route+'/restore',snap);ca=await previewClient(await a.api(route+'/start',{}));assert.deepEqual(await read(ca),{fromB:'two',fromA:'one'});
+  await a.api(route+'/stop',{});await sync();await host(b);
+  const again=await b.api(route+'/start',{});cb=await previewClient(again);assert.deepEqual(await read(cb),{fromB:'two',fromA:'one'});
   assert.equal((await cb.request('/__studio/storage',{method:'POST',body:'{}'})).status,403);
-  assert.equal((await fetch(new URL('/__studio/storage',liveB.url))).status,401);
+  assert.equal((await fetch(new URL('/__studio/storage',again.url))).status,401);
 });
 
-test('Artifact comments and replies execute on the current web server, including replies to the other machine comments',async t=>{
-  const {a,b,p,base,sync,calls,copy}=await fixture(t);
+test('Artifact comments and replies execute on the artifact host whichever server the page uses',async t=>{
+  const {a,b,p,base,sync,calls}=await fixture(t);
+  await a.api('/api/hosts',{url:`http://127.0.0.1:${b.app.port}`});
   await fs.mkdir(path.join(p.path,'web'));await fs.writeFile(path.join(p.path,'web/index.html'),'<h1>Comments</h1>');
   const artifact=await a.api(base+'/artifacts',{name:'Comments',root:'web'}),route=`${base}/artifacts/${artifact.id}`;await sync();
-  await a.api(route+'/start',{});await b.api(route+'/start',{});
+  const live=await b.api(route+'/start',{});assert.equal(live.hostId,a.app.hostId);assert.equal(b.app.artifacts.active.size,0);
   const input={profileId:'fake',model:'test',text:'Comment',anchor:{kind:'page'}};
-  const comment=await a.api(route+'/annotations',{...input,requestId:randomUUID(),hostId:a.app.hostId});
+  const comment=await b.api(route+'/annotations',{...input,requestId:randomUUID(),hostId:a.app.hostId});
   while(!(await a.app.store.read(p.id)).runs.every(r=>r.status==='succeeded'))await new Promise(r=>setTimeout(r,20));
-  await sync();const reply=await b.api(base+'/messages',{...input,text:'Reply on B',artifactId:artifact.id,annotationId:comment.annotation.id,requestId:randomUUID(),hostId:b.app.hostId});
-  while(!(await b.app.store.read(p.id)).runs.every(r=>r.status==='succeeded'))await new Promise(r=>setTimeout(r,20));
-  assert.equal(comment.run.hostId,a.app.hostId);assert.equal(reply.hostId,b.app.hostId);assert.equal(calls[0].cwd,p.path);assert.equal(calls[1].cwd,copy);
-  await assert.rejects(b.api(route+'/annotations',{...input,requestId:randomUUID(),hostId:a.app.hostId}),e=>e.status===409);
-  await assert.rejects(b.api(base+'/messages',{...input,artifactId:artifact.id,annotationId:comment.annotation.id,requestId:randomUUID(),hostId:a.app.hostId}),e=>e.status===409);
-  await a.api(route+'/stop',{});assert.equal((await b.api(route+'/status')).running,true);
+  const reply=await b.api(base+'/messages',{...input,text:'Reply via B',artifactId:artifact.id,annotationId:comment.annotation.id,requestId:randomUUID(),hostId:a.app.hostId});
+  while(!(await a.app.store.read(p.id)).runs.every(r=>r.status==='succeeded'))await new Promise(r=>setTimeout(r,20));
+  assert.equal(comment.run.hostId,a.app.hostId);assert.equal(reply.hostId,a.app.hostId);assert.deepEqual(calls.map(c=>[c.label,c.cwd]),[['A',p.path],['A',p.path]]);
+  await assert.rejects(b.api(route+'/annotations',{...input,requestId:randomUUID(),hostId:b.app.hostId}),e=>e.status===409);
+  await assert.rejects(b.api(base+'/messages',{...input,artifactId:artifact.id,annotationId:comment.annotation.id,requestId:randomUUID(),hostId:b.app.hostId}),e=>e.status===409);
+  await b.api(route+'/stop',{});assert.equal((await a.api(route+'/status')).running,false);
 });
 
 test('SQLite backend data uses the same project-relative path after stopping, syncing and starting on the other host',async t=>{
-  const {a,b,p,base,sync}=await fixture(t);
+  const {a,b,p,base,sync,host}=await fixture(t);
   await fs.cp(new URL('../examples/persistent-game/',import.meta.url),path.join(p.path,'game'),{recursive:true});
   const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
   const artifact=await a.api(base+'/artifacts',{name:'SQLite',root:'game',command:['node','server.mjs'],port,dataPaths:['game/data']}),route=`${base}/artifacts/${artifact.id}`;
-  const ca=await previewClient(await a.api(route+'/start',{}));await ca.request('/api/scores',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({score:42})});await a.api(route+'/stop',{});await sync();
+  const ca=await previewClient(await a.api(route+'/start',{}));await ca.request('/api/scores',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({score:42})});await a.api(route+'/stop',{});await sync();await host(b);
   const cb=await previewClient(await b.api(route+'/start',{}));assert.equal((await(await cb.request('/api/scores')).json())[0].score,42);
-  await cb.request('/api/scores',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({score:73})});await b.api(route+'/stop',{});await sync(b,a);
+  await cb.request('/api/scores',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({score:73})});await b.api(route+'/stop',{});await sync(b,a);await host(a);
   const again=await previewClient(await a.api(route+'/start',{}));assert.deepEqual((await(await again.request('/api/scores')).json()).map(x=>x.score),[73,42]);
 });
 

@@ -96,7 +96,7 @@ function peer(store, id, log, { digests = true } = {}) {
 
 test('idle peers exchange one digest probe instead of two name lists, and still converge after changes on either side', async t => {
   const { root, a, b, p } = await replicas(t), log = [];
-  const hosts = new Hosts({ machine: { hostId: 'a', name: 'A', hosts: [] }, projectRoot: path.join(root, 'servers'), profiles: async () => [] }); await hosts.init();
+  const hosts = new Hosts({ machine: { hostId: 'a', name: 'A', hosts: [] }, profiles: async () => [] });
   const host = { id: 'b', name: 'B', url: 'http://b.invalid' };
   hosts.request = peer(b, p.id, log);
   await a.mutate(p.id, 'one', s => { s.project.name = 'one'; });
@@ -151,12 +151,12 @@ test('the journal route answers digest probes without reading events and reports
   const { app, api } = await studio(t); const p = await api('/api/projects', 'POST', { name: 'digest' });
   await app.store.mutate(p.id, 'rename', s => { s.project.name = 'digest-2'; });
   const names = await app.store.journalNames(p.id), digest = journalDigest(names);
-  assert.equal(names.length, 1);
+  assert.equal(names.length, 2, 'the root snapshot event travels with the journal');
   assert.deepEqual(await api(`/api/projects/${p.id}/journal`, 'POST', { digest }), { same: true, digest, names: [], events: [] });
   const stale = await api(`/api/projects/${p.id}/journal`, 'POST', { digest: 'different' });
   assert.deepEqual(stale, { names, events: [], digest });
   const full = await api(`/api/projects/${p.id}/journal`, 'POST', { known: [], events: [] });
-  assert.deepEqual(full.names, names); assert.equal(full.events.length, 1); assert.equal(full.digest, digest);
+  assert.deepEqual(full.names, names); assert.equal(full.events.length, 2); assert.equal(full.digest, digest);
   const partial = await api(`/api/projects/${p.id}/journal`, 'POST', { known: names });
   assert.deepEqual(partial.events, []); assert.equal(partial.digest, digest);
 });

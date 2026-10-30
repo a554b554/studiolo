@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Studiolo</title>
+<link rel="stylesheet" href="launcher.css">
+</head>
+<body>
+<main>
+  <h1 class="brand">studiolo.</h1>
+  <p class="muted" id="intro">选择要连接的服务器。每台服务器都能看到全部项目；对话在哪台电脑上运行，由对话自己决定。</p>
+  <ul id="servers" aria-live="polite"></ul>
+  <form id="add">
+    <label for="url">添加服务器</label>
+    <div class="row"><input id="url" type="url" required placeholder="http://mac-mini:4410" autocomplete="url"><button type="submit">添加</button></div>
+    <p class="error" id="error" role="alert"></p>
+  </form>
+  <p class="muted small">托盘图标可随时回到这里（“Switch server…”）。快捷键 Ctrl/⌘ + Shift + Space 显示或隐藏窗口。</p>
+</main>
+<script type="module" src="launcher.js"></script>
+</body>
+</html>

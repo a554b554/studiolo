@@ -3,12 +3,12 @@ import path from 'node:path';
 import os from 'node:os';
 import {inside,writeJson} from './paths.mjs';
 
-// Hard deletion of projects. The deleting server writes a tombstone to the synced
-// projects/.deleted folder and removes the project folder; Syncthing carries both to the
-// other machines. Every server then removes what only it holds for that project: resident
-// agent processes, Artifact previews, and the native Claude/Codex transcripts of runs whose
-// working directory was the project folder. The tombstone also stops a folder that Syncthing
-// recreates from a late peer write from coming back as a project.
+// Hard deletion of projects. The deleting server writes a tombstone to projects/.deleted and
+// removes the project folder; the tombstone reaches the other servers in the host index
+// exchange. Every server then removes what only it holds for that project: its folder (files or
+// metadata stub), resident agent processes, Artifact previews, and the native Claude/Codex
+// transcripts of runs whose working directory was the project folder. The tombstone also stops
+// a folder recreated by a late peer write from coming back as a project.
 
 const claudeName=directory=>directory.replace(/[^a-zA-Z0-9]/g,'-');
 const samePath=(a,b)=>process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;
@@ -71,7 +71,7 @@ export class ProjectPurger {
     await this.runner.release?.(`${pid}:`);
     await this.artifacts.forget?.(pid);
     const projectPath=this.store.projectPath(pid),result={folder:false,claude:0,codex:0};
-    // Also when Syncthing already removed the folder: drops the registry entry and tells open pages.
+    // Also when the folder is already gone: drops the registry entry and tells open pages.
     result.folder=await exists(projectPath);await this.store.removeFolder(pid);
     const dirs=await this.nativeDirectories();
     for(const dir of dirs.claude)result.claude+=await purgeClaude(dir,projectPath);

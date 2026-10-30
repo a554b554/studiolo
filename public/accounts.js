@@ -151,7 +151,7 @@ export function initAccounts({hosts,localHostId,onChange=()=>{}}){
         await startLogin(account,apiKey);
       });
     };
-    const note=el('p','small muted',t('账号属于所选电脑：登录信息保存在那台电脑的 ~/.studio-local/accounts/ 下，与本机 ~/.claude、~/.codex 分开；skills、插件和设置会从默认目录继承。'));
+    const note=el('p','small muted',t('账号属于所选电脑：登录信息保存在那台电脑的 ~/.studiolo/accounts/ 下，与本机 ~/.claude、~/.codex 分开；skills、插件和设置会从默认目录继承。'));
     addSection.append(form,note);
   }
   function render(){

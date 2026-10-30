@@ -61,7 +61,7 @@ export function knowledgeText({helperPath,accounts,usage,rules}){
 // Platform-wide settings file beside the synchronized projects: {version, subagents:{enabled, rules, updatedAt, updatedBy}}.
 // `rules` is absent while the default text is in use, so a later default change reaches every machine.
 export class SubagentPolicy{
-  constructor({file}){this.file=file;this.cache=null;this.lastError=null;}
+  constructor({file,hostId=null}){this.file=file;this.hostId=hostId;this.cache=null;this.lastError=null;}
   async read(){
     let info=null;
     try{info=await fs.stat(this.file);}catch(e){if(e.code!=='ENOENT')throw e;}
@@ -88,9 +88,12 @@ export class SubagentPolicy{
     const data=await this.read(),current=await this.get();
     const next={...(data.subagents&&typeof data.subagents==='object'?data.subagents:{}),enabled:enabled??current.enabled,updatedAt:new Date().toISOString(),updatedBy};
     if(rules!==undefined){if(rules.trim()===DEFAULT_RULES||!rules.trim())delete next.rules;else next.rules=rules;}
-    await writeJson(this.file,{...data,version:1,subagents:next});
+    // The whole document is one last-writer-wins value in the peer index exchange.
+    await writeJson(this.file,{...data,version:1,subagents:next,updatedAt:next.updatedAt,updatedHostId:this.hostId});
     this.cache=null;return this.get();
   }
+  // A newer document from a peer replaces this server's copy as a whole.
+  async replace(value){await writeJson(this.file,value);this.cache=null;}
 }
 
 // Builds the prompt section for one run. Quota comes from the usage cache only (never waits for a

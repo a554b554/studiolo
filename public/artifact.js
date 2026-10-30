@@ -3,6 +3,7 @@ import { api, post, projectURL, requestId } from './api.js';
 import { initTheme } from './themes.js';
 import { renderMessages, reconcileChildren, mergeRuntime } from './ui.js';
 import { $, node, button, empty, time, attempt, showError, clearError, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
+import { artifactHostOf } from './project-hosts.js';
 initLanguage(); initTheme(); initDialogs();
 $('#connection').textContent=t('连接中'); $('#runtime-status').textContent=t('读取状态…'); $('#comments-heading').textContent=t('批注');
 const params = new URLSearchParams(location.search), projectId = params.get('project'), artifactId = params.get('artifact');
@@ -150,8 +151,10 @@ $('#selection-label').textContent=t('先选取页面内容或直接填写批注'
 $('#comment-text').placeholder=t('输入批注…');
 attempt(async () => {
   if (!projectId || !artifactId) throw new Error(t('链接缺少项目或 Artifact ID。请从项目文件栏打开。'));
-  const data = await bootstrap(); choices = initChoices(data,'',{hostId:data.hostId});
-  await reload(); await loadStatus();
+  const data = await bootstrap(); await reload();
+  // Comments run where the artifact runs: the project's artifact host, whichever server serves this page.
+  choices = initChoices(data,'',{hostId:artifactHostOf(state.project)||data.hostId});
+  await loadStatus();
 
   if (innerWidth <= 850) showComments(false);
   // Store events never change the preview process, so its status is re-read only after a

@@ -5,15 +5,13 @@
 // also be used by hand. Credentials stay in the account directories; nothing is printed but the
 // subagent's answer (stdout) and a one-line summary (stderr).
 import path from 'node:path';
-import os from 'node:os';
-import {fileURLToPath} from 'node:url';
 import {Accounts} from '../src/accounts.mjs';
 import {CliRunner} from '../src/runner.mjs';
 import {AccountUsage} from '../src/account-usage.mjs';
 import {SubagentPolicy,accountLine} from '../src/subagents.mjs';
 import {supportsAuto} from '../public/model-permissions.js';
+import {defaultStateDir,defaultProjectRoot} from '../src/defaults.mjs';
 
-const here=path.dirname(fileURLToPath(import.meta.url));
 const USAGE=`Usage:
   node subagent.mjs --list [--no-quota] [--json]
   node subagent.mjs --account <label|id> --model <model id> [options] "<task>"   (or the task on stdin, or "-")
@@ -25,7 +23,7 @@ Options:
   --timeout <sec>    abort after this many seconds (default 1800)
   --json             print {account, model, permissions, status, text, error, usage} instead of the plain answer
   --verbose          stream the subagent's tool activity to stderr
-  --state-dir <dir>  Studiolo state directory (default: STUDIO_STATE_DIR or ~/.studio-local)
+  --state-dir <dir>  Studiolo state directory (default: STUDIO_STATE_DIR or ~/.studiolo)
 Exit codes: 0 finished · 1 failed · 2 bad arguments · 3 stopped at a permission it could not ask about`;
 const FLAGS=new Set(['list','no-quota','json','verbose','help']);
 const VALUES=new Set(['account','model','effort','permissions','cwd','timeout','state-dir','settings']);
@@ -64,10 +62,10 @@ async function list(runner,policy,opts){
 async function main(){
   const opts=parse(process.argv.slice(2));
   if(opts.help){process.stdout.write(USAGE+'\n');return 0;}
-  const stateDir=opts['state-dir']||process.env.STUDIO_STATE_DIR||path.join(os.homedir(),'.studio-local');
+  const stateDir=opts['state-dir']||defaultStateDir();
   const accounts=new Accounts({stateDir});
   const runner=new CliRunner({stateDir,hostId:'subagent',accounts});
-  const policy=new SubagentPolicy({file:opts.settings||process.env.STUDIO_SETTINGS_FILE||path.resolve(here,'../projects/.studio-settings.json')});
+  const policy=new SubagentPolicy({file:opts.settings||process.env.STUDIO_SETTINGS_FILE||path.join(defaultProjectRoot(),'.studio-settings.json')});
   if(opts.list)return list(runner,policy,opts);
   if(!opts.account)fail('--account is required (label or id); --list shows the accounts');
   const configs=Object.values(await runner.configuration());

@@ -1,7 +1,7 @@
 import {initAccountUsage} from './account-usage.js';
-import { t, getLanguage, onLanguageChange, initLanguage } from './i18n.js';
+import { t, getLanguage, onLanguageChange, initLanguage, setLanguage } from './i18n.js';
 import { api, post, upload, projectURL, requestId } from './api.js';
-import { initTheme } from './themes.js';
+import { initTheme, setTheme } from './themes.js';
 import { view, draftKey, rememberSelection, previousSelection } from './state.js';
 import { syncMessages, mergeRuntime } from './ui.js';
 import { category, visibleItems, moreButton } from './lifecycle.js';
@@ -10,6 +10,11 @@ import { $, node, button, empty, time, showError, clearError, attempt, showDialo
 import { platformCommands, codexCommands, parseSlash, mergeCommands, createSlashMenu } from './commands.js';
 import { initAccounts } from './accounts.js';
 import { setAccountDirectory, accountName, familyName, recorded, steerCount } from './conversation.js';
+import { isSynced, runHosts, readyHosts } from './project-hosts.js';
+import { openSync } from './sync-dialog.js';
+import { notifyResults } from './notify.js';
+import { initFailover } from './failover.js';
+import { draftEdited, flushDraft, draftSent, adoptDraft, refreshDraft } from './drafts.js';
 let usage = { setHost() {}, reload() {} }, accountsUI = null, lastComposerHost = null;
 
 initLanguage(); initTheme(); initDialogs();
@@ -19,6 +24,17 @@ let projectSelectionPending=false;
 const pendingRequests = new Map();
 const formBody = form => Object.fromEntries(new FormData(form));
 const path = () => projectURL(view.projectId);
+// Last selection, theme and language follow the user to other devices; localStorage
+// keeps this browser's copy for when no server answers.
+const savePreferences = patch => api('/api/settings/ui',{method:'PUT',body:patch}).catch(() => {});
+function remember() { rememberSelection(); savePreferences({selection:{projectId:view.projectId,sessionId:view.sessionId}}); }
+// Shows the open conversation's draft: the newer of this tab's and the server's copy.
+function openDraft() {
+  const key = draftKey(), prompt = $('#prompt');
+  adoptDraft(key, view.project?.sessions?.find(s => s.id === view.sessionId)?.draft);
+  prompt.value = view.drafts.get(key) || '';
+  refreshDraft(key, text => { if (draftKey() === key) prompt.value = text; });
+}
 function closeDrawer() { delete $('#workspace').dataset.drawer; }
 document.querySelectorAll('[data-drawer]').forEach(el => el.addEventListener('click', () => { $('#workspace').dataset.drawer = el.dataset.drawer; }));
 document.querySelectorAll('[data-close-drawer]').forEach(el => el.addEventListener('click', closeDrawer));
@@ -244,17 +260,25 @@ function markSeen() {
   post(`${projectURL(projectId)}/sessions/${encodeURIComponent(sessionId)}/seen`,{at:mark.at}).catch(() => {}).finally(() => seenRequests.delete(key));
 }
 document.addEventListener('visibilitychange', markSeen);
+// Names of every registered server, online or not, so labels survive a host going offline.
+async function loadHostNames() { for (const host of await api('/api/hosts')) view.hostNames.set(host.id, host.name || host.id); navigationSignature = ''; renderNavigation(); }
+const hostName = id => view.bootstrap?.hosts?.find(h => h.id === id)?.name || view.hostNames.get(id) || id;
+// The top bar names every server this page reaches, the serving one first.
+function renderConnectedHosts() { $('#machine-label').textContent = t('已连接：{names}',{names:(view.bootstrap?.hosts || []).map(h => h.name || h.id).join(' · ')}); }
+// Where a project's files are: on its owner, or synced to several hosts.
+const projectPlace = project => isSynced(project) ? t('同步 · {n} 台',{n:readyHosts(project).length}) : project.ownerHostId ? hostName(project.ownerHostId) : '';
 function renderNavigation() {
   const projects = visibleItems(view.bootstrap.projects);
+  notifyResults(projects, unreadOf, mark => statuses[mark.status] || mark.status);
   // Rebuilding on every refresh would swallow clicks and orphan an open menu.
-  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name,unreadOf(p),runningOf(p)]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
+  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,[...creatingSessions],projects.map(p=>[p.id,p.name,unreadOf(p),runningOf(p),projectPlace(p)]),view.project&&visibleItems(view.project.sessions).map(s=>[s.id,s.title])]);
   if (signature === navigationSignature) return;
   navigationSignature = signature;
   const list = $('#project-list'); list.replaceChildren();
   for (const project of projects) {
     const selected = project.id === view.projectId, unread = unreadOf(project), running = runningOf(project);
     const el = button('', () => attempt(() => selectProject(project.id)), `project-button${selected ? ' active' : ''}`);
-    el.append(node('span','muted','▧'),node('span','',project.name));
+    el.append(node('span','muted','▧'),node('span','',project.name),node('small','project-place muted',projectPlace(project)));
     if (running.length) el.append(runningMark());
     const projectDot = unreadDot(Object.values(unread)); if (projectDot) el.append(projectDot);
     const add = button('＋', () => attempt(() => createProjectSession(project.id)), 'project-session-new');
@@ -281,9 +305,15 @@ function renderNavigation() {
   }
   if (!projects.length) list.append(empty(t('还没有项目。')));
 }
+// A fork is a new conversation that starts from an agent summary of this one; the user
+// picks its computer and account on the first send, limited to computers with the project's files.
+async function forkSession(project,session) {
+  const fork=await post(`${projectURL(project.id)}/sessions/${session.id}/fork`);
+  await selectProject(project.id,fork.id);
+}
 function lifecycleActions(project,session) {
   return [
-    ...(session ? [{label:t('重命名'),run:()=>openRename(project,session)}] : []),
+    ...(session ? [{label:t('重命名'),run:()=>openRename(project,session)},{label:t('分叉到新对话'),run:()=>attempt(()=>forkSession(project,session))}] : [{label:t('同步与副本…'),run:()=>openSync(project,{hosts:()=>view.bootstrap?.hosts||[],hostName})}]),
     {label:t(session?'归档对话':'归档项目'),run:()=>attempt(()=>updateLifecycle(project,session,'archive'))},
     {label:t(session?'删除对话':'删除项目'),danger:true,run:()=>attempt(()=>updateLifecycle(project,session,'delete'))},
   ];
@@ -340,7 +370,7 @@ async function reconcileSelection() {
   const projects=visibleItems(view.bootstrap.projects),selected=projects.find(p=>p.id===view.projectId);
   if(selected) await reloadProject();
   else if(projects.length)await selectProject(projects[0].id);
-  else {view.projectId=null;view.sessionId=null;view.project=null;$('#prompt').value='';messageSignature='';renderNavigation();renderConversation();renderPath();renderArtifacts();$('#files').replaceChildren();rememberSelection();}
+  else {view.projectId=null;view.sessionId=null;view.project=null;$('#prompt').value='';messageSignature='';renderNavigation();renderConversation();renderPath();renderArtifacts();$('#files').replaceChildren();remember();}
 }
 function renderConversation() {
   const session = view.project?.sessions.find(item => item.id === view.sessionId);
@@ -348,10 +378,11 @@ function renderConversation() {
   $('#project-title').textContent = view.project?.project.name || '';
   const writable=session && category(session)==='active' && category(view.project.project)==='active';
   const machineOnline=!session?.hostId||view.bootstrap.hosts.some(h=>h.id===session.hostId);
-  $('#prompt').disabled = !writable; $('#send').disabled = !writable || !machineOnline; $('#attach').disabled = !writable;
+  // A conversation bound to a host that no longer has the project's files stays readable only.
+  const allowedHosts=runHosts(view.project?.project),stranded=Boolean(session?.hostId&&allowedHosts&&!allowedHosts.includes(session.hostId));
+  $('#prompt').disabled = !writable || stranded; $('#send').disabled = !writable || !machineOnline || stranded; $('#attach').disabled = !writable || stranded;
   renderAttachments();
-  $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):t('输入消息…');
-  $('#takeover').hidden = true;
+  $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):stranded?t('此项目的文件只在 {hosts}，这个对话不能继续；请分叉到那里继续。',{hosts:allowedHosts.map(hostName).join('、')}):t('输入消息…');
   const messages = view.project?.messages.filter(message => message.sessionId === view.sessionId) || [];
   const runs = view.project?.runs.filter(run => run.sessionId === view.sessionId) || [];
   // While this conversation executes, sending steers that turn; the user can queue instead or stop.
@@ -363,7 +394,7 @@ function renderConversation() {
   $('#send-label').textContent = t(steering ? '插话 ↑' : '发送 ↑');
   $('#prompt').placeholder = steering ? t('输入插话内容，Ctrl / ⌘ + Enter 发送给正在执行的 agent…') : $('#prompt').placeholder;
   for (const [id, at] of stopRequests) if (!runs.some(r => r.id === id && ['running','waiting'].includes(r.status)) && Date.now() - at > 60000) stopRequests.delete(id);
-  choices.bindSession?.(session,runs); renderModelNote();
+  choices.allowHosts?.(allowedHosts,Object.fromEntries(view.hostNames)); choices.bindSession?.(session,runs); renderModelNote();
   // The quota panel follows the composer's machine only when that changes (switching
   // conversations); a machine picked in the panel itself stays until then.
   const composerHost = $('#host').value || view.bootstrap?.hostId;
@@ -375,6 +406,11 @@ function renderConversation() {
   // Which machine and account this conversation talks to, then the native session state.
   const boundRun=runs.at(-1),boundAccount=session?.profileId||boundRun?.profileId;
   const who=session&&boundAccount?[view.bootstrap.hosts.find(h=>h.id===(session.hostId||boundRun?.hostId))?.name,`${familyName(boundRun?.account?.family||view.bootstrap.hosts.flatMap(h=>h.profiles||[]).find(p=>p.id===boundAccount)?.family)} ${accountName(boundAccount,boundRun)}`.trim()].filter(Boolean).join(' · '):'';
+  let forkLinks=$('#fork-links');
+  if(!forkLinks){forkLinks=node('span','fork-links');forkLinks.id='fork-links';nativeStatus.after(forkLinks);}
+  const link=(label,id)=>button(label,()=>selectSession(id),'quiet fork-link');
+  const source=session?.forkOf&&view.project.sessions.find(s=>s.id===session.forkOf.sessionId);
+  forkLinks.replaceChildren(...(source?[link(t('分叉自：{title}',{title:source.title}),source.id)]:[]),...(session?.forks||[]).map(id=>view.project.sessions.find(s=>s.id===id)).filter(s=>s&&category(s)==='active').map(s=>link(t('分叉：{title}',{title:s.title}),s.id)),...(stranded&&writable?[button(t('分叉以继续'),()=>attempt(()=>forkSession(view.project.project,session)),'quiet fork-link')]:[]));
   nativeStatus.textContent=session?[who,!machineOnline?t('执行电脑离线'):native?.connected?t('原生会话 · {status}',{status:native.busy?t('执行中'):t('已连接')}):t('原生会话 · 待连接')].filter(Boolean).join(' · '):'';
   const pending = view.project ? outboxFor(view.sessionId) : [];
   const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,messages,runs,pending.map(p => [p.requestId,p.failed,Boolean(p.sentAt)])]);
@@ -396,12 +432,12 @@ function renderConversation() {
   markSeen();
 }
 function selectSession(id) {
-  view.drafts.set(draftKey(),$('#prompt').value); view.sessionId = id; $('#prompt').value = view.drafts.get(draftKey()) || ''; messageSignature = ''; renderNavigation(); renderConversation(); rememberSelection(); closeDrawer(); $('#messages').scrollTop = $('#messages').scrollHeight;
+  view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey()); view.sessionId = id; openDraft(); messageSignature = ''; renderNavigation(); renderConversation(); remember(); closeDrawer(); $('#messages').scrollTop = $('#messages').scrollHeight;
 }
 async function selectProject(id, sessionId) {
   const version=++loadVersion;projectSelectionPending=true;
   try {
-  view.drafts.set(draftKey(),$('#prompt').value);
+  view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey());
   let state;
   try { state = await api(projectURL(id)); }
   catch (error) {
@@ -409,20 +445,20 @@ async function selectProject(id, sessionId) {
     const registered = view.bootstrap.projects.find(project => project.id === id);
     if (error.status !== 409 || !registered) throw error;
     view.projectId = id; view.sessionId = null; view.project = {project:registered,sessions:[],messages:[],runs:[],artifacts:[],annotations:[],queues:{}};
-    $('#prompt').value = ''; renderNavigation(); renderConversation(); renderPath(); renderArtifacts(); $('#files').replaceChildren(empty(t('接管或连接项目所在电脑后可读取文件。'))); $('#takeover').hidden = false; showError(error); return;
+    $('#prompt').value = ''; renderNavigation(); renderConversation(); renderPath(); renderArtifacts(); $('#files').replaceChildren(empty(t('项目所在电脑上线后可读取文件。'))); showError(error); return;
   }
   if (version !== loadVersion) return;
   view.projectId = id; view.project = state;
   view.sessionId = visibleItems(state.sessions).some(session => session.id === sessionId) ? sessionId : visibleItems(state.sessions).at(-1)?.id || null;
-  $('#prompt').value = view.drafts.get(draftKey()) || ''; messageSignature = '';
-  renderNavigation(); renderConversation(); renderArtifacts(); renderPath(); rememberSelection(); closeDrawer(); await loadFiles(); $('#messages').scrollTop = $('#messages').scrollHeight;
+  openDraft(); messageSignature = '';
+  renderNavigation(); renderConversation(); renderArtifacts(); renderPath(); remember(); closeDrawer(); await loadFiles(); $('#messages').scrollTop = $('#messages').scrollHeight;
   } finally { if(version===loadVersion)projectSelectionPending=false; }
 }
 async function reloadProject() {
   if (!view.projectId) return;
   const id = view.projectId, state = await api(projectURL(id)); if (view.projectId !== id || projectSelectionPending) return;
   view.project = state;
-  if(!visibleItems(state.sessions).some(s=>s.id===view.sessionId)){view.sessionId=visibleItems(state.sessions).at(-1)?.id||null;$('#prompt').value=view.drafts.get(draftKey())||'';rememberSelection();}
+  if(!visibleItems(state.sessions).some(s=>s.id===view.sessionId)){view.sessionId=visibleItems(state.sessions).at(-1)?.id||null;openDraft();remember();}
   renderNavigation(); renderConversation(); renderArtifacts(); renderPath();
 }
 // Uncommitted streamed output only changes the executing runs, so a run.live tick refreshes
@@ -493,10 +529,28 @@ function renderArtifacts() {
   if (view.project?.artifactDiscoveryError) list.append(node('p','run-error',view.project.artifactDiscoveryError));
   if (!list.childNodes.length) list.append(empty(t('暂无 Artifact。让 agent 生成网页，或登记已有入口。')));
 }
-function renderHosts() {
+// Every registered server (machine.json of the serving server), online or not. Registering one
+// registers this server on it too; removing tells it the same.
+async function renderHosts() {
   const list = $('#host-list'); list.replaceChildren();
-  for (const host of view.bootstrap?.hosts || []) { const row = node('div','host-item'); row.append(node('span','',host.name || host.id),node('small','muted',host.local ? t('本机') : host.url || '')); list.append(row); }
+  const local = view.bootstrap?.hosts?.find(h => h.local);
+  if (local) { const row = node('div','host-item'); row.append(node('span','',local.name || local.id),node('small','muted',t('本机'))); list.append(row); }
+  let peers;
+  try { peers = await api('/api/hosts'); } catch (error) { list.append(node('p','run-error',error.message)); return; }
+  for (const host of peers) {
+    const row = node('div','host-item'), name = node('span','',host.name || host.id);
+    name.append(node('small','muted host-url',host.url || ''));
+    const remove = async () => { if (!confirm(t('移除 {name}？对方也会移除本机；已有对话的历史保留。',{name:host.name || host.id}))) return; await api(`/api/hosts/${encodeURIComponent(host.id)}`,{method:'DELETE'}); await refreshHosts(); };
+    row.append(name,node('small','badge',t(host.online ? '在线' : '离线')),button(t('编辑'),() => editHost(host),'quiet'),button(t('移除'),() => attempt(remove),'quiet danger'));
+    list.append(row);
+  }
 }
+async function refreshHosts() { view.bootstrap = await api('/api/bootstrap'); setAccountDirectory(view.bootstrap.hosts); choices.updateHosts(view.bootstrap.hosts); renderConnectedHosts(); await renderHosts(); await loadHostNames(); }
+function editHost(host) {
+  const form = $('#host-form'); form.dataset.hostId = host.id; form.elements.name.value = host.name || ''; form.elements.url.value = host.url || ''; form.elements.token.value = '';
+  form.elements.token.placeholder = t('留空则保持不变'); form.querySelector('[type=submit] span').textContent = t('保存电脑'); form.elements.name.focus();
+}
+function resetHostForm(form) { delete form.dataset.hostId; form.reset(); form.elements.token.placeholder = ''; form.querySelector('[type=submit] span').textContent = t('连接电脑'); }
 // Subagent routing rules: a shared prompt the agents read; each machine appends its own accounts
 // and quota when a conversation starts, so the preview shows what this server would send.
 let subagentSettings = null;
@@ -546,9 +600,16 @@ async function submitForm(form, fn) {
 }
 $('#project-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { const project = await post('/api/projects',body); view.bootstrap.projects = await api('/api/projects'); $('#project-dialog').close(); event.target.reset(); if(category(project)!=='active')throw new Error(project.deletedAt?t('项目已删除，不能从平台恢复。'):t('项目已归档，请在设置中恢复。')); await selectProject(project.id); }); });
 $('#artifact-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { const command = body.command.trim() ? JSON.parse(body.command) : undefined; if (command && (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== 'string'))) throw new Error(t('启动命令必须是非空字符串数组，例如 ["node", "server.mjs"]')); await post(`${path()}/artifacts`,{...body,command,port:body.port ? Number(body.port) : undefined,dataPaths:body.dataPaths.split('\n').map(value => value.trim()).filter(Boolean)}); await reloadProject(); $('#artifact-dialog').close(); event.target.reset(); }); });
-$('#host-form').addEventListener('submit', event => { event.preventDefault(); submitForm(event.currentTarget, async body => { await post('/api/hosts',body); view.bootstrap = await api('/api/bootstrap'); choices = watchChoices(initChoices(view.bootstrap)); renderHosts(); event.target.reset(); }); });
-$('#takeover').addEventListener('click', () => attempt(async () => { if (!confirm(t('确认原电脑已停止执行和 Artifact 写入，并且项目数据已同步。现在由本机接管此项目？'))) return; await post(`${path()}/takeover`,{confirm:true}); await reloadProject(); }));
-$('#prompt').addEventListener('input', () => view.drafts.set(draftKey(),$('#prompt').value));
+$('#host-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget; submitForm(form, async body => {
+  const id = form.dataset.hostId;
+  if (id) { const change = {name: body.name, url: body.url}; if (body.token) change.token = body.token; await api(`/api/hosts/${encodeURIComponent(id)}`,{method:'PATCH',body:change}); }
+  else { const added = await post('/api/hosts',body); if (added.mutual === false) showError(new Error(t('已连接 {name}，但它没能反向登记本机：{error}。请在那台电脑的设置里也添加本机。',{name:added.name,error:added.mutualError || ''}))); }
+  resetHostForm(form); await refreshHosts();
+}); });
+$('#prompt').addEventListener('input', () => { view.drafts.set(draftKey(),$('#prompt').value); draftEdited(draftKey()); });
+$('#prompt').addEventListener('blur', () => flushDraft(draftKey()));
+// Back in this window: another device may have changed the open conversation's draft.
+document.addEventListener('visibilitychange', () => { if (!document.hidden && document.activeElement !== $('#prompt')) { const key = draftKey(); refreshDraft(key, text => { if (draftKey() === key) $('#prompt').value = text; }); } });
 $('#prompt').addEventListener('keydown', event => {
   if (slashMenu.handleKey(event)) { event.preventDefault(); return; }
   if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('#composer').requestSubmit(); return; }
@@ -589,7 +650,7 @@ $('#messages').addEventListener('studio:outbox', event => {
   view.outbox.delete(request.requestId);
   const prompt = $('#prompt'), draft = draftKey() === request.draftKey ? prompt.value : view.drafts.get(request.draftKey) || '';
   const value = draft.trim() ? `${request.text}\n\n${draft}` : request.text;
-  view.drafts.set(request.draftKey,value);
+  view.drafts.set(request.draftKey,value); draftEdited(request.draftKey);
   if (request.attachmentItems.length) view.attachments.set(request.draftKey,[...request.attachmentItems,...(view.attachments.get(request.draftKey) || [])]);
   if (draftKey() === request.draftKey) { prompt.value = value; prompt.focus(); }
   renderAttachments(); renderConversation();
@@ -597,7 +658,7 @@ $('#messages').addEventListener('studio:outbox', event => {
 $('#composer').addEventListener('submit', event => { event.preventDefault(); const mode = sendMode; sendMode = 'auto'; attempt(async () => {
   const text = $('#prompt').value.trim(), chosen = choices(); if (!text || !view.sessionId) return;
   const command = parseSlash(text);
-  if (command && await runLocalCommand(command)) { $('#prompt').value = ''; view.drafts.delete(draftKey()); return; }
+  if (command && await runLocalCommand(command)) { $('#prompt').value = ''; draftSent(draftKey()); return; }
   if (!chosen.profileId) throw new Error(t('所选电脑没有可用的 CLI 入口。'));
   const pendingUploads = attachmentList().filter(item => item.status === 'uploading');
   if (pendingUploads.length) throw new Error(t('附件仍在上传，请稍候再发送。'));
@@ -612,27 +673,33 @@ $('#composer').addEventListener('submit', event => { event.preventDefault(); con
     agent:{profileId:chosen.profileId,model:chosen.model,reasoningEffort:chosen.reasoningEffort},placeholder:!steer && !active,steers:steer ? steerCount(view.project.messages,{sessionId,text}) : 0,
     body:{requestId:id,sessionId,text,...(attachments.length ? {attachments} : {}),...(steer ? {steer:true} : {}),...chosen}};
   view.outbox.set(id,request);
-  $('#prompt').value = ''; view.drafts.delete(originalKey); view.attachments.delete(originalKey); renderAttachments();
+  $('#prompt').value = ''; draftSent(originalKey); view.attachments.delete(originalKey); renderAttachments();
   renderConversation();
   const messages = $('#messages'); messages.scrollTo({top:messages.scrollHeight,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
   await deliver(request);
 }); });
 
 async function start() {
-  view.bootstrap = await bootstrap(); setAccountDirectory(view.bootstrap.hosts); choices = watchChoices(initChoices(view.bootstrap));
+  view.bootstrap = await bootstrap(); setAccountDirectory(view.bootstrap.hosts); choices = watchChoices(initChoices(view.bootstrap)); attempt(loadHostNames);
   const refreshAccounts = async () => { view.bootstrap = await api('/api/bootstrap'); setAccountDirectory(view.bootstrap.hosts); choices.updateHosts(view.bootstrap.hosts); choices.reloadProfiles?.(); usage.reload(); renderHosts(); messageSignature = ''; renderConversation(); };
   accountsUI = initAccounts({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, onChange: () => attempt(refreshAccounts) });
   usage = initAccountUsage({ hosts: () => view.bootstrap.hosts, localHostId: view.bootstrap.hostId, openAccounts: (hostId, accountId) => accountsUI.open(hostId, accountId) });
   $('#accounts-open').addEventListener('click', () => { $('#settings-dialog').close(); accountsUI.open($('#host').value || view.bootstrap.hostId); });
   $('#host').addEventListener('change', () => usage.setHost($('#host').value));
-  $('#machine-label').textContent = t('本机 · {id}',{id:view.bootstrap.hosts.find(h=>h.local)?.name||view.bootstrap.hostId});
-  const previous = previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
+  renderConnectedHosts(); initFailover({ hosts: () => view.bootstrap?.hosts || [], selfId: () => view.bootstrap?.hostId });
+  const ui = view.bootstrap.ui || {};
+  if (ui.theme) setTheme(ui.theme); if (ui.language && ui.language !== getLanguage()) setLanguage(ui.language);
+  document.querySelectorAll('[data-theme-picker]').forEach(el => el.addEventListener('change', () => savePreferences({theme:el.value})));
+  document.querySelectorAll('[data-language-picker]').forEach(el => el.addEventListener('change', () => savePreferences({language:getLanguage()})));
+  const previous = ui.selection || previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
   if (project) await selectProject(project.id,previous.sessionId); else { renderNavigation(); renderConversation(); }
   // Run output and conversation events only touch their own project; the project list
   // changes only on reconnect, project-level events or a run starting or ending in another
   // project (its spinner), so most refreshes skip it.
   let listStale = false, fullStale = false;
   listenChanges(change => {
+    // Drafts are saved on every pause in typing; open conversations fetch them on their own.
+    if (change.type === 'session.draft') return;
     const listChanged = !change.projectId || change.reconnect || String(change.type || '').startsWith('project.') || change.projectId !== view.projectId && /^run\.(started|finished|failed|cancelled)$/.test(change.type);
     if (!listChanged && change.projectId !== view.projectId) return;
     listStale ||= listChanged;
@@ -662,7 +729,7 @@ onLanguageChange(() => {
   renderNavigation(); renderConversation(); renderPath(); renderArtifacts(); renderHosts();
   $('#messages').scrollTop = scroll;
   document.querySelectorAll('.run-activity').forEach(el=>{el.open=openLogs.includes(el.dataset.runId);});
-  $('#machine-label').textContent = t('本机 · {id}',{id:view.bootstrap.hosts.find(h=>h.local)?.name||view.bootstrap.hostId});
+  renderConnectedHosts();
   if ($('#settings-dialog').open) attempt(renderArchives);
 });
 attempt(start);
