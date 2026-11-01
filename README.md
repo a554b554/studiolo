@@ -51,8 +51,10 @@ Studiolo is a self-hosted web workbench that drives the **Claude Code** and **Co
 - **One project history across machines, no file sync tool needed.** Every server keeps every project's conversation history, an append-only journal the servers exchange over HTTP every few seconds, so any machine shows every conversation. A project's files live on the machine that owns it; turn on *Sync* for a project and Studiolo copies its files to the machines you pick (versioned commit and pull, rsync over SSH). A conversation runs on the machine it is bound to; to continue elsewhere, fork it and the new conversation starts from an agent-written summary.
 - **The terminal experience, in the browser.** Stop a turn with Esc, steer a running agent with a follow-up message, type `/` for the CLI's own slash commands — all mapped to the native protocols, not re-implemented.
 - **Subagents across accounts.** An agent can hand a task to any other account signed in on its machine — Claude from Codex, Codex from Claude — as a one-shot subagent, routed by rules you edit in Settings and by live quota.
+- **A workbench, not just a chat.** Collapsible, resizable side panels; files and Artifacts open as tabs beside the conversation; files are edited in place with autosave and conflict detection; conversations group into categories, and forks nest under the conversation they came from.
 - **Desktop client.** A small Tauri app for Windows and macOS lists your servers, opens their UI in a window, sits in the tray and shows a notification when a conversation finishes.
-- **Artifacts and in-page comments.** Web apps the agents build run as Artifacts with persistent backends and preview storage kept in the project; select something in the preview and send it to an agent as a task.
+- **Artifacts and in-page comments.** Web apps the agents build run as Artifacts with persistent backends and preview storage kept in the project; select something in the preview and send it to an agent as a task. An Artifact can also run *persistent*: as its own server that keeps running when Studiolo stops.
+- **Voice input.** Hold the microphone button to dictate into the composer. One machine keeps an OpenAI API key, and every server forwards its recordings there.
 
 ---
 
@@ -63,7 +65,7 @@ Studiolo is a self-hosted web workbench that drives the **Claude Code** and **Co
 3. **Add accounts** — Settings → *Hosts & accounts* → *Add account*. Pick the machine, the type (Claude Code / Codex) and the sign-in method, then follow the steps shown (see below).
 4. **Create a project, start a conversation** — the composer picks **machine → account → model → effort → permission mode**. The first message fixes machine and account for that conversation; model, effort and permissions can change per message. Another model continues the same native session, and its first turn reads the context again without the prompt cache.
 
-Environment variables: `STUDIO_STATE_DIR` (machine-private state, default `~/.studiolo`), `STUDIO_PROJECT_ROOT` (default `projects/` in the checkout), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (bytes, default 100 MB). One server per state directory.
+Environment variables: `STUDIO_STATE_DIR` (machine-private state, default `~/.studiolo`), `STUDIO_PROJECT_ROOT` (default `studiolo-projects` next to the checkout: a checkout in `~/Studiolo` keeps its projects in `~/studiolo-projects`), `STUDIO_BIND`, `STUDIO_PORT` (4310), `STUDIO_PREVIEW_PORT` (4311), `STUDIO_TOKEN`, `STUDIO_UPLOAD_LIMIT` (bytes, default 100 MB), `STUDIO_TRANSCRIBE_MODEL` (default `gpt-transcribe`). One server per state directory.
 
 ---
 
@@ -78,7 +80,7 @@ Accounts belong to a machine and are created from the browser. Each account is a
 | Codex | **ChatGPT** | Device code via the Codex app-server: the page shows a link and a one-time code; sign in from any browser, the page updates when done. |
 | Codex | **OpenAI API key** | Stored by Codex itself in the account's `CODEX_HOME`. |
 
-After sign-in Studiolo reads the account's identity (e-mail, plan) and model list straight from the CLI — no model request is spent — and, for Claude, the CLI's slash commands for the composer's autocomplete. An account without a custom name is renamed to its e-mail, so the composer, the conversation header, every reply and the usage panel say who is talking. Accounts can be renamed, refreshed, signed out (`claude auth logout` / `codex logout`) or removed; a conversation whose account was removed may continue with another account on the same machine.
+After sign-in Studiolo reads the account's identity (e-mail, plan) and model list straight from the CLI — no model request is spent; an Anthropic API-key account also reads the Models API, so every model the key can use is listed with its version — and, for Claude, the CLI's slash commands for the composer's autocomplete. An account without a custom name is renamed to its e-mail, so the composer, the conversation header, every reply and the usage panel say who is talking. Accounts can be renamed, refreshed, signed out (`claude auth logout` / `codex logout`) or removed; a conversation whose account was removed may continue with another account on the same machine.
 
 The usage panel (bottom left) follows the machine chosen in the composer: Claude subscriptions show the 5-hour window, Codex the weekly one, API-key accounts are billed by usage. It reads the CLIs' own usage endpoints (`get_usage`, `account/rateLimits/read`), caches for 60 s, never polls and never starts a CLI for a signed-out account.
 
@@ -107,9 +109,9 @@ While a turn runs, the conversation shows the work the way the CLIs do: what the
 
 An agent in a conversation can hand a task to any other account signed in on its machine — Claude Code or Codex — as a one-shot subagent: a Codex session can call a Claude subagent and vice versa, and work can be spread over the quota of several accounts. This comes on top of the CLI's own subagent tools, which always use the conversation's account.
 
-- **Launcher** `scripts/subagent.mjs`: `node scripts/subagent.mjs --account "<label or id>" --model <model id> [--effort …] [--permissions auto|project-write|read-only] [--cwd <dir>] [--timeout <seconds>] [--verbose] "<task>"` (the task may also come from stdin). It reads this machine's `~/.studio-local/accounts.json`, runs `claude -p` / `codex exec` once with that account's configuration directory and the same CLI arguments the web chat uses, prints the final answer to stdout and a one-line summary (account, model, tokens) to stderr. Exit code 0 means finished, 3 means it stopped at a permission nobody could answer, anything else is a failure. `--list` prints the accounts on this machine with their current quota and the routing rules. Model names accept alias fragments (`haiku`, `sonnet-5-5`); permissions default to auto, or project-write for models without an auto mode.
+- **Launcher** `scripts/subagent.mjs`: `node scripts/subagent.mjs --account "<label or id>" --model <model id> [--effort …] [--permissions auto|project-write|read-only] [--cwd <dir>] [--timeout <seconds>] [--verbose] "<task>"` (the task may also come from stdin). It reads this machine's `~/.studiolo/accounts.json`, runs `claude -p` / `codex exec` once with that account's configuration directory and the same CLI arguments the web chat uses, prints the final answer to stdout and a one-line summary (account, model, tokens) to stderr. Exit code 0 means finished, 3 means it stopped at a permission nobody could answer, anything else is a failure. `--list` prints the accounts on this machine with their current quota and the routing rules. Model names accept alias fragments (`haiku`, `sonnet-5-5`); permissions default to auto, or project-write for models without an auto mode.
 - **Shared knowledge** (`src/subagents.mjs`, `src/context.mjs`): the platform prompt of every new conversation's first turn carries a *Subagents* section — how to call the launcher, the accounts available on this machine (label, id, CLI, plan, quota, models) and the routing rules — and asks the agent to follow the request when the user names an account or model, otherwise to choose by the rules and the quota and say which account it used. Quota comes from the usage panel's cache (it never waits for a CLI) and is refreshed in the background when stale. When the rules or the account list change, running conversations receive the section again with their next message; a quota change alone does not resend it. Slash commands and title generation never carry it.
-- **Settings → Subagents**: an on/off switch, the routing rules text, *Restore default*, *Save rules*, and a preview of the section this machine would append. The default rules prefer a team or secondary account for smaller models, keep premium models on the main account, fall back to the main account when the preferred ones have less than 30 % left in any quota window, and let an account or model named in the message override everything. The rules are saved in `projects/.studio-settings.json` and exchanged between the servers; each machine appends its own accounts and quota at run time. API: `GET` / `PUT /api/settings/subagents`.
+- **Settings → Subagents**: an on/off switch, the routing rules text, *Restore default*, *Save rules*, and a preview of the section this machine would append. The default rules prefer a team or secondary account for smaller models, keep premium models on the main account, fall back to the main account when the preferred ones have less than 30 % left in any quota window, and let an account or model named in the message override everything. The rules are saved in `.studio-settings.json` in the projects folder and exchanged between the servers; each machine appends its own accounts and quota at run time. API: `GET` / `PUT /api/settings/subagents`.
 
 A subagent does not inherit the conversation and nobody answers its questions, so the agent has to spell out the files and the expected output in the task. It spends the quota of the account it runs on, whichever account the chat uses.
 
@@ -123,15 +125,19 @@ Run the same server on every computer and register the servers with each other o
 
 **Reaching other machines.** The simplest secure setup is [Tailscale](https://tailscale.com): put `tailnet.json` (`{"enabled":true,"command":"tailscale"}`) and a random `access-token.txt` (≥ 32 chars) in the state directory, start normally, and Studiolo publishes its port with `tailscale serve`; open `http://<machine>:4310` and enter the token once. With `"trustTailnet":true` the token is skipped for tailnet traffic. Without Tailscale, bind to a private address with `STUDIO_BIND` and set `STUDIO_TOKEN`. Each server keeps its registered peers in `machine.json` in its state directory.
 
+**Device allowlist.** To use the tailnet as transport only and let Studiolo decide which devices may connect, add `"deviceAllowlist":true` to `tailnet.json`. Each browser or desktop client then generates its own secret on first visit, keeps it in its local storage and registers with the server, which stores only a hash, the device name and its status (`devices.json` in the state directory). An unapproved device sees a waiting page that retries every few seconds. Approve, revoke, rename or remove devices in Settings → *Devices* (also for the other registered servers), or on the server machine itself with `node scripts/devices.mjs list | approve <id> | revoke <id> | remove <id> | rename <id> <name> | token <name>`; `http://127.0.0.1:4310` on the server needs no device identity, so the first device can be approved from there. Revoking takes effect at once. A client that cannot register itself gets an *access token* from the same page, shown once and revocable like any device. Servers reach each other with the peer token in `access-token.txt` (the same value on every server), which browsers cannot use to sign in. Clearing a browser's site data makes it a new device.
+
 **Autostart.** macOS: `node scripts/install-studio-macos.mjs` installs a LaunchAgent (`net.studiolo.server`; `--label`, `--port` and `--preview-port` select another instance). Windows: register `scripts/start-studio-windows.ps1` as a Task Scheduler task (action `conhost.exe --headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>`, run at logon, no duplicate instances, retry every minute); `scripts/restart-studio-windows.ps1` restarts it after an upgrade once no runs are active.
 
 **Upgrading.** Front-end files under `public/` are read per request and take effect as soon as they are deployed; changes under `src/` need a restart on every machine. Deploy the same commit to every server.
+
+**Upgrading from 0.1 (projects inside the checkout).** Since 0.2.0 the projects live next to the checkout, in `studiolo-projects`, not in its `projects/` folder. On the first start without `STUDIO_PROJECT_ROOT`, the server renames the old `projects/` folder to the new place (a single rename on the same drive) and renames the Claude transcript folders named after the old path in every account, so resuming a conversation keeps working; Codex resumes by thread id and needs nothing. The move is recorded in `projects-moved.json` in the state directory. The server refuses to start when both folders hold projects, and the move fails while a program holds the old folder open (a terminal, an editor, a persistent Artifact); close it and start again. If both folders are on different drives, move the folder yourself or set `STUDIO_PROJECT_ROOT`.
 
 **Upgrading from a version that used an external file sync for `projects/`.** The default state directory moved from `~/.studio-local` to `~/.studiolo` (or set `STUDIO_STATE_DIR` to keep the old one; on macOS, moving a Claude account directory signs it out, because its Keychain entry is named after the path). Stop the external sync of `projects/` on every machine before starting the new version, so a moved or removed folder is not propagated as a deletion. Keep each project's files on the machine that owns it and turn on *Sync* only where you want copies.
 
 ## Desktop client
 
-`desktop/` is a Tauri 2 app for Windows and macOS. Its launcher page keeps a list of servers and checks each one's `/api/identity`; opening a server loads that server's own web UI in the window, so UI changes ship with the server, not the client. The app adds a tray menu (show, switch server, start at login, quit), close-to-tray, a single instance and native notifications. If the server it shows stops answering, a banner offers the other known servers. Build instructions are in [desktop/README.md](desktop/README.md). On macOS, plain-HTTP connections to other machines are allowed only to `*.ts.net` (Tailscale) names; any other remote server needs HTTPS.
+`desktop/` is a Tauri 2 app for Windows and macOS. Its launcher page keeps a list of servers and checks each one's `/api/identity`; opening a server loads that server's own web UI in the window, so UI changes ship with the server, not the client. The app adds a tray menu (show, switch server, start at login, quit), close-to-tray, a single instance and native notifications. If the server it shows stops answering, a banner offers the other known servers. Build instructions are in [desktop/README.md](desktop/README.md). On macOS, plain-HTTP connections to other machines are allowed only to `*.ts.net` (Tailscale) names; any other remote server needs HTTPS. Browsers allow the microphone only on HTTPS or 127.0.0.1; the Windows client treats every server in its list as secure, so voice input works over plain HTTP on the tailnet too (the first time a server is opened, the client restarts once to apply this).
 
 ---
 
@@ -152,25 +158,48 @@ Static pages omit `command`, `port` and `dataPaths`. Each Artifact gets its own 
 
 In the preview, *select an element, text or a canvas region* and write a comment: it becomes a task for the agent you pick, with the selection as evidence (DOM path, quoted text or a PNG of the canvas). Comments on one Artifact run in order; different Artifacts and conversations run in parallel. See `examples/persistent-game/` (Node backend + SQLite + Canvas) and `examples/artifact-compatibility/`.
 
+Artifacts start and stop from the list in the side panel, and open as a tab beside the chat or in their own window, in edit mode (with comments) or browse mode (the Artifact alone, like any web app).
+
+**Persistent Artifacts (∞).** The ∞ button starts an Artifact as an independent server: the process is not a child of Studiolo, keeps running when Studiolo stops or restarts, and ends only when you stop it. Any program on the machine can reach it on `127.0.0.1:<port>`. It runs the same command with `STUDIO_PERSISTENT=1` added; static pages are served by `src/artifact-serve.mjs`, without Studiolo's selection and storage bridge. Viewing a persistent backend in the workbench proxies to that process instead of starting another one. Running servers are recorded in `persistent-artifacts.json` in the state directory (logs in `persistent-logs/`), and Studiolo starts them again after a reboot. The Artifact decides how other machines reach it with a `persistent` entry in its manifest:
+
+```json
+"persistent": { "port": 4520, "host": "127.0.0.1", "tailnet": true, "urls": ["https://example.org/app"] }
+```
+
+`port` defaults to the backend's `port` (a static page gets a free port that it keeps); `host` is passed as `HOST` (`0.0.0.0` opens it to the local network); `tailnet: true` forwards the port to the tailnet with `tailscale serve --tcp`, which tailscaled keeps without Studiolo and Studiolo removes on stop; `urls` lists addresses the Artifact provides itself. A backend that exits when its parent process is gone must skip that check when `STUDIO_PERSISTENT=1`.
+
+---
+
+## Voice input
+
+The chat composer and the Artifact comment box have a microphone button: hold to talk and release to transcribe, or tap once to start and again to stop. The text lands at the caret and is not sent automatically.
+
+Pick the machine that transcribes and enter an OpenAI API key in Settings → *Voice transcription* (语音转写), then *Verify and save*. Like an account, the key belongs to one machine: it is checked with OpenAI and kept only in that machine's state directory (`openai-api-key.txt`, mode 0600). Choosing another machine removes the key from the previous one, so one machine transcribes at a time. Any server that receives `POST /api/transcribe` without a key of its own forwards the recording there, so every client works whichever server it uses, and the microphone shows as soon as one machine has a key (`features.voiceInput` in `/api/bootstrap`).
+
+`POST /api/transcribe` takes the raw audio (`audio/webm`, `audio/mp4`, `audio/wav`, `audio/ogg`, …), optional `?duration_ms=` and up to ten repeated `?keyword=`, and returns `{text}`. It uses OpenAI `gpt-transcribe` with Chinese and English hints; set `STUDIO_TRANSCRIBE_MODEL` for another model.
+
 ---
 
 ## Files and configuration
 
 | Location | Contents |
 | --- | --- |
-| `projects/<id>/` | Project working directory: code, Artifacts, data (on the owner, or on every copy of a synced project) |
-| `projects/<id>/.studioignore` | Paths never copied between machines (gitignore syntax) |
-| `projects/<id>/.studio/events/` | Authoritative, immutable conversation journal |
-| `projects/<id>/.studio/state.json`, `history-index.md`, `sessions/`, `artifacts/` | Rebuildable state and readable history for agents |
-| `projects/<id>/.studio/artifact-storage/`, `snapshots/`, `attachments/` | Preview storage, data snapshots, comment evidence |
-| `projects/<id>/.studio/stub` | Marks a metadata stub: the journal of a project whose files are on another machine |
-| `projects/<id>/uploads/` | Files dropped into the chat or the resource pane |
-| `projects/.deleted/<id>.json` | Tombstones of deleted projects, exchanged between servers |
-| `projects/.studio-settings.json` | Shared settings: subagent routing rules, exchanged between servers |
+| `studiolo-projects/<id>/` | Project working directory: code, Artifacts, data (on the owner, or on every copy of a synced project). The projects folder sits next to the checkout; `STUDIO_PROJECT_ROOT` moves it |
+| `studiolo-projects/<id>/.studioignore` | Paths never copied between machines (gitignore syntax) |
+| `studiolo-projects/<id>/.studio/events/` | Authoritative, immutable conversation journal |
+| `studiolo-projects/<id>/.studio/state.json`, `history-index.md`, `sessions/`, `artifacts/` | Rebuildable state and readable history for agents |
+| `studiolo-projects/<id>/.studio/artifact-storage/`, `snapshots/`, `attachments/` | Preview storage, data snapshots, comment evidence |
+| `studiolo-projects/<id>/.studio/stub` | Marks a metadata stub: the journal of a project whose files are on another machine |
+| `studiolo-projects/<id>/uploads/` | Files dropped into the chat or the resource pane |
+| `studiolo-projects/.deleted/<id>.json` | Tombstones of deleted projects, exchanged between servers |
+| `studiolo-projects/.studio-settings.json` | Shared settings: subagent routing rules, exchanged between servers |
 | `~/.studiolo/` | Machine-private: identity, `machine.json` (registered servers), `accounts.json`, `accounts/<id>/`, Tailscale settings — never copy between machines |
 | `~/.studiolo/agent-profiles.json` | Optional: executable path / env per CLI family (`claude`, `codex`) or per account id |
+| `~/.studiolo/devices.json` | Device allowlist: hashed device secrets, names and status |
+| `~/.studiolo/openai-api-key.txt` | The OpenAI API key for voice input, on the one machine that transcribes |
+| `~/.studiolo/persistent-artifacts.json`, `persistent-logs/` | Persistent Artifacts running on this machine, and their logs |
 
-Deleting a project is permanent (archiving stays reversible) and is refused while work is queued, running or waiting. The deleting server writes a tombstone, then removes the whole `projects/<id>/` folder; the other servers learn of the tombstone through the host index exchange. Each server, on seeing a new tombstone, removes its leftover copy, the project's resident agent processes and Artifact preview ports, and the Claude transcripts (`projects/<encoded path>*` in each config directory) and Codex rollouts (matched by the `cwd` on their first line) whose working directory was inside the project. Handled IDs are recorded in `~/.studiolo/purged-projects.json`. Projects soft-deleted by older versions (`deletedAt`) are removed once at startup.
+Deleting a project is permanent (archiving stays reversible) and is refused while work is queued, running or waiting. The deleting server writes a tombstone, then removes the whole `studiolo-projects/<id>/` folder; the other servers learn of the tombstone through the host index exchange. Each server, on seeing a new tombstone, removes its leftover copy, the project's resident agent processes and Artifact preview ports, and the Claude transcripts (`projects/<encoded path>*` in each config directory) and Codex rollouts (matched by the `cwd` on their first line) whose working directory was inside the project. Handled IDs are recorded in `~/.studiolo/purged-projects.json`. Projects soft-deleted by older versions (`deletedAt`) are removed once at startup.
 
 ---
 

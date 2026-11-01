@@ -111,3 +111,25 @@ test('changes made on a host that was behind are kept apart until the user picks
  await wait(async()=>(await fs.readFile(path.join(onB,'notes.txt'),'utf8'))==='A edit');
  await wait(async()=>{const x=(await b.api(url)).project;return !x.diverged&&x.replicas[b.app.hostId].version===x.head.id;});
 });
+
+test('a copy that is behind can be brought up to date on demand',async t=>{
+ const {a,b}=await servers(t);
+ const p=await a.api('/api/projects','POST',{name:'Pull'}),url=`/api/projects/${p.id}`;
+ await fs.writeFile(path.join(p.path,'notes.txt'),'v1');
+ await wait(async()=>(await b.api('/api/projects')).some(x=>x.id===p.id&&!x.unavailable));
+ await assert.rejects(a.api(url+'/pull','POST',{hostId:b.app.hostId}),/not synced/);
+ await a.api(url+'/sync','PATCH',{enabled:true,prefetch:false});
+ await wait(async()=>(await b.api(url)).project.head);
+ await assert.rejects(a.api(url+'/pull','POST',{hostId:b.app.hostId}),/has no copy yet/);
+ await b.api(url+'/replicas','POST',{});
+ await wait(async()=>(await a.api(url)).project.replicas[b.app.hostId]?.state==='ready');
+ // A commits a change; without prefetch B stays behind until someone asks it to pull.
+ await fs.writeFile(path.join(p.path,'notes.txt'),'v2');
+ const head=await a.api(url+'/commit','POST',{});
+ await wait(async()=>(await b.api(url)).project.head?.id===head.id);
+ const onB=path.join(b.app.store.projectRoot,p.id);
+ assert.equal(await fs.readFile(path.join(onB,'notes.txt'),'utf8'),'v1');
+ assert.equal((await a.api(url+'/pull','POST',{hostId:b.app.hostId})).started,true,'asked from A, it runs on B');
+ await wait(async()=>(await fs.readFile(path.join(onB,'notes.txt'),'utf8'))==='v2');
+ await wait(async()=>(await a.api(url)).project.replicas[b.app.hostId].version===head.id);
+});

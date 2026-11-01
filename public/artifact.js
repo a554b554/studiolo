@@ -2,11 +2,14 @@ import { t, getLanguage, onLanguageChange, initLanguage } from './i18n.js';
 import { api, post, projectURL, requestId } from './api.js';
 import { initTheme } from './themes.js';
 import { renderMessages, reconcileChildren, mergeRuntime } from './ui.js';
+import { mountDictation } from './dictation.js';
 import { $, node, button, empty, time, attempt, showError, clearError, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
 import { artifactHostOf } from './project-hosts.js';
 initLanguage(); initTheme(); initDialogs();
 $('#connection').textContent=t('连接中'); $('#runtime-status').textContent=t('读取状态…'); $('#comments-heading').textContent=t('批注');
 const params = new URLSearchParams(location.search), projectId = params.get('project'), artifactId = params.get('artifact');
+// Opened as a tab of the workbench's side pane: no top bar, and the comments start folded when narrow.
+const embedded = params.get('embed') === '1'; document.body.classList.toggle('embedded', embedded);
 const base = projectURL(projectId), artifactBase = `${base}/artifacts/${encodeURIComponent(artifactId)}`;
 let state, artifact, runtime, choices = () => ({}), selection = null, replyId = null, mode = false, selectionMode = 'element', frameOrigin, frameNonce, refreshTimer, submitting = false, lastAnchors = '', frameGeneration = 0;
 const pendingRequests = new Map();
@@ -16,7 +19,7 @@ let persistenceStatus='';
 function showPersistence(status){persistenceStatus=status;$('#persistence-status').textContent=t(status==='saving'?'保存中…':status==='error'?'存档未保存，正在重试':status==='saved'?'存档已保存到项目':'');}
 let runtimeBusy=false;
 $('#preview-empty').replaceChildren(empty(t('正在读取项目和 Artifact 状态…')));
-for(const id of ['artifact-start','artifact-stop','select-mode','area-mode','text-mode'])$('#'+id).disabled=true;
+for(const id of ['artifact-start','artifact-stop','artifact-persist','select-mode','area-mode','text-mode'])$('#'+id).disabled=true;
 const loadingNotice=setTimeout(()=>{if(!runtime)$('#preview-empty').replaceChildren(empty(t('项目读取耗时较长，正在等待服务响应…')));},8000);
 function bridge(type, data = {}) { if (frame.contentWindow && frameOrigin && frameNonce) frame.contentWindow.postMessage({type,nonce:frameNonce,...data},frameOrigin); }
 const saveWaiters=new Map();
@@ -37,14 +40,48 @@ function evidencePreview(anchor, annotationId) {
 function updateSelectionEvidence() { const target = $('#selection-evidence'); target.replaceChildren(); if (selection) target.append(evidencePreview(selection)); target.hidden = !target.childNodes.length; }
 function selectReply(id) { replyId = id; selection = null; updateSelectionEvidence(); const annotation = state.annotations.find(item => item.id === id); $('#selection-label').textContent = t('回复：{text}',{text:annotation?.text.slice(0,60) || t('批注')}); $('#selection-clear').hidden = false; $('#comment-text').placeholder = t('回复这条批注…'); showComments(true); $('#comment-text').focus(); focusAnnotation(id); }
 function clearSelection() { replyId = selection = null; updateSelectionEvidence(); $('#selection-label').textContent = t('先选取页面内容或直接填写批注'); $('#selection-clear').hidden = true; $('#comment-text').placeholder = t('输入批注…'); document.querySelectorAll('.annotation.focused').forEach(el => el.classList.remove('focused')); }
-function showComments(show) { $('#comments-panel').hidden = !show; $('#comments-toggle').setAttribute('aria-expanded',String(show)); $('.artifact-layout').classList.toggle('comments-hidden',!show); }
+// `remember` keeps the reader's own choice (the toggle, the shortcut, folding by dragging) for the next visit.
+function showComments(show, remember = false) { $('#comments-panel').hidden = !show; $('#comments-toggle').setAttribute('aria-expanded',String(show)); $('.artifact-layout').classList.toggle('comments-hidden',!show); if (remember) { commentsLayout.open = show; saveCommentsLayout(); } }
+// The comments sidebar: drag its edge to resize, below the snap width it folds; a double click restores
+// the default width. Width and open state are kept per browser, like the workbench's panels.
+const COMMENTS = { key: 'studio-artifact-layout', def: 364, min: 260, snap: 180 };
+const commentsLayout = (() => { try { return JSON.parse(localStorage.getItem(COMMENTS.key) || '{}'); } catch { return {}; } })();
+function saveCommentsLayout() { try { localStorage.setItem(COMMENTS.key, JSON.stringify(commentsLayout)); } catch {} }
+const commentsMax = () => Math.max(COMMENTS.min, Math.min(760, innerWidth - 320));
+const applyCommentsWidth = (width = commentsLayout.width || COMMENTS.def) => $('.artifact-layout').style.setProperty('--cw', Math.min(width, commentsMax()) + 'px');
+{
+  const panel = $('#comments-panel'), handle = node('div','comments-handle'); handle.title = t('拖动调整宽度，双击恢复默认'); panel.prepend(handle);
+  handle.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    event.preventDefault(); handle.setPointerCapture(event.pointerId);
+    const x0 = event.clientX, w0 = panel.getBoundingClientRect().width; let width = w0, snap = false;
+    document.body.classList.add('resizing'); handle.classList.add('active');
+    const move = ev => { const raw = w0 - (ev.clientX - x0); snap = raw < COMMENTS.snap; width = Math.max(COMMENTS.min, Math.min(commentsMax(), raw)); applyCommentsWidth(width); panel.classList.toggle('snapping', snap); };
+    const up = () => {
+      handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up);
+      document.body.classList.remove('resizing'); handle.classList.remove('active'); panel.classList.remove('snapping');
+      if (snap) { applyCommentsWidth(); showComments(false, true); } else { commentsLayout.width = width; saveCommentsLayout(); }
+    };
+    handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
+  });
+  handle.addEventListener('dblclick', () => { commentsLayout.width = COMMENTS.def; applyCommentsWidth(); saveCommentsLayout(); });
+  addEventListener('resize', () => applyCommentsWidth());
+  addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.altKey && event.key.toLowerCase() === 'b') { event.preventDefault(); showComments($('#comments-panel').hidden, true); } });
+  applyCommentsWidth();
+}
 function focusAnnotation(id) { const el = document.getElementById(`annotation-${id}`); document.querySelectorAll('.annotation.focused').forEach(item => item.classList.remove('focused')); if (el) { el.classList.add('focused'); el.scrollIntoView({block:'nearest',behavior:'smooth'}); } }
 $('#notice').addEventListener('click',clearError);
+if (commentsLayout.open === false || embedded && innerWidth < 1000) showComments(false);
 $('#settings-open').addEventListener('click',()=>showDialog('#settings-dialog'));
 $('#select-mode').addEventListener('click', () => setMode(!mode || selectionMode !== 'element','element'));
 $('#area-mode').addEventListener('click', () => setMode(!mode || selectionMode !== 'region','region'));
 $('#text-mode').addEventListener('click', () => setMode(!mode || selectionMode !== 'text','text'));
-$('#comments-toggle').addEventListener('click', () => showComments($('#comments-panel').hidden));
+$('#comments-toggle').addEventListener('click', () => showComments($('#comments-panel').hidden, true));
+// Browse mode opens the Artifact alone in a new window (open.html); from a workbench tab, edit mode opens this page on its own.
+const openWindow = url => window.open(url, '_blank', 'noopener');
+$('#artifact-open-browse').addEventListener('click', () => openWindow(`/open.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(artifactId)}`));
+$('#artifact-open-edit').hidden = !embedded;
+$('#artifact-open-edit').addEventListener('click', () => openWindow(`/artifact.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(artifactId)}`));
 $('#selection-clear').addEventListener('click',clearSelection);
 document.addEventListener('keydown',event => { if (event.key === 'Escape' && mode) setMode(false); });
 $('#comment-filter').addEventListener('change', () => renderComments());
@@ -62,8 +99,11 @@ window.addEventListener('message', event => {
 });
 async function loadStatus({ resetFrame = false } = {}) {
   runtime = await api(`${artifactBase}/status`);
-  $('#runtime-status').textContent = runtime.running ? t('运行中') : runtime.error ? t('启动失败：{error}',{error:runtime.error}) : t('已停止');
-  $('#artifact-start').disabled = !!runtime.running || runtime.filesReady===false; $('#artifact-stop').disabled = !runtime.running;
+  const resident = !!runtime.persistent?.running;
+  $('#runtime-status').textContent = resident ? t('常驻运行中') : runtime.running ? t('运行中') : runtime.error ? t('启动失败：{error}',{error:runtime.error}) : runtime.persistent?.error ? t(runtime.persistent.error) : t('已停止');
+  renderRuntimeButtons(); renderPersistentInfo();
+  // A persistent Artifact is already running: show it here without a second click.
+  if (resident && !runtime.running && !attachTried) { attachTried = true; setTimeout(() => changeRuntime('start')); }
   $('#select-mode').disabled = $('#area-mode').disabled = $('#text-mode').disabled = !runtime.running;
   if (runtime.running && runtime.url) {
     const url = new URL(runtime.url,location.href); frameOrigin = url.origin; frameNonce = runtime.nonce;
@@ -72,17 +112,36 @@ async function loadStatus({ resetFrame = false } = {}) {
   } else { frame.hidden = true; $('#preview-empty').hidden = false; const start=button(t('启动 Artifact'), () => changeRuntime('start'),'primary');start.disabled=runtime.filesReady===false;$('#preview-empty').replaceChildren(empty(runtime.syncMessage?t(runtime.syncMessage):runtime.error || t('Artifact 尚未运行。')),start); frame.removeAttribute('src'); frameOrigin = frameNonce = undefined;showPersistence(''); }
   renderSnapshots();
 }
+let attachTried = false;
+function renderRuntimeButtons() {
+  const resident = !!runtime?.persistent?.running, persist = $('#artifact-persist');
+  $('#artifact-start').disabled = runtimeBusy || !!runtime?.running || runtime?.filesReady===false;
+  $('#artifact-stop').disabled = runtimeBusy || !(runtime?.running || resident);
+  persist.disabled = runtimeBusy || runtime?.filesReady===false; persist.setAttribute('aria-pressed', String(resident));
+  persist.querySelector('span').textContent = t(resident ? '常驻运行中' : '常驻运行');
+  persist.title = t(resident ? '已作为独立服务器运行；Studiolo 关闭后继续。点“停止”结束。' : '常驻运行：作为独立服务器运行，Studiolo 关闭后继续');
+}
+// Where a persistent Artifact can be reached without Studiolo: this computer, and whatever the Artifact's
+// own `persistent` settings add (Tailscale, the local network, its own addresses).
+function renderPersistentInfo() {
+  const info = $('#persistent-info'), persistent = runtime?.persistent; info.replaceChildren(); info.hidden = !persistent?.running;
+  if (!persistent?.running) return;
+  const labels = {local:'本机', tailnet:'Tailnet', network:'局域网', artifact:'Artifact 提供'};
+  for (const {kind, url} of persistent.urls) { const link = document.createElement('a'); link.href = url; link.target = '_blank'; link.rel = 'noopener'; link.textContent = `${t(labels[kind] || kind)} ${new URL(url).host} ↗`; link.title = url; info.append(link); }
+  if (persistent.tailnetError) { const note = document.createElement('span'); note.className = 'muted'; note.textContent = t('Tailnet 未转发：{error}', {error: t(persistent.tailnetError)}); info.append(note); }
+}
 async function changeRuntime(action) {
   if(runtimeBusy)return;
-  runtimeBusy=true;$('#artifact-start').disabled=$('#artifact-stop').disabled=true;
-  $('#runtime-status').textContent=t(action==='start'?'正在启动…':'正在停止…');
-  if(action==='start'&&!runtime?.running)$('#preview-empty').replaceChildren(empty(t('正在启动 Artifact…')));
-  try { if(action==='stop')await flushStorage();await post(`${artifactBase}/${action}`); await loadStatus({resetFrame:action==='start'}); }
+  runtimeBusy=true;renderRuntimeButtons();
+  $('#runtime-status').textContent=t(action==='stop'?'正在停止…':'正在启动…');
+  if(action!=='stop'&&!runtime?.running)$('#preview-empty').replaceChildren(empty(t('正在启动 Artifact…')));
+  try { if(action==='stop')await flushStorage();await post(`${artifactBase}/${action}`); await loadStatus({resetFrame:action!=='stop'}); }
   catch(error){showError(error);$('#runtime-status').textContent=t('操作失败：{error}',{error:error.message});if(!runtime?.running)$('#preview-empty').replaceChildren(empty(error.message),button(t('重试启动'),()=>changeRuntime('start'),'primary'));}
-  finally{runtimeBusy=false;$('#artifact-start').disabled=!!runtime?.running||runtime?.filesReady===false;$('#artifact-stop').disabled=!runtime?.running;}
+  finally{runtimeBusy=false;renderRuntimeButtons();}
 }
 $('#artifact-start').addEventListener('click', () => changeRuntime('start'));
 $('#artifact-stop').addEventListener('click', () => changeRuntime('stop'));
+$('#artifact-persist').addEventListener('click', () => changeRuntime(runtime?.persistent?.running ? 'stop' : 'persist'));
 $('#artifact-refresh').addEventListener('click', () => attempt(async()=>{await flushStorage();await loadStatus({resetFrame:true});}));
 $('#artifact-snapshots').addEventListener('click', () => attempt(async () => { await loadStatus(); showDialog('#snapshot-dialog'); }));
 $('#snapshot-create').addEventListener('click', () => attempt(async () => { const button = $('#snapshot-create'); button.disabled = true; try { await flushStorage();const result = await post(`${artifactBase}/snapshot`); $('#snapshot-restore input').value = result.snapshotId; await loadStatus(); } finally { button.disabled = false; } }));
@@ -141,7 +200,7 @@ $('#comment-form').addEventListener('submit', event => { event.preventDefault();
 onLanguageChange(() => {
   renderComments(); renderSnapshots();showPersistence(persistenceStatus);
   // The preview iframe and its application state are never reloaded or translated.
-  if(runtime)$('#runtime-status').textContent=runtime.running?t('运行中'):runtime.error?t('启动失败：{error}',{error:runtime.error}):t('已停止');
+  if(runtime){$('#runtime-status').textContent=runtime.persistent?.running?t('常驻运行中'):runtime.running?t('运行中'):runtime.error?t('启动失败：{error}',{error:runtime.error}):t('已停止');renderRuntimeButtons();renderPersistentInfo();}
   if(runtime && !runtime.running){const start=button(t('启动 Artifact'),()=>changeRuntime('start'),'primary');start.disabled=runtime.filesReady===false;$('#preview-empty').replaceChildren(empty(runtime.syncMessage?t(runtime.syncMessage):runtime.error || t('Artifact 尚未运行。')),start);}
   const annotation=state?.annotations.find(item=>item.id===replyId);
   $('#selection-label').textContent=replyId?t('回复：{text}',{text:annotation?.text.slice(0,60)||t('批注')}):selection?t('已选取：{text}',{text:selection.text?.slice(0,65)||selection.selector||t(selection.kind==='region'?'页面区域':'页面元素')}):t('先选取页面内容或直接填写批注');
@@ -154,6 +213,8 @@ attempt(async () => {
   const data = await bootstrap(); await reload();
   // Comments run where the artifact runs: the project's artifact host, whichever server serves this page.
   choices = initChoices(data,'',{hostId:artifactHostOf(state.project)||data.hostId});
+  // Voice input, once a machine transcribes (Settings → 语音转写).
+  if (data.features?.voiceInput) { $('#comment-dictate').hidden = false; mountDictation({ button: $('#comment-dictate'), textarea: $('#comment-text'), onError: showError }); }
   await loadStatus();
 
   if (innerWidth <= 850) showComments(false);

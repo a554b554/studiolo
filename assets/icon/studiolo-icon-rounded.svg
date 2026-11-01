@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The iOS app icon (studiolo-icon-ios.svg) on a rounded tile with a small margin, for the desktop client and the web favicon, where the system does not mask the corners. -->
+  <rect x="40" y="40" width="944" height="944" rx="212" fill="#050606"/>
+  <g transform="translate(512 512) scale(0.92) translate(-512 -512)">
+    <path d="M592 256H392C312 256 248 320 248 400C248 458 294 504 352 504H472C556 504 624 570 624 648C624 728 560 792 480 792H248" fill="none" stroke="#B8ED86" stroke-width="104" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="792" cy="792" r="52" fill="#B8ED86"/>
+  </g>
+</svg>

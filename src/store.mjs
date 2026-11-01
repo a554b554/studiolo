@@ -218,7 +218,9 @@ export class Store {
       try {
         const { entry: current, event } = await this._loadEntry(entry.id);
         const running = [...new Set(event.state.runs.filter(r => r.status === 'running' && r.sessionId).map(r => r.sessionId))];
-        return { ...clone(event.state.project), path: current.path, replica: !current.stub, ...(running.length ? { running } : {}) };
+        // The sidebar lists every project's conversations (with forks and categories) without loading their messages.
+        const sessions = event.state.sessions.filter(s => !s.archivedAt && !s.deletedAt).map(s => ({ id: s.id, title: s.title, createdAt: s.createdAt, forkOf: s.forkOf, forks: s.forks, categoryId: s.categoryId, hostId: s.hostId }));
+        return { ...clone(event.state.project), path: current.path, replica: !current.stub, sessions: clone(sessions), ...(running.length ? { running } : {}) };
       }
       catch (e) { const { stub, ...rest } = clone(entry); return { ...rest, replica: !stub, unavailable: true, error: e.message }; }
     }));

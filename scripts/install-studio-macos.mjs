@@ -21,7 +21,9 @@ const escape=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>',
 const label=opts.label,domain=`gui/${process.getuid()}`;
 const plist=path.join(os.homedir(),'Library','LaunchAgents',label+'.plist');await fs.mkdir(path.dirname(plist),{recursive:true});
 const values={Label:label,WorkingDirectory:root,StandardOutPath:path.join(state,'server.stdout.log'),StandardErrorPath:path.join(state,'server.stderr.log')};
-const env={PATH:opts.path||process.env.PATH||'/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',STUDIO_STATE_DIR:state,STUDIO_PORT:opts.port,STUDIO_PREVIEW_PORT:opts['preview-port']};
+// The native Claude installer puts `claude` in ~/.local/bin, which an SSH or launchd PATH lacks.
+const searchPath=[...new Set([path.join(os.homedir(),'.local','bin'),...(opts.path||process.env.PATH||'/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin').split(':')])].filter(Boolean).join(':');
+const env={PATH:searchPath,STUDIO_STATE_DIR:state,STUDIO_PORT:opts.port,STUDIO_PREVIEW_PORT:opts['preview-port']};
 const xml=`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n${Object.entries(values).map(([k,v])=>`<key>${k}</key><string>${escape(v)}</string>`).join('\n')}\n<key>ProgramArguments</key><array><string>${escape(process.execPath)}</string><string>${escape(path.join(root,'src/server.mjs'))}</string></array>\n<key>EnvironmentVariables</key><dict>${Object.entries(env).map(([k,v])=>`<key>${k}</key><string>${escape(v)}</string>`).join('')}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>\n</dict></plist>\n`;
 await fs.writeFile(plist,xml,{mode:0o600});
 // A loaded agent keeps its old plist until it is booted out, so reload it to apply the new one.

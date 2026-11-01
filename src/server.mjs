@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath,pathToFileURL} from 'node:url';
-import {randomUUID,randomBytes,timingSafeEqual} from 'node:crypto';
+import {randomUUID,randomBytes,timingSafeEqual,createHash} from 'node:crypto';
 import {gzip} from 'node:zlib';
 import {Store} from './store.mjs';
 import {QueueManager} from './queue.mjs';
@@ -21,6 +21,7 @@ import {renameSession,needsTitle} from './session-titles.mjs';
 import {markSeen} from './unread.mjs';
 import {UiState} from './ui-state.mjs';
 import {loadTailnet} from './tailnet.mjs';
+import {Devices} from './devices.mjs';
 import {Hosts} from './hosts.mjs';
 import {sessionBinding,journalDigest} from './journal.mjs';
 import {validateModelPermission} from '../public/model-permissions.js';
@@ -28,13 +29,22 @@ import {isSynced,runHosts,artifactHostOf,replicasOf,syncOf} from '../public/proj
 import {ReplicaSync} from './sync-engine.mjs';
 import {RsyncTransport} from './transport.mjs';
 import {saveUpload,normalizeAttachments,assertAttachmentsExist} from './uploads.mjs';
+import {OpenAITranscriber,readAudio,transcribeOptions,DEFAULT_LIMIT as TRANSCRIBE_LIMIT} from './transcribe.mjs';
 import {SubagentPolicy,SubagentKnowledge} from './subagents.mjs';
 import {PeerIndex} from './peer-index.mjs';
-import {DEFAULT_PORT,DEFAULT_PREVIEW_PORT,defaultStateDir,defaultProjectRoot} from './defaults.mjs';
+import {DEFAULT_PORT,DEFAULT_PREVIEW_PORT,defaultStateDir,defaultProjectRoot,legacyProjectRoot} from './defaults.mjs';
+import {moveLegacyProjects} from './move-projects.mjs';
 
 const here=path.dirname(fileURLToPath(import.meta.url));const publicRoot=path.resolve(here,'../public');
 const localAddress=x=>['127.0.0.1','::1','::ffff:127.0.0.1'].includes(x);
-const DRAFT_LIMIT=200000;
+const DRAFT_LIMIT=200000,EDIT_LIMIT=1024*1024;
+// A text file's version for the editor: the first 16 hex characters of the SHA-256 of its bytes.
+export const fileVersion=bytes=>createHash('sha256').update(bytes).digest('hex').slice(0,16);
+// The release this server runs: `version` (package.json, raised on every deploy, see CHANGELOG.md), the
+// desktop client release shipped with it (`clientVersion`) and `build`, a hash of the code, which an open page
+// compares with later bootstraps to offer a reload after an update.
+async function buildInfo(){const hash=createHash('sha256');for(const [dir,pattern] of [[publicRoot,/\.(js|css|html)$/],[here,/\.mjs$/]])for(const name of (await fs.readdir(dir)).filter(n=>pattern.test(n)).sort())hash.update(name+'\0').update(await fs.readFile(path.join(dir,name)));const read=async rel=>{try{return JSON.parse(await fs.readFile(path.resolve(here,rel),'utf8')).version||null;}catch{return null;}};return {version:await read('../package.json')||'0.0.0',clientVersion:await read('../desktop/src-tauri/tauri.conf.json'),build:hash.digest('hex').slice(0,16)};}
+const categoryName=name=>{if(typeof name!=='string'||!name.trim()||[...name.trim()].length>60||/[\r\n\x00-\x1f]/.test(name))throw httpError('分类名称需为 1–60 个字符的单行文本');return name.trim();};
 const equals=(a,b)=>typeof a==='string'&&typeof b==='string'&&Buffer.byteLength(a)===Buffer.byteLength(b)&&timingSafeEqual(Buffer.from(a),Buffer.from(b));
 async function body(req){let size=0;const chunks=[];for await(const chunk of req){size+=chunk.length;if(size>2*1024*1024)throw httpError('请求过大',413);chunks.push(chunk);}const buf=Buffer.concat(chunks).toString('utf8');try{return buf?JSON.parse(buf):{};}catch{throw httpError('无效 JSON');}}
 const rawImageTypes={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp','.avif':'image/avif','.svg':'image/svg+xml'};
@@ -49,24 +59,34 @@ const send=(res,data,status=200)=>{const text=JSON.stringify(data??{}),headers={
 
 export async function createStudio(options={}){
   const stateDir=options.stateDir||defaultStateDir();await fs.mkdir(stateDir,{recursive:true});const tailnet=await loadTailnet(stateDir);const bind=options.bind||process.env.STUDIO_BIND||'127.0.0.1';const token=options.token??process.env.STUDIO_TOKEN??tailnet?.token??'';if(!localAddress(bind)&&!token)throw new Error('非回环监听需要设置 STUDIO_TOKEN');
+  // Device allowlist (README「设备白名单」): with it, `token` is the peer token hosts use for each other and every browser or app must be an approved device.
+  const devices=(options.deviceAllowlist??tailnet?.deviceAllowlist??false)?await new Devices({stateDir}).load():null;
   if(tailnet&&(bind!=='127.0.0.1'||(!token&&!tailnet.trustedHosts)))throw new Error('Tailscale Serve requires loopback binding and an explicit access policy');
   let machine;try{machine=JSON.parse(await fs.readFile(path.join(stateDir,'machine.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw new Error('本机配置无法读取，拒绝重建身份：'+error.message);machine={hostId:randomUUID(),name:tailnet?.name||os.hostname(),hosts:[]};await writeJson(path.join(stateDir,'machine.json'),machine);}
   const projectRoot=options.projectRoot||defaultProjectRoot();
+  // Projects left inside the installation by a release before 0.2.0 move next to it once (src/defaults.mjs).
+  const moveFrom=options.moveProjectsFrom??(!options.projectRoot&&!process.env.STUDIO_PROJECT_ROOT?legacyProjectRoot():null);
+  if(moveFrom)await moveLegacyProjects({from:moveFrom,to:projectRoot,stateDir,homedir:options.homedir,env:options.env});
   const hostId=machine.hostId;const store=options.store||new Store({stateDir,hostId,projectRoot});await store.init();const accounts=options.accounts||new Accounts({stateDir});const runner=options.runner||new CliRunner({stateDir,hostId,accounts});const accountUsage=options.accountUsage||new AccountUsage({runner});
   // Subagent routing rules are one shared document (projects/.studio-settings.json), exchanged with
   // every peer in the host index; the accounts of this machine and their quota are appended when a
   // conversation starts.
   const subagentPolicy=new SubagentPolicy({file:path.join(projectRoot,'.studio-settings.json'),hostId});const subagentKnowledge=new SubagentKnowledge({runner,accountUsage,policy:subagentPolicy,helperPath:path.resolve(here,'../scripts/subagent.mjs')});
-  let replicas=null;const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),hooks:{beforeRun:(p,run,say,signal)=>replicas?.barrier(p,run,say,signal),afterRun:p=>replicas?.afterRun(p)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
+  let replicas=null;const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),hooks:{beforeRun:(p,run,say,signal)=>replicas?.barrier(p,run,say,signal),afterRun:p=>replicas?.afterRun(p)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,forwarder:tailnet?.forwarder,tailnetName:tailnet?.dnsName,platformPorts:()=>[server?.address()?.port].filter(Boolean),bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
   const uiState=new UiState({file:path.join(projectRoot,'.studio-ui.json'),hostId});
   const peerIndex=new PeerIndex({store,policy:subagentPolicy,ui:uiState,hostId});
-  const hosts=new Hosts({machine,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||DEFAULT_PORT}`:undefined),profiles:()=>runner.profiles(),files:{projectRoot:store.projectRoot,ssh:machine.ssh?{rsync:machine.rsync,...machine.ssh}:null,rsync:Boolean(machine.rsync)}});
+  const app=await buildInfo();
+  const hosts=new Hosts({machine,version:app.version,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||DEFAULT_PORT}`:undefined),profiles:()=>runner.profiles(),files:{projectRoot:store.projectRoot,ssh:machine.ssh?{rsync:machine.rsync,...machine.ssh}:null,rsync:Boolean(machine.rsync)}});
   // A peer is identified by what its own /api/identity reports at the given address.
   async function verifyHost({url,token}){let target;try{target=new URL(url);}catch{throw httpError('仅支持 HTTP(S) 主机地址');}if(!['http:','https:'].includes(target.protocol)||target.username||target.password)throw httpError('仅支持 HTTP(S) 主机地址');const host={url:target.origin,token};const info=await hosts.request(host,'/api/identity');if(info.protocol!==2)throw httpError('Upgrade the remote server first',409);if(info.hostId===hostId)throw httpError('不能把本机登记为远程主机');return {...host,id:info.hostId,name:info.name||info.hostId};}
   const hostName=id=>id===hostId?machine.name:machine.hosts.find(h=>h.id===id)?.name||id;
   // Which host holds a project's working tree.
   // Synced projects: this host while its copy is at the head, otherwise the head host.
   const fileHost=state=>{const p=state.project;if(!isSynced(p))return p.ownerHostId||hostId;const mine=replicasOf(p)[hostId];return mine?.state==='ready'&&(!p.head||mine.version===p.head.id)?hostId:p.head?.hostId||p.ownerHostId||hostId;};
+  // Saved edits in a synced project are committed like a run's changes, once typing pauses.
+  const editCommits=new Map();const commitEdits=pid=>{clearTimeout(editCommits.get(pid));const timer=setTimeout(()=>{editCommits.delete(pid);replicas.afterRun(pid).catch(()=>{});},5000);timer.unref?.();editCommits.set(pid,timer);};
+  // Writes to one file run one at a time, so a version check and its write are not interleaved.
+  const fileLocks=new Map();const serialFile=(key,fn)=>{const next=(fileLocks.get(key)||Promise.resolve()).catch(()=>{}).then(fn);fileLocks.set(key,next);next.finally(()=>{if(fileLocks.get(key)===next)fileLocks.delete(key);}).catch(()=>{});return next;};
   replicas=new ReplicaSync({store,hosts,hostId,machine,stateDir,transport:options.transport||new RsyncTransport({rsync:machine.rsync,sshKey:machine.sshKey}),hostName});
   // What one replica host does for a project, run here or on that host through /peer/<action>.
   const replicaActions={
@@ -114,29 +134,76 @@ export async function createStudio(options={}){
   const login=options.accountLogin||new AccountLogin({accounts,runner,oauth:accountAuth,onChange:accountChanged});
   const accountsView=async()=>{const list=await accounts.list();return (await runner.profiles()).map(p=>({...p,seed:list.find(a=>a.id===p.id)?.seed,lastError:list.find(a=>a.id===p.id)?.lastError||null}));};
   const uploadLimit=options.uploadLimit??Number(process.env.STUDIO_UPLOAD_LIMIT||100*1024*1024);
+  const transcribeLimit=options.transcribeLimit??Number(process.env.STUDIO_TRANSCRIBE_LIMIT||TRANSCRIBE_LIMIT);
+  // Voice input (Settings → 语音转写, README「语音输入」): one machine keeps an OpenAI API key, like an account
+  // belongs to a machine, and every other server forwards its recordings there. The key never leaves it.
+  const openaiTranscriber=options.openaiTranscriber||new OpenAITranscriber({keyFile:path.join(stateDir,'openai-api-key.txt'),model:process.env.STUDIO_TRANSCRIBE_MODEL||undefined});
+  const transcriptionHost=async origin=>{if(await openaiTranscriber.available())return {id:hostId,name:machine.name,local:true};return (await hosts.online(origin)).find(h=>!h.local&&h.transcribe)||null;};
+  async function transcriptionSettings(req,origin,input){
+    const hop=Boolean(req.headers['x-studio-hop']),local=async()=>({hostId,hostName:machine.name,provider:'openai',configured:await openaiTranscriber.available(),hint:await openaiTranscriber.hint()});
+    if(req.method==='GET'){if(hop)return await local();const bound=await transcriptionHost(origin);if(!bound)return {provider:'openai',hostId:null,hostName:null,hint:null};if(bound.local)return await local();const remote=await hosts.request(bound,'/api/settings/transcription').catch(()=>({}));return {provider:'openai',hostId:bound.id,hostName:bound.name,hint:remote.hint||null};}
+    if(req.method==='PUT'&&hop){await openaiTranscriber.saveKey(input.apiKey);hosts.cache=null;return await local();}
+    if(req.method==='DELETE'&&hop){await openaiTranscriber.removeKey();hosts.cache=null;return {ok:true};}
+    const peers=(await hosts.online(origin)).filter(h=>!h.local);
+    if(req.method==='PUT'){
+      const target=input.hostId||hostId;if(input.provider&&input.provider!=='openai')throw httpError('目前只支持 OpenAI');
+      if(target===hostId)await openaiTranscriber.saveKey(input.apiKey);else{const host=peers.find(h=>h.id===target);if(!host)throw httpError('这台机器不在线',503);await hosts.request(host,'/api/settings/transcription',{method:'PUT',data:{apiKey:input.apiKey},timeout:30000});}
+      // One machine transcribes for all: a key kept elsewhere before is removed.
+      if(target!==hostId)await openaiTranscriber.removeKey();for(const host of peers)if(host.id!==target&&host.transcribe)await hosts.request(host,'/api/settings/transcription',{method:'DELETE'}).catch(()=>{});
+      hosts.cache=null;return await transcriptionSettings({method:'GET',headers:{}},origin);
+    }
+    if(req.method==='DELETE'){await openaiTranscriber.removeKey();for(const host of peers)if(host.transcribe)await hosts.request(host,'/api/settings/transcription',{method:'DELETE'}).catch(()=>{});hosts.cache=null;return {provider:'openai',hostId:null,hostName:null,hint:null};}
+    throw httpError('Method not allowed',405);
+  }
   async function handler(req,res){
     const url=new URL(req.url,'http://localhost');const pathname=url.pathname;const origin='http://'+req.headers.host;
-    if(!pathname.startsWith('/api/')){if(!['GET','HEAD'].includes(req.method))throw httpError('Method not allowed',405);const file=await safePath(publicRoot,decodeURIComponent(pathname.slice(1)||'index.html'));const info=await fs.stat(file);const etag=`W/"${info.size}-${Math.trunc(info.mtimeMs)}"`;const types={'.html':'text/html; charset=utf-8','.css':'text/css','.js':'text/javascript','.mjs':'text/javascript','.svg':'image/svg+xml'};const headers={'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Content-Security-Policy':"frame-ancestors 'none'",'Cache-Control':'no-cache',ETag:etag};if(req.headers['if-none-match']===etag){res.writeHead(304,headers);res.end();return;}const content=await fs.readFile(file);res.writeHead(200,headers);res.end(req.method==='HEAD'?undefined:content);return;}
+    if(!pathname.startsWith('/api/')){if(!['GET','HEAD'].includes(req.method))throw httpError('Method not allowed',405);const file=await safePath(publicRoot,decodeURIComponent(pathname.slice(1)||'index.html'));const info=await fs.stat(file);const etag=`W/"${info.size}-${Math.trunc(info.mtimeMs)}"`;const types={'.html':'text/html; charset=utf-8','.css':'text/css','.js':'text/javascript','.mjs':'text/javascript','.svg':'image/svg+xml','.png':'image/png'};const headers={'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Content-Security-Policy':"frame-ancestors 'self'",'Cache-Control':'no-cache',ETag:etag};if(req.headers['if-none-match']===etag){res.writeHead(304,headers);res.end();return;}const content=await fs.readFile(file);res.writeHead(200,headers);res.end(req.method==='HEAD'?undefined:content);return;}
     const bearer=req.headers.authorization?.startsWith('Bearer ')?req.headers.authorization.slice(7):null;const cookie=/studio_session=([^;]+)/.exec(req.headers.cookie||'')?.[1];const ownHost=new URL(origin).hostname;const local=localAddress(req.socket.remoteAddress)&&['127.0.0.1','localhost','[::1]'].includes(ownHost)&&localAddress(bind);
-    // Reachability probe for other origins (the desktop client's launcher, failover in another server's page): name and id only, no auth.
-    if(pathname==='/api/identity'&&req.method==='GET'&&req.headers.origin&&req.headers.origin!==origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');return send(res,{protocol:2,hostId,name:machine.name});}
+    // Reachability probe for other origins (the desktop client's launcher, failover in another server's page): name, id and release only, no auth.
+    if(pathname==='/api/identity'&&req.method==='GET'&&req.headers.origin&&req.headers.origin!==origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');return send(res,{protocol:2,hostId,name:machine.name,version:app.version});}
     if(req.headers.origin&&req.headers.origin!==origin)throw httpError('跨站请求已拒绝',403);
-    if(['/api/auth','/api/login'].includes(pathname)&&req.method==='POST'){const input=await body(req);if(!token||!equals(input.token,token))throw httpError('访问令牌不正确',401);const sid=randomBytes(32).toString('hex');sessions.add(sid);res.setHeader('Set-Cookie',`studio_session=${sid}; HttpOnly; SameSite=Strict; Path=/`);return send(res,{ok:true});}
-    const trustedTailnet=tailnet?.trustedHosts?.has(ownHost.toLowerCase())&&localAddress(req.socket.remoteAddress);
-    if(!(token?equals(bearer,token)||sessions.has(cookie):local||trustedTailnet))throw httpError('需要访问令牌',401);
+    const peer=Boolean(token)&&equals(bearer,token);const trustedTailnet=tailnet?.trustedHosts?.has(ownHost.toLowerCase())&&localAddress(req.socket.remoteAddress);
+    const sessionCookie=sid=>res.setHeader('Set-Cookie',`studio_session=${sid}; HttpOnly; SameSite=Strict; Path=/`);
+    let device=null;
+    if(devices){
+      // Device allowlist: the tailnet only carries the connection. A browser or app presents the secret it
+      // registered and must have been approved; hosts reach each other with the peer token; a page opened
+      // on this machine itself needs nothing. The waiting page gets a `device` code to tell these apart.
+      if(!local&&!peer&&tailnet?.trustedHosts&&!trustedTailnet)throw httpError('需要访问令牌',401);
+      if(pathname==='/api/device/login'&&req.method==='POST'){const input=await body(req);const known=await devices.identify({id:input.id,name:input.name,secret:input.secret,agent:req.headers['user-agent']});if(known.status==='approved')sessionCookie(devices.createSession(known.id));return send(res,{status:known.status,device:known});}
+      if(['/api/auth','/api/login'].includes(pathname)&&req.method==='POST'){const input=await body(req);const known=devices.byBearer(input.token);if(!known)throw httpError('访问令牌不正确',401);sessionCookie(devices.createSession(known.id));return send(res,{ok:true,device:known});}
+      if(!local&&!peer){device=devices.session(cookie)||devices.byBearer(bearer);if(!device)throw Object.assign(httpError('此设备尚未获准访问',401),{code:'device'});}
+    }else{
+      if(['/api/auth','/api/login'].includes(pathname)&&req.method==='POST'){const input=await body(req);if(!token||!equals(input.token,token))throw httpError('访问令牌不正确',401);const sid=randomBytes(32).toString('hex');sessions.add(sid);sessionCookie(sid);return send(res,{ok:true});}
+      if(!(token?peer||sessions.has(cookie):local||trustedTailnet))throw httpError('需要访问令牌',401);
+    }
     let parentOrigin=origin;if(req.headers['x-studio-parent-origin']){if(req.headers['x-studio-hop']!=='1')throw httpError('无效预览来源',403);const candidate=new URL(req.headers['x-studio-parent-origin']);if(!['http:','https:'].includes(candidate.protocol)||candidate.origin!==req.headers['x-studio-parent-origin'])throw httpError('无效预览来源');parentOrigin=candidate.origin;}
-    if(pathname==='/api/logout'&&req.method==='POST'){sessions.delete(cookie);res.setHeader('Set-Cookie','studio_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,{ok:true});}
+    if(pathname==='/api/logout'&&req.method==='POST'){sessions.delete(cookie);devices?.endSession(cookie);res.setHeader('Set-Cookie','studio_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,{ok:true});}
     if(pathname==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});res.write('event: change\ndata: {}\n\n');clients.add(res);const timer=setInterval(()=>res.write(': heartbeat\n\n'),15000);req.on('close',()=>{clearInterval(timer);clients.delete(res)});return;}
     // Account management and quota, for this machine or (forwarded) for another online host.
     let accountPath=pathname==='/api/account-usage'||pathname.startsWith('/api/accounts')?pathname:null;
-    const viaHost=/^\/api\/hosts\/([^/]+)(\/(?:accounts|account-usage)(?:\/.*)?)$/.exec(pathname);
+    const viaHost=/^\/api\/hosts\/([^/]+)(\/(?:accounts|account-usage|devices)(?:\/.*)?)$/.exec(pathname);
     if(viaHost){
       if(viaHost[1]!==hostId){
         if(req.headers['x-studio-hop'])throw httpError('Host not found',404);
         const host=await hosts.get(viaHost[1],origin);const input=['POST','PATCH','PUT'].includes(req.method)?await body(req):undefined;
-        return send(res,await hosts.request(host,'/api'+viaHost[2]+url.search,{method:req.method,data:input,timeout:120000}),req.method==='POST'&&viaHost[2]==='/accounts'?201:200);
+        return send(res,await hosts.request(host,'/api'+viaHost[2]+url.search,{method:req.method,data:input,timeout:120000}),req.method==='POST'&&['/accounts','/devices/tokens'].includes(viaHost[2])?201:200);
       }
       accountPath='/api'+viaHost[2];
+    }
+    // Device allowlist management, for this machine or (above) a peer through /api/hosts/:id/devices.
+    const deviceRoute=/^\/api\/devices(?:\/([^/]+))?(?:\/(approve|revoke))?$/.exec(viaHost?accountPath:pathname);
+    if(deviceRoute){
+      const devicePath=viaHost?accountPath:pathname;
+      if(devicePath==='/api/devices'&&req.method==='GET')return send(res,{hostId,hostName:machine.name,enabled:Boolean(devices),devices:devices?devices.list():[],current:device?.id||null});
+      if(!devices)throw httpError('此服务未启用设备白名单',409);
+      if(devicePath==='/api/devices/tokens'&&req.method==='POST'){const input=await body(req);return send(res,await devices.createToken({name:input.name}),201);}
+      const id=decodeURIComponent(deviceRoute[1]||''),self=Boolean(device)&&device.id===id;
+      if(deviceRoute[2]==='approve'&&req.method==='POST')return send(res,{device:await devices.approve(id)});
+      if(deviceRoute[2]==='revoke'&&req.method==='POST'){if(self)throw httpError('不能吊销当前设备',409);return send(res,{device:await devices.revoke(id)});}
+      if(!deviceRoute[2]&&req.method==='PATCH'){const input=await body(req);return send(res,{device:await devices.rename(id,input.name)});}
+      if(!deviceRoute[2]&&req.method==='DELETE'){if(self)throw httpError('不能删除当前设备',409);await devices.remove(id);return send(res,{ok:true});}
+      throw httpError('Method not allowed',405);
     }
     if(accountPath==='/api/account-usage'&&req.method==='GET')return send(res,{hostId,hostName:machine.name,...await accountUsage.get({refresh:url.searchParams.get('refresh')==='1'})});
     if(accountPath==='/api/accounts'){
@@ -159,6 +226,14 @@ export async function createStudio(options={}){
     const authFlow=/^\/api\/account-auth\/([^/]+)(\/code)?$/.exec(pathname);
     if(authFlow?.[2]&&req.method==='POST')return send(res,await accountAuth.submit(authFlow[1],(await body(req)).code));
     if(authFlow&&!authFlow[2]&&req.method==='DELETE')return send(res,accountAuth.cancel(authFlow[1]));
+    if(pathname==='/api/transcribe'&&req.method==='POST'){
+      const audio=await readAudio(req,{limit:transcribeLimit}),input={...audio,...transcribeOptions(url,req.headers)};
+      if(await openaiTranscriber.available())return send(res,await openaiTranscriber.transcribe(input));
+      const bound=req.headers['x-studio-hop']?null:await transcriptionHost(origin);
+      if(bound)return send(res,await hosts.request(bound,'/api/transcribe'+url.search,{method:'POST',raw:audio.bytes,headers:{'Content-Type':req.headers['content-type']},timeout:90000}));
+      throw httpError('还没有设置语音转写：在设置 → 语音转写里添加 OpenAI API key',503);
+    }
+    if(pathname==='/api/settings/transcription')return send(res,await transcriptionSettings(req,origin,['PUT'].includes(req.method)?await body(req):{}));
     // Subagent routing rules (shared) plus a preview of the section this machine would append to a new conversation.
     if(pathname==='/api/settings/subagents'){
       if(req.method==='GET'){const policy=await subagentPolicy.get();const knowledge=await subagentKnowledge.describe().catch(e=>({error:e.message}));return send(res,{hostId,hostName:machine.name,...policy,helperPath:subagentKnowledge.helperPath,preview:knowledge?.text||null,previewError:knowledge?.error||null});}
@@ -168,8 +243,8 @@ export async function createStudio(options={}){
     // Per-user UI state: last selection, theme and language, shared with every peer.
     if(pathname==='/api/settings/ui'){if(req.method==='GET')return send(res,await uiState.read());if(req.method==='PUT')return send(res,await uiState.set(await body(req)));throw httpError('Method not allowed',405);}
     if(pathname==='/api/archives'&&req.method==='GET')return send(res,await listArchives(store));
-    if(pathname==='/api/identity')return send(res,{protocol:2,hostId,name:machine.name,profiles:await runner.profiles(),...(req.headers['x-studio-hop']?{files:hosts.files}:{})});
-    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,features:{},projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin)),ui:await uiState.read()});
+    if(pathname==='/api/identity')return send(res,{protocol:2,hostId,name:machine.name,...app,profiles:await runner.profiles(),transcribe:await openaiTranscriber.available(),...(req.headers['x-studio-hop']?{files:hosts.files}:{})});
+    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,...app,features:{voiceInput:Boolean(await transcriptionHost(origin)),transcribe:Boolean(await transcriptionHost(origin)),deviceAllowlist:Boolean(devices)},device:device?{id:device.id,name:device.name}:null,projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin)),ui:await uiState.read()});
     // Server registry (machine.json). Registering B on A also registers A on B through B's
     // /api/peer/hello, so the user does it once; removal tells the peer the same way.
     if(pathname==='/api/hosts'&&req.method==='GET')return send(res,await hosts.configured(origin));
@@ -222,6 +297,8 @@ export async function createStudio(options={}){
       if(syncOf(project).artifactHostId===target)await store.mutate(pid,'project.sync',s=>{s.project.sync.artifactHostId=null;});
       return send(res,await onReplica(target,pid,'drop',{},origin));}
     if(tail==='/commit'&&req.method==='POST'){const input=await body(req);return send(res,await onReplica(input.hostId||hostId,pid,'commit',{},origin));}
+    // Brings one copy up to the head now instead of before its next run; progress shows in /sync.
+    if(tail==='/pull'&&req.method==='POST'){const input=await body(req),target=input.hostId||hostId;if(!isSynced(project))throw httpError('This project is not synced',409);if(replicasOf(project)[target]?.state!=='ready')throw httpError(`${hostName(target)} has no copy yet; add one first`,409);if(project.diverged)throw httpError('Choose which copy to keep first',409);return send(res,await onReplica(target,pid,'pull',{},origin),202);}
     // A diverged project keeps one host's files: it commits them as the head, the others are overwritten.
     if(tail==='/resolve'&&req.method==='POST'){const input=await body(req);if(!project.diverged)throw httpError('This project has not diverged',409);const keep=input.hostId;if(replicasOf(project)[keep]?.state!=='ready')throw httpError(`${hostName(keep)} has no ready copy`,409);
       const head=await onReplica(keep,pid,'commit',{force:true},origin);if(keep!==hostId)await hosts.sync(store,await hosts.get(keep,origin),pid);const others=Object.entries(replicasOf((await store.read(pid)).project)).filter(([id,r])=>id!==keep&&r.state==='ready').map(([id])=>id);
@@ -233,11 +310,12 @@ export async function createStudio(options={}){
     // Other servers forward file reads, uploads and artifact creation there; this server may
     // hold only the metadata stub.
     const files=fileHost(state);
-    if(files!==hostId&&(tail==='/uploads'&&req.method==='POST'||['/files','/file','/raw'].includes(tail)&&['GET','HEAD'].includes(req.method)||tail==='/artifacts'&&req.method==='POST')){
+    if(files!==hostId&&(tail==='/uploads'&&req.method==='POST'||['/files','/file','/raw'].includes(tail)&&['GET','HEAD'].includes(req.method)||tail==='/file'&&req.method==='PUT'||tail==='/artifacts'&&req.method==='POST')){
       if(req.headers['x-studio-hop'])throw httpError('Project files are not on this server',409);
       const host=await filesOnline(files,origin);
       if(tail==='/artifacts')return send(res,await forward(host.id,pid,pathname,'POST',await body(req),origin),201);
-      if(['/files','/file'].includes(tail))return send(res,await hosts.request(host,pathname+url.search,{timeout:30000}));
+      if(tail==='/files')return send(res,await hosts.request(host,pathname+url.search,{timeout:30000}));
+      // File reads and edits pass the file host's answer through as is, so a conflict keeps its code and current version.
       return hosts.proxy(host,req,res,pathname+url.search);
     }
     // Raw file bodies, one file per request, written to the project's uploads/ folder on the host
@@ -270,7 +348,7 @@ export async function createStudio(options={}){
     if(runRoute)target=state.runs.find(r=>r.id===runRoute[1])?.hostId||hostId;
     if(tail==='/queues/resume')target=state.runs.findLast(r=>r.queueId===input.queueId)?.hostId||hostId;
     // Artifacts, their comment agents and evidence live on the artifact host.
-    const artifactRoute=/^\/artifacts\/[^/]+\/(?:start|stop|status|snapshot|restore|annotations)$/.test(tail)||tail==='/messages'&&input&&!input.sessionId;
+    const artifactRoute=/^\/artifacts\/[^/]+\/(?:start|persist|stop|status|snapshot|restore|annotations)$/.test(tail)||tail==='/messages'&&input&&!input.sessionId;
     if(artifactRoute){target=artifactHostOf(project)||hostId;if(input?.hostId&&input.hostId!==target)throw httpError(`Artifact comments run on ${hostName(target)}`,409);}
     const sessionLifecycle=/^\/sessions\/([^/]+)\/lifecycle$/.exec(tail);
     if(sessionLifecycle)target=sessionBinding(state,sessionLifecycle[1])?.hostId||hostId;
@@ -304,7 +382,20 @@ export async function createStudio(options={}){
     if(tail==='/sessions'&&req.method==='POST'){const input=await readBody();if(input.title!==undefined&&(typeof input.title!=='string'||[...input.title.trim()].length>120||/[\r\n\x00-\x1f]/.test(input.title)))throw httpError('请输入 1–120 个字符的单行标题');const session={id:randomUUID(),createdHostId:hostId,title:input.title?.trim()||'新会话',createdAt:new Date().toISOString()};session.titleSource=needsTitle(session)?'pending':'manual';await store.mutate(pid,'session.created',s=>s.sessions.push(session));return send(res,session,201);}
     // A fork starts unbound: the first send picks its computer and account.
     const forkRoute=/^\/sessions\/([^/]+)\/fork$/.exec(tail);if(forkRoute&&req.method==='POST'){await readBody();const source=state.sessions.find(s=>s.id===forkRoute[1]&&!s.deletedAt);if(!source)throw httpError('会话不存在',404);if(inactive(project))throw httpError('项目已归档或删除，请先恢复',409);const at=new Date().toISOString(),session={id:randomUUID(),createdHostId:hostId,title:`${source.title} · 分叉`.slice(0,120),titleSource:'manual',createdAt:at,forkOf:{projectId:pid,sessionId:source.id,at}};await store.mutate(pid,'session.forked',s=>{s.sessions.push(session);const from=s.sessions.find(x=>x.id===source.id);from.forks=[...(from.forks||[]),session.id];});return send(res,session,201);}
-    const sessionRoute=/^\/sessions\/([^/]+)$/.exec(tail);if(sessionRoute&&req.method==='PATCH')return send(res,await renameSession(store,pid,sessionRoute[1],(await readBody()).title));
+    // A conversation's title and its category; forks are listed under the conversation they came from, so they take no category of their own.
+    const sessionRoute=/^\/sessions\/([^/]+)$/.exec(tail);if(sessionRoute&&req.method==='PATCH'){const input=await readBody();let session=input.title!==undefined?await renameSession(store,pid,sessionRoute[1],input.title):null;
+      if(Object.hasOwn(input,'categoryId')){const cid=input.categoryId;if(cid!==null&&typeof cid!=='string')throw httpError('无效分类');session=await store.mutate(pid,'session.categorized',s=>{const target=s.sessions.find(x=>x.id===sessionRoute[1]);if(!target)throw httpError('对话不存在',404);if(target.forkOf)throw httpError('分叉跟随原对话，不能单独分类',409);if(cid!==null&&!(s.project.categories||[]).some(c=>c.id===cid))throw httpError('分类不存在',404);if(cid===null)delete target.categoryId;else target.categoryId=cid;return target;});}
+      if(!session)throw httpError('需要标题或分类');return send(res,session);}
+    if(tail==='/categories'&&req.method==='POST'){const input=await readBody();const name=categoryName(input.name),ids=input.sessionIds??[];if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))throw httpError('sessionIds 需为对话 ID 数组');const category={id:randomUUID(),name,createdAt:new Date().toISOString()};
+      await store.mutate(pid,'category.created',s=>{const targets=ids.map(id=>s.sessions.find(x=>x.id===id));if(targets.some(x=>!x))throw httpError('对话不存在',404);if(targets.some(x=>x.forkOf))throw httpError('分叉跟随原对话，不能单独分类',409);s.project.categories=[...(s.project.categories||[]),category];for(const target of targets)target.categoryId=category.id;});return send(res,category,201);}
+    const categoryRoute=/^\/categories\/([^/]+)$/.exec(tail);
+    if(categoryRoute&&['PATCH','DELETE'].includes(req.method)){const cid=categoryRoute[1],name=req.method==='PATCH'?categoryName((await readBody()).name):null;let result={ok:true};
+      await store.mutate(pid,req.method==='PATCH'?'category.renamed':'category.deleted',s=>{const list=s.project.categories||[],index=list.findIndex(c=>c.id===cid);if(index<0)throw httpError('分类不存在',404);if(name){s.project.categories=list.map(c=>c.id===cid?{...c,name}:c);result=s.project.categories[index];return;}s.project.categories=list.filter(c=>c.id!==cid);for(const target of s.sessions)if(target.categoryId===cid)delete target.categoryId;});return send(res,result);}
+    // Detaching makes a fork an ordinary conversation: it leaves its source's fork list and joins the category of the conversation it came from.
+    const detachRoute=/^\/sessions\/([^/]+)\/detach$/.exec(tail);if(detachRoute&&req.method==='POST'){await readBody();return send(res,await store.mutate(pid,'session.detached',s=>{const target=s.sessions.find(x=>x.id===detachRoute[1]);if(!target)throw httpError('对话不存在',404);if(!target.forkOf)throw httpError('这个对话不是分叉',409);
+      let root=target;const seen=new Set();while(root.forkOf&&!seen.has(root.id)){seen.add(root.id);root=s.sessions.find(x=>x.id===root.forkOf.sessionId)||{id:root.id};}
+      const source=s.sessions.find(x=>x.id===target.forkOf.sessionId);if(source)source.forks=(source.forks||[]).filter(id=>id!==target.id);
+      target.detachedFrom={sessionId:target.forkOf.sessionId,at:new Date().toISOString()};delete target.forkOf;if(root.categoryId)target.categoryId=root.categoryId;else delete target.categoryId;return target;}));}
     if(tail==='/messages'&&req.method==='POST'){const input=await readBody();if(!input.text?.trim()||!input.requestId)throw httpError('需要消息与 requestId');if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);if(input.sessionId&&!state.sessions.some(s=>s.id===input.sessionId))throw httpError('会话不存在',404);if(input.artifactId&&!state.artifacts.some(a=>a.id===input.artifactId))throw httpError('Artifact 不存在',404);if(!input.sessionId&&(!input.artifactId||!state.annotations.some(a=>a.id===input.annotationId&&a.artifactId===input.artifactId)))throw httpError('缺少会话或批注');return send(res,await queue.submit(pid,{...input,text:input.text.trim(),hostId,queueId:input.sessionId?'session:'+input.sessionId:'artifact:'+input.artifactId}),201);}
     const approval=/^\/runs\/([^/]+)\/approvals\/([^/]+)$/.exec(tail);if(approval&&req.method==='POST')return send(res,await queue.approvals.respond(pid,approval[1],approval[2],await readBody()));
     const continuation=/^\/runs\/([^/]+)\/continue$/.exec(tail);if(continuation&&req.method==='POST')return send(res,await queue.continueWaiting(pid,continuation[1]));
@@ -312,19 +403,28 @@ export async function createStudio(options={}){
     // Stop the current turn but keep the native process and session (Esc in the CLIs).
     const interrupt=/^\/runs\/([^/]+)\/interrupt$/.exec(tail);if(interrupt&&req.method==='POST'){await queue.interrupt(pid,interrupt[1]);return send(res,{ok:true});}if(tail==='/queues/resume'&&req.method==='POST'){const input=await readBody();await queue.resume(pid,input.queueId);return send(res,{ok:true});}
     if(tail==='/files'){const rel=url.searchParams.get('path')||'';const dir=await safePath(project.path,rel);const entries=await fs.readdir(dir,{withFileTypes:true});const results=[];for(const entry of entries.filter(e=>!['.git','node_modules'].includes(e.name))){const p=path.posix.join(rel.replaceAll('\\','/'),entry.name);try{await safePath(project.path,p);results.push({name:entry.name,path:p,type:entry.isDirectory()?'directory':'file'});}catch{}}return send(res,results.sort((a,b)=>a.type===b.type?a.name.localeCompare(b.name):a.type==='directory'?-1:1));}
-    if(tail==='/file'){const rel=url.searchParams.get('path')||'';const file=await safePath(project.path,rel);if((await fs.stat(file)).size>1024*1024)throw httpError('文件超过 1 MB 预览限制',413);const data=await fs.readFile(file);if(data.includes(0))throw httpError('二进制文件暂不支持文本预览');return send(res,{path:rel,content:data.toString('utf8')});}
+    // Text files carry a version (fileVersion); an edit names the version it started from and is refused once the file changed.
+    const fileMeta=(rel,bytes,info)=>({path:rel,version:fileVersion(bytes),size:info.size,mtime:info.mtime.toISOString()});
+    if(tail==='/file'&&req.method==='PUT'){const rel=typeof input.path==='string'?input.path:'';if(!rel)throw httpError('需要文件路径');if(rel.split(/[\\/]/).some(p=>['.studio','.git'].includes(p.toLowerCase())))throw httpError('不能编辑 .studio 或 .git 里的文件',403);if(typeof input.content!=='string'||Buffer.byteLength(input.content)>EDIT_LIMIT)throw httpError('文件内容需为不超过 1 MB 的文本',413);if(input.version!==null&&typeof input.version!=='string')throw httpError('需要文件版本');
+      const file=await safePath(project.path,rel,{missing:true});
+      const saved=await serialFile(file,async()=>{let current=null;try{const info=await fs.stat(file);if(!info.isFile())throw httpError('不是文件');current=fileVersion(await fs.readFile(file));}catch(e){if(e.code!=='ENOENT')throw e;}
+        if(current!==input.version)return {conflict:current};
+        if(current===null)await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,input.content);const bytes=await fs.readFile(file);return fileMeta(rel,bytes,await fs.stat(file));});
+      if(Object.hasOwn(saved,'conflict'))return send(res,{error:saved.conflict===null?'文件已被删除':'文件已被修改',code:'conflict',version:saved.conflict},409);
+      if(isSynced(project))commitEdits(pid);return send(res,saved);}
+    if(tail==='/file'){const rel=url.searchParams.get('path')||'';const stat=url.searchParams.get('stat')==='1';let file;try{file=await safePath(project.path,rel);}catch(e){if(stat&&e.code==='ENOENT')throw Object.assign(httpError('文件不存在',404),{code:'missing'});throw e;}const info=await fs.stat(file);if(stat){if(!info.isFile())throw httpError('不是文件');return send(res,fileMeta(rel,await fs.readFile(file),info));}if(info.size>1024*1024)throw httpError('文件超过 1 MB 预览限制',413);const data=await fs.readFile(file);if(data.includes(0))throw httpError('二进制文件暂不支持文本预览');return send(res,{...fileMeta(rel,data,info),content:data.toString('utf8')});}
     // Images referenced by Markdown previews. Sandboxed like evidence so a project SVG cannot run script.
     if(tail==='/raw'){const rel=url.searchParams.get('path')||'';const type=rawImageTypes[path.extname(rel).toLowerCase()];if(!type)throw httpError('仅支持预览图片文件',415);const file=await safePath(project.path,rel);const info=await fs.stat(file);if(!info.isFile())throw httpError('不是文件');if(info.size>10*1024*1024)throw httpError('图片超过 10 MB 预览限制',413);const etag=`W/"${info.size}-${Math.trunc(info.mtimeMs)}"`;const headers={'Content-Type':type,'Cache-Control':'private, no-cache',ETag:etag,'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; sandbox"};if(req.headers['if-none-match']===etag){res.writeHead(304,headers);res.end();return;}const bytes=await fs.readFile(file);res.writeHead(200,{...headers,'Content-Length':bytes.length});res.end(req.method==='HEAD'?undefined:bytes);return;}
     if(tail==='/artifacts'&&req.method==='POST')return send(res,await artifacts.create(pid,await readBody()),201);
-    const art=/^\/artifacts\/([^/]+)\/(start|stop|status|snapshot|restore|annotations)$/.exec(tail);if(art){const aid=art[1],action=art[2];if(action==='status')return send(res,await artifacts.status(pid,aid,parentOrigin,origin));if(req.method!=='POST')throw httpError('需要 POST',405);if(action==='start')return send(res,await artifacts.start(pid,aid,parentOrigin,origin));if(action==='stop'){await artifacts.stop(pid,aid);return send(res,{running:false});}if(action==='snapshot')return send(res,await artifacts.snapshot(pid,aid));if(action==='restore')return send(res,await artifacts.restore(pid,aid,(await readBody()).snapshotId));if(action==='annotations'){const input=await readBody();if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);await artifacts.lookup(pid,aid);if(!input.text?.trim()||!input.requestId)throw httpError('需要批注文本及 requestId');let annotation=state.annotations.find(a=>a.requestId===input.requestId);if(!annotation){const annotationId=randomUUID();const anchor=await saveAnchorEvidence(project,annotationId,input.anchor||{});annotation={id:annotationId,requestId:input.requestId,artifactId:aid,text:input.text.trim(),anchor,anchorStatus:'attached',status:'open',createdAt:new Date().toISOString()};await store.mutate(pid,'annotation.created',s=>{if(!s.annotations.some(a=>a.requestId===input.requestId))s.annotations.push(annotation);else annotation=s.annotations.find(a=>a.requestId===input.requestId);});}const run=await queue.submit(pid,{...input,artifactId:aid,annotationId:annotation.id,queueId:'artifact:'+aid,hostId});return send(res,{annotation,run},201);}}
+    const art=/^\/artifacts\/([^/]+)\/(start|persist|stop|status|snapshot|restore|annotations)$/.exec(tail);if(art){const aid=art[1],action=art[2];if(action==='status')return send(res,await artifacts.status(pid,aid,parentOrigin,origin));if(req.method!=='POST')throw httpError('需要 POST',405);if(action==='start')return send(res,await artifacts.start(pid,aid,parentOrigin,origin));if(action==='persist')return send(res,await artifacts.persist(pid,aid,parentOrigin,origin));if(action==='stop'){await artifacts.halt(pid,aid);return send(res,{running:false});}if(action==='snapshot')return send(res,await artifacts.snapshot(pid,aid));if(action==='restore')return send(res,await artifacts.restore(pid,aid,(await readBody()).snapshotId));if(action==='annotations'){const input=await readBody();if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);await artifacts.lookup(pid,aid);if(!input.text?.trim()||!input.requestId)throw httpError('需要批注文本及 requestId');let annotation=state.annotations.find(a=>a.requestId===input.requestId);if(!annotation){const annotationId=randomUUID();const anchor=await saveAnchorEvidence(project,annotationId,input.anchor||{});annotation={id:annotationId,requestId:input.requestId,artifactId:aid,text:input.text.trim(),anchor,anchorStatus:'attached',status:'open',createdAt:new Date().toISOString()};await store.mutate(pid,'annotation.created',s=>{if(!s.annotations.some(a=>a.requestId===input.requestId))s.annotations.push(annotation);else annotation=s.annotations.find(a=>a.requestId===input.requestId);});}const run=await queue.submit(pid,{...input,artifactId:aid,annotationId:annotation.id,queueId:'artifact:'+aid,hostId});return send(res,{annotation,run},201);}}
     const evidence=/^\/annotations\/([^/]+)\/evidence$/.exec(tail);if(evidence&&req.method==='GET'&&artifactHostOf(project)&&artifactHostOf(project)!==hostId&&!req.headers['x-studio-hop'])return hosts.proxy(await filesOnline(artifactHostOf(project),origin),req,res,pathname);if(evidence&&req.method==='GET'){const annotation=state.annotations.find(a=>a.id===evidence[1]);if(!annotation)throw httpError('批注不存在',404);return sendImage(res,await readAnchorEvidence(project,annotation));}
     const ann=/^\/annotations\/([^/]+)$/.exec(tail);if(ann&&req.method==='PATCH'){const input=await readBody();let result;await store.mutate(pid,'annotation.updated',s=>{const a=s.annotations.find(a=>a.id===ann[1]);if(!a)throw httpError('批注不存在',404);if(input.status){if(!['open','resolved'].includes(input.status))throw httpError('无效状态');a.status=input.status;}if(input.anchorStatus){if(!['attached','orphaned','unlocated'].includes(input.anchorStatus))throw httpError('无效锚点状态');a.anchorStatus=input.anchorStatus;}result=a;});return send(res,result);}
     throw httpError('接口不存在',404);
   }
-  const server=http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)send(res,{error:e.message},e.status||400);else res.end();}));const port=options.port??Number(process.env.STUDIO_PORT||DEFAULT_PORT);try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,bind,resolve)});if(tailnet)await tailnet.forwarder.expose(server.address().port);await queue.init();}catch(error){unsubscribe();await queue.close();await artifacts.close();if(server.listening)await new Promise(r=>server.close(r));throw error;}
+  const server=http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)send(res,{error:e.message,...(e.status&&typeof e.code==='string'?{code:e.code}:{})},e.status||400);else res.end();}));const port=options.port??Number(process.env.STUDIO_PORT||DEFAULT_PORT);try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,bind,resolve)});if(tailnet)await tailnet.forwarder.expose(server.address().port);await queue.init();artifacts.resumePersistent().catch(error=>console.error('常驻 Artifact 恢复失败：',error.message));}catch(error){unsubscribe();await queue.close();await artifacts.close();if(server.listening)await new Promise(r=>server.close(r));throw error;}
   let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{await purger.reconcile().catch(e=>{purger.lastError=e.message;});const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;for(const h of peers)try{await hosts.syncIndex(peerIndex,h);}catch(e){hosts.lastSyncError=e.message;}const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
   // Projects soft-deleted before hard deletion existed are removed once, after startup.
   const legacyPurge=purger.reconcile({legacy:true}).catch(e=>{purger.lastError=e.message;console.error('Project purge failed: '+e.message);});
-  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await new Promise(r=>server.close(r));}};
+  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);for(const timer of editCommits.values())clearTimeout(timer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await devices?.close();await new Promise(r=>server.close(r));}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Studiolo — Quiet S</title>
+  <desc id="desc">A continuous pale green S with rounded turns and a separate full stop on OLED black.</desc>
+  <rect width="1024" height="1024" fill="#050606"/>
+  <path d="M592 256H392C312 256 248 320 248 400C248 458 294 504 352 504H472C556 504 624 570 624 648C624 728 560 792 480 792H248" fill="none" stroke="#B8ED86" stroke-width="104" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="792" cy="792" r="52" fill="#B8ED86"/>
+</svg>

@@ -1,10 +1,15 @@
 // A failed connection (server restarting, network gone) reads as a plain sentence, not "Failed to fetch".
 const unreachable = error => Object.assign(new Error('无法连接服务器，它可能正在重启；请稍后重试'), { status: 0, cause: error });
 export async function api(path, options = {}) {
-  const headers = { ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...options.headers };
-  const response = await fetch(path, { ...options, headers, body: options.body === undefined ? undefined : JSON.stringify(options.body) }).catch(error => { if (error.name === 'AbortError' || error.name === 'TimeoutError') throw error; throw unreachable(error); });
+  const { renew = true, ...request } = options;
+  const headers = { ...(request.body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...request.headers };
+  const response = await fetch(path, { ...request, headers, body: request.body === undefined ? undefined : JSON.stringify(request.body) }).catch(error => { if (error.name === 'AbortError' || error.name === 'TimeoutError') throw error; throw unreachable(error); });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) { const error = new Error(data.error || `HTTP ${response.status}`); error.status = response.status; throw error; }
+  if (!response.ok) {
+    // Device allowlist: a session lost to a server restart is renewed once with this device's own secret.
+    if (response.status === 401 && data.code === 'device' && renew && path !== '/api/device/login') { const { login } = await import('./device.js'); const result = await login().catch(() => null); if (result?.status === 'approved') return api(path, { ...options, renew: false }); }
+    const error = new Error(data.error || `HTTP ${response.status}`); error.status = response.status; error.data = data; if (data.code) error.code = data.code; throw error;
+  }
   return data;
 }
 export const post = (path, body = {}) => api(path, { method: 'POST', body });

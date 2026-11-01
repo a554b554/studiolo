@@ -2,10 +2,11 @@ import {httpError} from './paths.mjs';
 import {journalDigest} from './journal.mjs';
 
 export class Hosts {
-  constructor({machine,publicUrl,profiles,files=null}) {Object.assign(this,{machine,publicUrl,profiles,files});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
-  async request(host,url,{method='GET',data,timeout=5000,headers={}}={}){
+  constructor({machine,version=null,publicUrl,profiles,files=null}) {Object.assign(this,{machine,version,publicUrl,profiles,files});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
+  // `raw` sends bytes as they are (a recording forwarded for transcription) with headers['Content-Type'].
+  async request(host,url,{method='GET',data,raw,timeout=5000,headers={}}={}){
     try{
-      const response=await fetch(new URL(url,host.url),{method,headers:{...headers,...(host.token?{Authorization:'Bearer '+host.token}:{}),'X-Studio-Hop':'1',...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined,signal:AbortSignal.timeout(timeout),redirect:'error'});
+      const response=await fetch(new URL(url,host.url),{method,headers:{...headers,...(host.token?{Authorization:'Bearer '+host.token}:{}),'X-Studio-Hop':'1',...(data?{'Content-Type':'application/json'}:{})},body:raw??(data?JSON.stringify(data):undefined),signal:AbortSignal.timeout(timeout),redirect:'error'});
       const result=await response.json();if(!response.ok)throw httpError(result.error||'Remote request failed',response.status);return result;
     }catch(e){if(e.status)throw e;throw httpError(`${host.name||host.id}: server unavailable`,503);}
   }
@@ -16,13 +17,13 @@ export class Hosts {
       // Peers come from machine.json alone (registered in Settings, mutually through /api/peer/hello).
       const candidates=new Map((this.machine.hosts||[]).map(h=>[h.id,h]));
       candidates.delete(this.machine.hostId);
-      const remote=await Promise.all([...candidates.values()].map(async h=>{try{const info=await this.request(h,'/api/identity');return info.protocol===2&&info.hostId===h.id?{...h,profiles:info.profiles,files:info.files||null}:null;}catch{return null;}}));
-      const hosts=[{id:this.machine.hostId,name:this.machine.name,local:true,url:this.publicUrl||origin,profiles:await this.profiles(),files:this.files},...remote.filter(Boolean)];
+      const remote=await Promise.all([...candidates.values()].map(async h=>{try{const info=await this.request(h,'/api/identity');return info.protocol===2&&info.hostId===h.id?{...h,version:info.version||null,profiles:info.profiles,files:info.files||null,transcribe:info.transcribe===true}:null;}catch{return null;}}));
+      const hosts=[{id:this.machine.hostId,name:this.machine.name,local:true,version:this.version,url:this.publicUrl||origin,profiles:await this.profiles(),files:this.files},...remote.filter(Boolean)];
       this.cache={at:Date.now(),hosts};return hosts;
     })();try{return await this.inflight;}finally{this.inflight=null;}
   }
-  // Every registered peer with its last probe result, for the Settings list (offline ones included).
-  async configured(origin){const online=new Set((await this.online(origin)).map(h=>h.id));return (this.machine.hosts||[]).map(({token,...h})=>({...h,online:online.has(h.id)}));}
+  // Every registered peer with its last probe result and release, for the Settings list (offline ones included).
+  async configured(origin){const online=new Map((await this.online(origin)).map(h=>[h.id,h]));return (this.machine.hosts||[]).map(({token,...h})=>({...h,online:online.has(h.id),version:online.get(h.id)?.version||null}));}
   async get(id,origin){const h=(await this.online(origin)).find(h=>h.id===id);if(!h)throw httpError('Conversation machine is offline or not yet upgraded. It cannot be changed; create another conversation to use an online machine.',503);return h;}
   visible(hosts){return hosts.map(({token,...h})=>h);}
   // Journals are exchanged every few seconds for every project and peer. While both sides

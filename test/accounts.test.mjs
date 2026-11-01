@@ -44,7 +44,7 @@ if(args[0]==='app-server'){
 }else{
   let model='claude-opus-5-5';const key=env.ANTHROPIC_API_KEY;
   r.on('line',l=>{const e=JSON.parse(l);if(e.type!=='control_request')return;const q=e.request;const reply=response=>send({type:'control_response',response:{request_id:e.request_id,subtype:'success',response}});
-    if(q.subtype==='initialize')return reply({commands:[{name:'compact',description:'Compact'}],models:[{value:'default',displayName:'Default'},{value:'opus',displayName:'Opus 5.5'},{value:'haiku',displayName:'Haiku 5.5'},{value:'claude-haiku-4-5-20251001',displayName:'Haiku 4.5'}],account:key==='sk-ant-good'?{email:'claude@example.com',subscriptionType:null,apiKeySource:'ANTHROPIC_API_KEY',apiProvider:'firstParty'}:{tokenSource:'none'}});
+    if(q.subtype==='initialize')return reply({commands:[{name:'compact',description:'Compact'}],models:[{value:'default',displayName:'Default'},{value:'opus',displayName:'Opus 5.5'},{value:'haiku',displayName:'Haiku'},{value:'claude-haiku-4-5-20251001',displayName:'Haiku 4.5'}],account:key==='sk-ant-good'?{email:'claude@example.com',subscriptionType:null,apiKeySource:'ANTHROPIC_API_KEY',apiProvider:'firstParty'}:{tokenSource:'none'}});
     if(q.subtype==='set_model'){model=q.model==='opus'?'claude-opus-5-5[1m]':q.model==='haiku'?'claude-haiku-5-5':q.model;return reply({});}
     if(q.subtype==='get_settings')return reply({applied:{model,effort:'medium'}});
     reply({});
@@ -156,6 +156,9 @@ test('API keys: Codex stores through its CLI, Claude keeps a file; bad keys are 
   await assert.rejects(f.login.start(claude.id,{apiKey:'sk-ant-bad'}),e=>e.message==='api_key_rejected');
   assert.equal(await f.accounts.readKey(claude.id),null,'a rejected key is not kept');
   assert.equal((await f.accounts.get(claude.id)).status,'signed_out');
+  // The Models API adds what the CLI leaves out for key accounts, with display names.
+  const realFetch=globalThis.fetch;t.after(()=>{globalThis.fetch=realFetch;});
+  globalThis.fetch=async(url,init)=>{assert.equal(new URL(url).pathname,'/v1/models');assert.equal(init.headers['x-api-key'],'sk-ant-good');return new Response(JSON.stringify({data:[{id:'claude-opus-5-5',display_name:'Claude Opus 5.5'},{id:'claude-opus-4-6',display_name:'Claude Opus 4.6'}],has_more:false}),{status:200});};
   await f.login.start(claude.id,{apiKey:'sk-ant-good'});
   const account=await f.accounts.get(claude.id);
   assert.equal(account.status,'signed_in');assert.equal(account.identity.email,'claude@example.com');
@@ -166,8 +169,8 @@ test('API keys: Codex stores through its CLI, Claude keeps a file; bad keys are 
   assert.equal((await f.accounts.get(named.id)).label,'Work key');
   await f.accounts.update(claude.id,{label:'Personal'});await f.login.refresh(claude.id);
   assert.equal((await f.accounts.get(claude.id)).label,'Personal');
-  assert.deepEqual(account.models.map(m=>[m.id,m.label,m.alias]),[['claude-opus-5-5','Opus 5.5','opus'],['claude-haiku-5-5','Haiku 5.5','haiku'],['claude-haiku-4-5-20251001','Haiku 4.5',undefined]],'aliases resolve to concrete ids; default is skipped');
-  assert.deepEqual(account.models.map(m=>m.efforts.length),[5,5,0]);
+  assert.deepEqual(account.models.map(m=>[m.id,m.label,m.alias]),[['claude-opus-5-5','Opus 5.5','opus'],['claude-haiku-5-5','Haiku 5.5','haiku'],['claude-haiku-4-5-20251001','Haiku 4.5',undefined],['claude-opus-4-6','Opus 4.6',undefined]],'aliases resolve to concrete ids, versionless labels gain the version, the Models API adds the rest; default is skipped');
+  assert.deepEqual(account.models.map(m=>m.efforts.length),[5,5,0,5]);
   assert.deepEqual(account.commands,[{name:'compact',hint:null,description:'Compact'}]);
   assert.equal(await f.accounts.readKey(claude.id),'sk-ant-good');
   assert.equal((await f.runner.configuration())[claude.id].env.ANTHROPIC_API_KEY,'sk-ant-good','the runner sees the key without waiting for its cache to expire');

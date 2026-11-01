@@ -5,22 +5,31 @@ import {promisify} from 'node:util';
 const execute=promisify(execFile);
 
 // Machine-local opt-in. Never sync credentials or overwrite another Serve endpoint.
+// `deviceAllowlist: true` (README「设备白名单」) makes the tailnet carry connections only: every
+// browser or app must be approved as a device, and hosts reach each other with the peer token in
+// access-token.txt, which no device ever receives.
 export async function loadTailnet(stateDir) {
   let config;
   try { config=JSON.parse(await fs.readFile(path.join(stateDir,'tailnet.json'),'utf8')); }
   catch(e) { if(e.code==='ENOENT')return null; throw new Error('Cannot read tailnet.json: '+e.message); }
   if(!config.enabled)return null;
   const forwarder=new TailnetForwarder({command:config.command});
+  const deviceAllowlist=config.deviceAllowlist===true;
+  const readToken=async()=>{
+    let token;
+    try { token=(await fs.readFile(path.join(stateDir,'access-token.txt'),'utf8')).trim(); }
+    catch(e) { if(e.code!=='ENOENT')throw e; throw new Error(deviceAllowlist?'The device allowlist needs access-token.txt, the peer token hosts use for each other':'access-token.txt is missing'); }
+    if(token.length<32)throw new Error('Tailnet access token must contain at least 32 characters');
+    return token;
+  };
   if(config.trustTailnet===true){
     const status=JSON.parse(await forwarder.run(['status','--json']));
     if(status.BackendState!=='Running'||!status.Self?.DNSName)throw new Error('Tailscale must be connected before starting trusted tailnet access');
     const dns=status.Self.DNSName.replace(/\.$/,'').toLowerCase();
     const trustedHosts=new Set([dns,dns.split('.')[0],...(status.Self.TailscaleIPs||[]).map(ip=>ip.includes(':')?`[${ip}]`:ip)]);
-    return {token:'',trustedHosts,forwarder,dnsName:dns,name:status.Self.HostName};
+    return {token:deviceAllowlist?await readToken():'',trustedHosts,forwarder,dnsName:dns,name:status.Self.HostName,deviceAllowlist};
   }
-  const token=(await fs.readFile(path.join(stateDir,'access-token.txt'),'utf8')).trim();
-  if(token.length<32)throw new Error('Tailnet access token must contain at least 32 characters');
-  return {token,forwarder};
+  return {token:await readToken(),forwarder,deviceAllowlist};
 }
 
 export class TailnetForwarder {
@@ -41,6 +50,15 @@ export class TailnetForwarder {
       await this.run(['serve','--bg',`--tcp=${port}`,`tcp://${target}`]);
       const verified=JSON.parse(await this.run(['serve','status','--json']));
       if(verified.TCP?.[port]?.TCPForward!==target)throw new Error(`Tailscale forwarding verification failed for ${port}`);
+    });
+    this.tail=work;return work;
+  }
+  // Removes a forward this class made (a persistent Artifact that stopped); any other Serve entry stays.
+  async unexpose(port) {
+    const work=this.tail.catch(()=>{}).then(async()=>{
+      const config=JSON.parse(await this.run(['serve','status','--json']));
+      if(config.TCP?.[port]?.TCPForward!==`127.0.0.1:${port}`)return;
+      await this.run(['serve',`--tcp=${port}`,'off']);
     });
     this.tail=work;return work;
   }

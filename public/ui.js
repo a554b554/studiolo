@@ -1,5 +1,6 @@
 import { t, getLanguage, onLanguageChange } from './i18n.js';
 import { api, post } from './api.js';
+import { ensureDevice } from './device.js';
 import { conversationItems, runNotice, agentLabel, accountName, familyName, modelName } from './conversation.js';
 import { markdown } from './markdown.js';
 import {supportsAuto,validateModelPermission} from './model-permissions.js';
@@ -270,6 +271,8 @@ export function mergeRuntime(state, live, hostId) {
 }
 export const $ = (selector, root = document) => root.querySelector(selector);
 export function node(tag, className, text) { const el = document.createElement(tag); if (className) el.className = className; if (text !== undefined) el.textContent = text; return el; }
+// An icon from the sprite in index.html (<symbol id="i-…">).
+export function icon(name, className = 'i i-sm') { const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('class', className); svg.setAttribute('aria-hidden', 'true'); const use = document.createElementNS('http://www.w3.org/2000/svg', 'use'); use.setAttribute('href', '#' + name); svg.append(use); return svg; }
 export function button(text, action, className = '') { const el = node('button', className, text); el.type = 'button'; el.addEventListener('click', action); return el; }
 export function showError(error) { const panel = $('#notice'); if (!panel) return; panel.textContent = t(error.message || String(error)); panel.hidden = false; }
 export function clearError() { const panel = $('#notice'); if (panel) panel.hidden = true; }
@@ -298,12 +301,14 @@ export function messageContent(message, className = 'message-body') {
 export function showDialog(id) { const el = $(id); if (!el.open) el.showModal(); }
 export function initDialogs() {
   document.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', () => el.closest('dialog').close()));
-  document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog && (event.clientX < dialog.getBoundingClientRect().left || event.clientX > dialog.getBoundingClientRect().right || event.clientY < dialog.getBoundingClientRect().top || event.clientY > dialog.getBoundingClientRect().bottom)) dialog.close(); }));
+  document.querySelectorAll('dialog:not([data-persistent])').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog && (event.clientX < dialog.getBoundingClientRect().left || event.clientX > dialog.getBoundingClientRect().right || event.clientY < dialog.getBoundingClientRect().top || event.clientY > dialog.getBoundingClientRect().bottom)) dialog.close(); }));
 }
 export async function bootstrap() {
   try { return await api('/api/bootstrap'); }
   catch (error) {
     if (error.status !== 401 && error.status !== 403) throw error;
+    // Device allowlist: wait on the approval page, then load as the approved device.
+    if (error.code === 'device') { await ensureDevice(); return api('/api/bootstrap'); }
     const dialog = $('#auth-dialog'); if (!dialog) throw error;
     showDialog('#auth-dialog');
     return new Promise(resolve => {

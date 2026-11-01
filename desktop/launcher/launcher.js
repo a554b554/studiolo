@@ -16,9 +16,12 @@ async function probe(url) {
     return info.protocol === 2 && info.hostId ? info : null;
   } catch { return null; }
 }
-function open(server) {
+async function open(server) {
   opened = true;
   localStorage.setItem(LAST, server.url);
+  // The microphone works over plain http only for servers the client trusts from its start
+  // (src-tauri/src/lib.rs); for a new one it restarts and this page opens the server again.
+  if (await window.__TAURI__?.core?.invoke('trust_origins', { origins: servers.map(s => s.url) }).catch(() => false)) return;
   location.replace(server.url);
 }
 function render() {
@@ -29,7 +32,7 @@ function render() {
     const dot = document.createElement('span'); dot.className = 'dot' + (info ? ' online' : ''); dot.title = info ? '在线' : status.has(server.url) ? '离线' : '检查中';
     const who = document.createElement('div'); who.className = 'who';
     const name = document.createElement('strong'); name.textContent = info?.name || server.name || server.url;
-    const address = document.createElement('span'); address.textContent = server.url + (info || !status.has(server.url) ? '' : ' · 离线');
+    const address = document.createElement('span'); address.textContent = server.url + (info ? info.version ? ` · ${info.version}` : '' : status.has(server.url) ? ' · 离线' : '');
     who.append(name, address);
     const go = document.createElement('button'); go.className = 'primary'; go.textContent = '打开'; go.disabled = !info; go.onclick = () => open(server);
     const remove = document.createElement('button'); remove.className = 'quiet'; remove.textContent = '移除'; remove.setAttribute('aria-label', `移除 ${server.url}`);
@@ -69,5 +72,6 @@ $('#add').addEventListener('submit', async event => {
   $('#url').value = ''; render();
 });
 
+window.__TAURI__?.app?.getVersion?.().then(version => { $('#client-version').textContent = `Studiolo 桌面客户端 ${version}`; }).catch(() => {});
 render(); refresh();
 setInterval(() => { if (!opened) refresh(); }, 4000);
