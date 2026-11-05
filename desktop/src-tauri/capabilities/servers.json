@@ -1,10 +1,31 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "servers",
-  "description": "Studiolo servers opened in the main window may only show notifications (public/notify.js) and read the client's version (Settings → 版本).",
-  "windows": ["main"],
+  "description": "Studiolo servers opened in the main window may show notifications (public/notify.js), read the client's version and build (Settings → 版本), record from the microphone for voice input (src/recorder.rs), name the Studiolo servers, choose where their windows open and open links (src/lib.rs, Links) and update the client.",
+  "windows": [
+    "main",
+    "view-*"
+  ],
   "remote": {
-    "urls": ["http://*", "https://*", "http://*:*", "https://*:*"]
+    "urls": [
+      "http://*",
+      "https://*",
+      "http://*:*",
+      "https://*:*"
+    ]
   },
-  "permissions": ["notification:default", "core:app:allow-version"]
+  "permissions": [
+    "notification:default",
+    "core:app:allow-version",
+    "allow-start-recording",
+    "allow-start-streaming",
+    "allow-stop-recording",
+    "allow-cancel-recording",
+    "allow-client-build",
+    "allow-known-servers",
+    "allow-link-mode",
+    "allow-set-link-mode",
+    "allow-open-link",
+    "allow-update-client"
+  ]
 }

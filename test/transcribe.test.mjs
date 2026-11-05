@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import {OpenAITranscriber,OPENAI_TRANSCRIBE_URL,DEFAULT_KEYWORDS,mask,audioFormat,transcribeOptions} from '../src/transcribe.mjs';
+import {OpenAITranscriber,OPENAI_TRANSCRIBE_URL,REALTIME_SECRET_URL,REALTIME_URL,DEFAULT_KEYWORDS,mask,audioFormat,transcribeOptions} from '../src/transcribe.mjs';
 import {createStudio} from '../src/server.mjs';
 
 const b64=obj=>Buffer.from(JSON.stringify(obj)).toString('base64url');
@@ -119,7 +119,7 @@ test('the OpenAI key file turns the route, the microphone and features.transcrib
  const app=await createStudio({stateDir:state,projectRoot:path.join(dir,'projects'),port:0,previewPort:0,runner,openaiTranscriber:new OpenAITranscriber({keyFile:path.join(state,'openai-api-key.txt'),fetch:f.fetch})});
  t.after(async()=>{await app.close();await fs.rm(dir,{recursive:true,force:true});});
  const base=`http://127.0.0.1:${app.port}`;
- const features=async()=>(await (await fetch(`${base}/api/bootstrap`)).json()).features;
+ const features=async()=>{const {reveal,...rest}=(await (await fetch(`${base}/api/bootstrap`)).json()).features;return rest;};
  const post=()=>fetch(`${base}/api/transcribe?keyword=Demo`,{method:'POST',headers:{'Content-Type':'audio/mp4'},body:'x'.repeat(40)});
  assert.deepEqual(await features(),{voiceInput:false,transcribe:false,deviceAllowlist:false});
  assert.equal((await post()).status,503);
@@ -149,4 +149,41 @@ test('Settings → 语音转写 keeps one key on one machine, and every other se
  assert.equal((await b.api('/api/settings/transcription')).hostId,a.app.hostId,'B now sends recordings to A');
  await b.api('/api/settings/transcription','DELETE');
  assert.equal((await a.api('/api/settings/transcription')).hostId,null);
+});
+
+test('live dictation mints a short-lived realtime transcription secret with the same hints',async t=>{
+ const {transcriber,calls}=await makeOpenAI(t,[reply(200,{value:'ek_live_secret_123456',expires_at:1793552528,session:{type:'transcription'}})]);
+ assert.deepEqual(await transcriber.realtimeSecret({keywords:['我的项目','Studiolo']}),{value:'ek_live_secret_123456',expiresAt:1793552528,url:REALTIME_URL,model:'gpt-live-transcribe'});
+ const {url,init,headers}=calls[0],sent=JSON.parse(init.body);
+ assert.equal(url,REALTIME_SECRET_URL);assert.equal(init.method,'POST');assert.equal(headers.Authorization,`Bearer ${OPENAI_KEY}`);
+ assert.deepEqual(sent.expires_after,{anchor:'created_at',seconds:120});
+ assert.equal(sent.session.type,'transcription');
+ const input=sent.session.audio.input;
+ assert.deepEqual(input.format,{type:'audio/pcm',rate:24000});assert.equal(input.turn_detection,null,'the page commits at pauses');
+ assert.equal(input.transcription.model,'gpt-live-transcribe');assert.deepEqual(input.transcription.languages,['zh','en']);assert.match(input.transcription.prompt,/中英夹杂/);
+ assert.deepEqual(input.transcription.keywords,[...DEFAULT_KEYWORDS,'我的项目']);
+ assert.equal(mask('token ek_live_secret_123456'),'token ek_…');
+ const missing=await makeOpenAI(t,[],{content:null});await assert.rejects(missing.transcriber.realtimeSecret(),e=>e.status===503);
+ const bad=await makeOpenAI(t,[reply(401,{error:{message:`Incorrect API key provided: ${OPENAI_KEY}`}})]);
+ await assert.rejects(bad.transcriber.realtimeSecret(),e=>e.status===502&&!e.message.includes(OPENAI_KEY));
+ const flaky=await makeOpenAI(t,[reply(502,''),reply(200,{value:'ek_ok_secret_abcdef'})]);
+ assert.equal((await flaky.transcriber.realtimeSecret()).value,'ek_ok_secret_abcdef');assert.deepEqual(flaky.delays,[500]);
+ const empty=await makeOpenAI(t,[reply(200,{})]);await assert.rejects(empty.transcriber.realtimeSecret(),e=>e.status===502);
+});
+
+test('POST /api/transcribe/realtime signs locally or on the machine with the key',async t=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'studio-transcribe-realtime-'));const apps=[];
+ t.after(async()=>{for(const app of apps)await app.close().catch(()=>{});await fs.rm(root,{recursive:true,force:true});});
+ const seen=[];
+ const openai=async(url,init)=>{if(String(url).endsWith('/v1/models'))return reply(200,{data:[]});seen.push(JSON.parse(init.body));return reply(200,{value:'ek_from_b_secret_000',expires_at:1});};
+ const make=async label=>{const state=path.join(root,label,'state');const app=await createStudio({stateDir:state,projectRoot:path.join(root,label,'projects'),port:0,previewPort:0,runner,openaiTranscriber:new OpenAITranscriber({keyFile:path.join(state,'openai-api-key.txt'),fetch:openai})});apps.push(app);return {app,base:`http://127.0.0.1:${app.port}`};};
+ const a=await make('A'),b=await make('B');
+ const ask=base=>fetch(`${base}/api/transcribe/realtime?keyword=Demo`,{method:'POST'});
+ assert.equal((await ask(a.base)).status,503,'no key anywhere');
+ await fetch(`${a.base}/api/hosts`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.base})});
+ await fetch(`${a.base}/api/settings/transcription`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({hostId:b.app.hostId,apiKey:'sk-test-'+'k'.repeat(30)})});
+ const forwarded=await ask(a.base);assert.equal(forwarded.status,200);
+ assert.deepEqual(await forwarded.json(),{value:'ek_from_b_secret_000',expiresAt:1,url:REALTIME_URL,model:'gpt-live-transcribe'});
+ assert.ok(seen[0].session.audio.input.transcription.keywords.includes('Demo'),'keywords travel with the forward');
+ assert.equal((await ask(b.base)).status,200);
 });

@@ -2,7 +2,7 @@ import {httpError} from './paths.mjs';
 import {journalDigest} from './journal.mjs';
 
 export class Hosts {
-  constructor({machine,version=null,publicUrl,profiles,files=null}) {Object.assign(this,{machine,version,publicUrl,profiles,files});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
+  constructor({machine,version=null,publicUrl,profiles,files=null,onlineDeadline=8000}) {Object.assign(this,{machine,version,publicUrl,profiles,files,onlineDeadline});this.cache=null;this.inflight=null;this.syncing=new Map();this.digests=new Map();}
   // `raw` sends bytes as they are (a recording forwarded for transcription) with headers['Content-Type'].
   async request(host,url,{method='GET',data,raw,timeout=5000,headers={}}={}){
     try{
@@ -13,14 +13,21 @@ export class Hosts {
   async online(origin){
     if(this.cache&&Date.now()-this.cache.at<4000)return this.cache.hosts;
     if(this.inflight)return this.inflight;
-    this.inflight=(async()=>{
+    const probe=(async()=>{
       // Peers come from machine.json alone (registered in Settings, mutually through /api/peer/hello).
       const candidates=new Map((this.machine.hosts||[]).map(h=>[h.id,h]));
       candidates.delete(this.machine.hostId);
       const remote=await Promise.all([...candidates.values()].map(async h=>{try{const info=await this.request(h,'/api/identity');return info.protocol===2&&info.hostId===h.id?{...h,version:info.version||null,profiles:info.profiles,files:info.files||null,transcribe:info.transcribe===true}:null;}catch{return null;}}));
       const hosts=[{id:this.machine.hostId,name:this.machine.name,local:true,version:this.version,url:this.publicUrl||origin,profiles:await this.profiles(),files:this.files},...remote.filter(Boolean)];
       this.cache={at:Date.now(),hosts};return hosts;
-    })();try{return await this.inflight;}finally{this.inflight=null;}
+    })();
+    // Every caller shares this probe, and almost every page request waits on it. One that never
+    // settles once froze the whole server (2026-11-01: project views, sends and the host list hung
+    // while /api/identity still answered), so past the deadline callers get the last known hosts,
+    // or this machine alone, and the next call probes again.
+    let timer;const deadline=new Promise(resolve=>{timer=setTimeout(()=>resolve(this.cache?.hosts||[{id:this.machine.hostId,name:this.machine.name,local:true,version:this.version,url:this.publicUrl||origin,profiles:[],files:this.files}]),this.onlineDeadline);});
+    this.inflight=Promise.race([probe,deadline]).finally(()=>{clearTimeout(timer);this.inflight=null;});
+    return this.inflight;
   }
   // Every registered peer with its last probe result and release, for the Settings list (offline ones included).
   async configured(origin){const online=new Map((await this.online(origin)).map(h=>[h.id,h]));return (this.machine.hosts||[]).map(({token,...h})=>({...h,online:online.has(h.id),version:online.get(h.id)?.version||null}));}

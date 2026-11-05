@@ -54,7 +54,7 @@ Studiolo is a self-hosted web workbench that drives the **Claude Code** and **Co
 - **A workbench, not just a chat.** Collapsible, resizable side panels; files and Artifacts open as tabs beside the conversation; files are edited in place with autosave and conflict detection; conversations group into categories, and forks nest under the conversation they came from.
 - **Desktop client.** A small Tauri app for Windows and macOS lists your servers, opens their UI in a window, sits in the tray and shows a notification when a conversation finishes.
 - **Artifacts and in-page comments.** Web apps the agents build run as Artifacts with persistent backends and preview storage kept in the project; select something in the preview and send it to an agent as a task. An Artifact can also run *persistent*: as its own server that keeps running when Studiolo stops.
-- **Voice input.** Hold the microphone button to dictate into the composer. One machine keeps an OpenAI API key, and every server forwards its recordings there.
+- **Voice input.** Tap the microphone and the words appear in the composer as you speak (OpenAI realtime transcription). One machine keeps an OpenAI API key, and every other server forwards to it.
 
 ---
 
@@ -103,6 +103,8 @@ Permission requests that the CLI would ask in the terminal appear in the page: a
 
 While a turn runs, the conversation shows the work the way the CLIs do: what the agent says between steps stays in full, consecutive tool calls fold into one line you can open, and the step in progress and the elapsed time stay in view; when the reply arrives, the whole run folds into its raw log. A message you send appears at once and is delivered in the background (a failed send offers retry). In the sidebar a spinner marks conversations and projects that are working, and a dot marks results you have not seen yet.
 
+Every conversation lives in a project: the sidebar's main button creates a project, and a project's ＋ (or `/new`) starts a conversation in it. The page loads one conversation at a time. Tool records of finished runs arrive as short previews, and the full record loads when you open a raw log. Long conversations show their most recent part; 「显示更早的内容」 or scrolling to the top shows more. Recently opened conversations show at once while a fresh copy loads. In the Files panel, right-click a file or folder to show it in File Explorer or Finder; this works only for a page opened on the same machine as the server that holds the files (`127.0.0.1` or `localhost`).
+
 ---
 
 ## Subagents and account routing
@@ -137,7 +139,9 @@ Run the same server on every computer and register the servers with each other o
 
 ## Desktop client
 
-`desktop/` is a Tauri 2 app for Windows and macOS. Its launcher page keeps a list of servers and checks each one's `/api/identity`; opening a server loads that server's own web UI in the window, so UI changes ship with the server, not the client. The app adds a tray menu (show, switch server, start at login, quit), close-to-tray, a single instance and native notifications. If the server it shows stops answering, a banner offers the other known servers. Build instructions are in [desktop/README.md](desktop/README.md). On macOS, plain-HTTP connections to other machines are allowed only to `*.ts.net` (Tailscale) names; any other remote server needs HTTPS. Browsers allow the microphone only on HTTPS or 127.0.0.1; the Windows client treats every server in its list as secure, so voice input works over plain HTTP on the tailnet too (the first time a server is opened, the client restarts once to apply this).
+`desktop/` is a Tauri 2 app for Windows and macOS. Its launcher page keeps a list of servers and checks each one's `/api/identity`; opening a server loads that server's own web UI in the window, so UI changes ship with the server, not the client. The app adds a tray menu (show, switch server, start at login, quit), close-to-tray, a single instance and native notifications. If the server it shows stops answering, a banner offers the other known servers. Build instructions are in [desktop/README.md](desktop/README.md). On macOS, plain-HTTP connections to other machines are allowed only to `*.ts.net` (Tailscale) names; any other remote server needs HTTPS. Browsers allow the microphone only on HTTPS or 127.0.0.1; the Windows client treats every server in its list as secure, so voice input works over plain HTTP on the tailnet too (the first time a server is opened, the client restarts once to apply this). The Mac client records natively when a page has no microphone of its own.
+
+The client updates itself: Settings → 版本 shows 「更新客户端」 when the server it shows offers a newer signed build in its `desktop/dist` (see [desktop/README.md](desktop/README.md), *Updates*). Links open in the default browser, signed in with a one-time ticket; Settings → 版本 can keep Artifact windows and other servers' pages in client windows instead.
 
 ---
 
@@ -156,7 +160,7 @@ Ask an agent for a web page or app and it maintains `studio.artifacts.json` at t
 
 Static pages omit `command`, `port` and `dataPaths`. Each Artifact gets its own persistent preview port and origin; the preview's `localStorage` is persisted into the project, so a game saved on one machine continues on any machine that holds the project's files. Backends run as plain local processes (not a sandbox) with `PORT` and `HOST`; **Snapshot** stops the backend and copies the declared data paths, **Restore** puts them back.
 
-In the preview, *select an element, text or a canvas region* and write a comment: it becomes a task for the agent you pick, with the selection as evidence (DOM path, quoted text or a PNG of the canvas). Comments on one Artifact run in order; different Artifacts and conversations run in parallel. See `examples/persistent-game/` (Node backend + SQLite + Canvas) and `examples/artifact-compatibility/`.
+In the preview, *select an element, text or a canvas region* and write a comment: it becomes a task for the agent you pick, with the selection as evidence (DOM path, quoted text or a PNG of the canvas). Each comment thread runs in its own agent session, so comments in different threads run in parallel; replies in one thread queue behind it. Each thread's agent is told that other threads may be editing the same files. Different Artifacts and conversations run in parallel too. See `examples/persistent-game/` (Node backend + SQLite + Canvas) and `examples/artifact-compatibility/`.
 
 Artifacts start and stop from the list in the side panel, and open as a tab beside the chat or in their own window, in edit mode (with comments) or browse mode (the Artifact alone, like any web app).
 
@@ -172,9 +176,11 @@ Artifacts start and stop from the list in the side panel, and open as a tab besi
 
 ## Voice input
 
-The chat composer and the Artifact comment box have a microphone button: hold to talk and release to transcribe, or tap once to start and again to stop. The text lands at the caret and is not sent automatically.
+The chat composer and the Artifact comment box have a microphone button. Tap it and a voice bar replaces the composer's controls: a live waveform, ✕ to cancel (Esc) and ✓ to finish (Enter). The words appear at the caret while you speak and are not sent automatically.
 
 Pick the machine that transcribes and enter an OpenAI API key in Settings → *Voice transcription* (语音转写), then *Verify and save*. Like an account, the key belongs to one machine: it is checked with OpenAI and kept only in that machine's state directory (`openai-api-key.txt`, mode 0600). Choosing another machine removes the key from the previous one, so one machine transcribes at a time. Any server that receives `POST /api/transcribe` without a key of its own forwards the recording there, so every client works whichever server it uses, and the microphone shows as soon as one machine has a key (`features.voiceInput` in `/api/bootstrap`).
+
+**Live transcription.** The page first asks `POST /api/transcribe/realtime` (optional `?keyword=`). The machine with the key exchanges it for a client secret valid for two minutes (session model `gpt-live-transcribe`; set `STUDIO_REALTIME_MODEL` for another), and other servers forward the request there. The page then streams 24 kHz PCM to OpenAI itself and commits a segment at each pause, so neither the key nor the audio passes through another Studiolo server. Without a secure context (the Mac client on a plain-HTTP tailnet page) the client records natively and streams through a Tauri channel. If no secret can be had or the connection drops, the audio not yet transcribed is sent in one piece on ✓ to the endpoint below.
 
 `POST /api/transcribe` takes the raw audio (`audio/webm`, `audio/mp4`, `audio/wav`, `audio/ogg`, …), optional `?duration_ms=` and up to ten repeated `?keyword=`, and returns `{text}`. It uses OpenAI `gpt-transcribe` with Chinese and English hints; set `STUDIO_TRANSCRIBE_MODEL` for another model.
 

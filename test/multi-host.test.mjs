@@ -133,3 +133,16 @@ test('registering a server once lists both ways from machine.json alone; rename,
  await new Promise(resolve=>b.app.server.close(resolve));a.app.hosts.cache=null;
  listed=await a.api('/api/hosts');assert.equal(listed[0].online,false,'an offline server stays listed in Settings');
 });
+
+test('a project view on a server without the files lists an Artifact the file host has just gained',async t=>{
+ const {a,b}=await servers(t);
+ const p=await a.api('/api/projects','POST',{name:'Owner manifest'}),url=`/api/projects/${p.id}`;
+ await wait(async()=>(await b.api('/api/projects')).some(x=>x.id===p.id&&!x.unavailable));
+ assert.deepEqual((await b.api(url)).artifacts,[]);
+ // An agent on A writes the manifest; nobody opens the project on A itself.
+ await fs.mkdir(path.join(p.path,'web'));await fs.writeFile(path.join(p.path,'web/index.html'),'<h1>New</h1>');
+ await fs.writeFile(path.join(p.path,'studio.artifacts.json'),JSON.stringify({artifacts:[{key:'new',name:'New page',root:'web',entry:'index.html'}]}));
+ const view=await b.api(url);
+ assert.deepEqual(view.artifacts.map(x=>x.name),['New page']);assert.equal(view.filesHostId,a.app.hostId);
+ assert.deepEqual((await b.app.store.read(p.id)).artifacts.map(x=>x.name),['New page']);
+});

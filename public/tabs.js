@@ -1,5 +1,5 @@
 import { t, onLanguageChange } from './i18n.js';
-import { api, projectURL } from './api.js';
+import { api, projectURL, signedInClick } from './api.js';
 import { $, node, icon, showError } from './ui.js';
 import { markdown, isMarkdownPath } from './markdown.js';
 // The side pane: files and Artifacts open as tabs next to the chat. Each project has its own tab
@@ -15,7 +15,7 @@ const formatSize = bytes => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFi
 const keyOf = spec => spec.kind === 'artifact' ? `artifact:${spec.artifactId}` : `file:${spec.path}`;
 function loadSets() { try { const value = JSON.parse(localStorage.getItem(STORE) || '{}'); return value && typeof value === 'object' ? value : {}; } catch { return {}; } }
 
-export function initTabs({ panes, artifactName = () => '', artifactRunning = () => false, onActiveChange = () => {} }) {
+export function initTabs({ panes, artifactName = () => '', artifactRunning = () => false, artifactHome = () => null, onActiveChange = () => {} }) {
   const sets = loadSets(), views = new Map();
   let projectId = null;
   const persist = () => { try { localStorage.setItem(STORE, JSON.stringify(sets)); } catch {} };
@@ -148,10 +148,22 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
   }
 
   // ---------- Artifact tab: the Artifact page itself, embedded ----------
+  // An Artifact that runs on another server cannot be framed here (project-hosts.js, artifactHome): the
+  // tab offers that server's windows instead.
   function artifactView(pid, tab) {
     const el = node('div', 'pane-view artifact'), body = node('div', 'art-body'); el.append(body);
     const view = { el, pid, tab, kind: 'artifact', frame: null, paint() {}, check() {}, save() {}, focus() {},
-      mount() { if (view.frame) return; const frame = node('iframe'); frame.title = artifactName(pid, tab.artifactId) || 'Artifact'; frame.src = `/artifact.html?project=${encodeURIComponent(pid)}&artifact=${encodeURIComponent(tab.artifactId)}&embed=1`; view.frame = frame; body.replaceChildren(frame); },
+      mount() {
+        if (view.frame) return;
+        const home = artifactHome(pid), query = `?project=${encodeURIComponent(pid)}&artifact=${encodeURIComponent(tab.artifactId)}`;
+        if (home) {
+          const link = (path, label) => { const a = node('a', 'button', label); a.href = home.url + path + query; a.target = '_blank'; a.rel = 'noopener'; a.addEventListener('click', signedInClick(home.id, a)); return a; };
+          const card = node('div', 'art-remote'), actions = node('div', 'art-remote-actions');
+          actions.append(link('/artifact.html', t('打开（编辑模式）')), link('/open.html', t('打开（仅浏览）')));
+          card.append(node('p', '', t('这个 Artifact 运行在 {host} 上，在那台电脑的页面里打开。', { host: home.name || home.id })), actions);
+          view.frame = card; body.replaceChildren(card); return;
+        }
+        const frame = node('iframe'); frame.title = artifactName(pid, tab.artifactId) || 'Artifact'; frame.src = `/artifact.html?project=${encodeURIComponent(pid)}&artifact=${encodeURIComponent(tab.artifactId)}&embed=1`; view.frame = frame; body.replaceChildren(frame); },
       unmount() { view.frame?.remove(); view.frame = null; },
       reload() { if (view.frame) view.frame.src = view.frame.src; } };
     return view;

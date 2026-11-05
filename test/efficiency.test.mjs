@@ -94,6 +94,20 @@ function peer(store, id, log, { digests = true } = {}) {
   };
 }
 
+test('a host probe that never settles releases every caller at the deadline, and the next call probes again', async () => {
+  let calls = 0, stuck = true;
+  const hosts = new Hosts({ machine: { hostId: 'a', name: 'A', hosts: [] }, onlineDeadline: 50, profiles: () => { calls++; return stuck ? new Promise(() => {}) : Promise.resolve([{ id: 'p' }]); } });
+  const [first, second] = await Promise.all([hosts.online('http://a'), hosts.online('http://a')]);
+  assert.deepEqual(first.map(h => [h.id, h.local, h.profiles.length]), [['a', true, 0]]);
+  assert.equal(second, first); assert.equal(calls, 1, 'concurrent callers share one probe');
+  stuck = false;
+  assert.deepEqual((await hosts.online('http://a'))[0].profiles, [{ id: 'p' }]);
+  assert.equal(calls, 2);
+  // Once known, a later stuck probe falls back to the last good answer, not to an empty machine.
+  hosts.cache.at = 0; stuck = true;
+  assert.deepEqual((await hosts.online('http://a'))[0].profiles, [{ id: 'p' }]);
+});
+
 test('idle peers exchange one digest probe instead of two name lists, and still converge after changes on either side', async t => {
   const { root, a, b, p } = await replicas(t), log = [];
   const hosts = new Hosts({ machine: { hostId: 'a', name: 'A', hosts: [] }, profiles: async () => [] });
@@ -177,7 +191,7 @@ test('repeated large responses are served compressed from the content cache with
   assert.equal(JSON.parse((await rawGet(url, { 'Accept-Encoding': 'identity' })).body.toString('utf8')).project.name, 'changed');
 });
 
-test('the browser merges a runtime view like the server: executing runs replaced, their messages upserted, local native runtime refreshed', async () => {
+test('the browser merges a runtime view like the server: executing runs replaced or added, their messages upserted, local native runtime refreshed', async () => {
   const ui = await fs.readFile(new URL('../public/ui.js', import.meta.url), 'utf8');
   const source = ui.slice(ui.indexOf('export function mergeRuntime('), ui.indexOf('export const $')).replace('export function', 'function');
   const context = {}; vm.createContext(context); vm.runInContext(source + ';this.mergeRuntime=mergeRuntime;', context);
@@ -185,7 +199,8 @@ test('the browser merges a runtime view like the server: executing runs replaced
     nativeRuntime: { 'p:session:s:claude:local': { busy: false }, 'p:session:t:codex:remote': { busy: true } } };
   const live = { runs: [{ id: 'r1', status: 'running', outputSeq: 3 }, { id: 'unknown', status: 'running' }], messages: [{ id: 'm1', runId: 'r1', text: 'ab' }, { id: 'm2', runId: 'r1', text: 'tool' }], nativeRuntime: { 'p:session:u:claude:local': { busy: true } } };
   context.mergeRuntime(state, live, 'local');
-  assert.deepEqual(state.runs, [{ id: 'r1', status: 'running', outputSeq: 3 }, { id: 'r2', status: 'succeeded' }]);
+  // A run the page has not loaded yet comes in with its messages, so they never show without it.
+  assert.deepEqual(state.runs, [{ id: 'r1', status: 'running', outputSeq: 3 }, { id: 'r2', status: 'succeeded' }, { id: 'unknown', status: 'running' }]);
   assert.deepEqual(state.messages.map(m => m.text), ['ab', 'old', 'tool']);
   // Objects built inside the vm realm have another prototype; compare their JSON shape.
   const shape = value => JSON.parse(JSON.stringify(value));

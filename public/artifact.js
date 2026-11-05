@@ -1,16 +1,19 @@
 import { t, getLanguage, onLanguageChange, initLanguage } from './i18n.js';
-import { api, post, projectURL, requestId } from './api.js';
+import { api, post, projectURL, requestId, openSignedIn, signedIn, signedInClick } from './api.js';
 import { initTheme } from './themes.js';
-import { renderMessages, reconcileChildren, mergeRuntime } from './ui.js';
+import { renderMessages, reconcileChildren, mergeRuntime, setRecordSource } from './ui.js';
 import { mountDictation } from './dictation.js';
 import { $, node, button, empty, time, attempt, showError, clearError, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
-import { artifactHostOf } from './project-hosts.js';
+import { artifactHostOf, artifactHome } from './project-hosts.js';
 initLanguage(); initTheme(); initDialogs();
 $('#connection').textContent=t('连接中'); $('#runtime-status').textContent=t('读取状态…'); $('#comments-heading').textContent=t('批注');
 const params = new URLSearchParams(location.search), projectId = params.get('project'), artifactId = params.get('artifact');
 // Opened as a tab of the workbench's side pane: no top bar, and the comments start folded when narrow.
 const embedded = params.get('embed') === '1'; document.body.classList.toggle('embedded', embedded);
 const base = projectURL(projectId), artifactBase = `${base}/artifacts/${encodeURIComponent(artifactId)}`;
+// Only this Artifact's comment threads, tool records of ended runs as previews.
+const viewURL = `${base}?artifact=${encodeURIComponent(artifactId)}`;
+setRecordSource(runId => api(`${base}/runs/${encodeURIComponent(runId)}/records`));
 let state, artifact, runtime, choices = () => ({}), selection = null, replyId = null, mode = false, selectionMode = 'element', frameOrigin, frameNonce, refreshTimer, submitting = false, lastAnchors = '', frameGeneration = 0;
 const pendingRequests = new Map();
 const commentCards = new Map();
@@ -78,7 +81,8 @@ $('#area-mode').addEventListener('click', () => setMode(!mode || selectionMode !
 $('#text-mode').addEventListener('click', () => setMode(!mode || selectionMode !== 'text','text'));
 $('#comments-toggle').addEventListener('click', () => showComments($('#comments-panel').hidden, true));
 // Browse mode opens the Artifact alone in a new window (open.html); from a workbench tab, edit mode opens this page on its own.
-const openWindow = url => window.open(url, '_blank', 'noopener');
+let hereId = null;
+const openWindow = url => openSignedIn(hereId, url);
 $('#artifact-open-browse').addEventListener('click', () => openWindow(`/open.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(artifactId)}`));
 $('#artifact-open-edit').hidden = !embedded;
 $('#artifact-open-edit').addEventListener('click', () => openWindow(`/artifact.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(artifactId)}`));
@@ -149,7 +153,7 @@ async function restoreSnapshot(snapshotId) { if (!confirm(t('这会用所选快�
 $('#snapshot-restore').addEventListener('submit', event => { event.preventDefault(); attempt(() => restoreSnapshot(new FormData(event.target).get('snapshotId'))); });
 function renderSnapshots() { const list = $('#snapshot-list'); list.replaceChildren(); for (const snapshot of runtime?.snapshots || []) { const row = node('li','',`${time(snapshot.createdAt)} · ${snapshot.id}`); row.append(button(t('恢复'), () => attempt(() => restoreSnapshot(snapshot.id)))); list.append(row); } if (!list.childNodes.length) list.append(empty(t('暂无数据快照'))); }
 // Returns whether the artifact's own configuration changed, so callers know to refresh its runtime status.
-async function reload() { state = await api(base); const previous = JSON.stringify(artifact); artifact = state.artifacts.find(item => item.id === artifactId); if (!artifact) throw new Error(t('找不到这个 Artifact')); $('#artifact-title').textContent = artifact.name; document.title = `${artifact.name} · Studiolo`; renderComments(); const anchors = JSON.stringify(state.annotations.filter(item => item.artifactId === artifactId).map(item => [item.id,item.status,item.anchor])); if (anchors !== lastAnchors) { lastAnchors = anchors; sendAnchors(); } return previous !== undefined && previous !== JSON.stringify(artifact); }
+async function reload() { state = await api(viewURL); const previous = JSON.stringify(artifact); artifact = state.artifacts.find(item => item.id === artifactId); if (!artifact) throw new Error(t('找不到这个 Artifact')); $('#artifact-title').textContent = artifact.name; document.title = `${artifact.name} · Studiolo`; renderComments(); const anchors = JSON.stringify(state.annotations.filter(item => item.artifactId === artifactId).map(item => [item.id,item.status,item.anchor])); if (anchors !== lastAnchors) { lastAnchors = anchors; sendAnchors(); } return previous !== undefined && previous !== JSON.stringify(artifact); }
 function commentCard(annotation, messages, runs) {
   const card = node('article',`annotation${replyId === annotation.id ? ' focused' : ''}`); card.id = `annotation-${annotation.id}`;
   const head = node('div','annotation-head'); head.append(node('span','',time(annotation.createdAt)),node('span','badge',annotation.status === 'resolved' ? t('已解决') : t('未解决')));
@@ -182,8 +186,12 @@ function renderComments() {
   for (const id of commentCards.keys()) if (!annotations.some(annotation => annotation.id === id)) commentCards.delete(id);
   if (!shown.length) nodes.push(empty(filter === 'open' ? t('暂无未解决批注') : t('暂无符合筛选的批注')));
   reconcileChildren(list,nodes); list.scrollTop = scroll;
-  const queueId = `artifact:${artifactId}:${$('#host').value}`;
-  renderRuns($('#artifact-queue'), state.runs.filter(run => run.artifactId === artifactId), state.queues?.[queueId], runId => attempt(async () => { await post(`${base}/runs/${runId}/cancel`); await reload(); }), () => attempt(async () => { await post(`${base}/queues/resume`,{queueId}); await reload(); }),async (runId,id,input)=>{await post(`${base}/runs/${runId}/approvals/${id}`,input);await reload();},runId=>attempt(async()=>{await post(`${base}/runs/${runId}/continue`);await reload();}),queueId);
+  // Each comment thread has its own queue (0.2.4) and they run in parallel. The panel shows every thread's
+  // work; failures stay listed while their thread is paused, and resuming continues every paused thread.
+  const prefix = `artifact:${artifactId}:`, paused = Object.entries(state.queues || {}).filter(([id,queue]) => id.startsWith(prefix) && queue?.paused).map(([id]) => id);
+  const runs = state.runs.filter(run => run.artifactId === artifactId && (['queued','running','waiting'].includes(run.status) || paused.includes(run.queueId)));
+  const queue = paused.length ? {paused:true,reason:paused.every(id => state.queues[id].reason === 'stopped') ? 'stopped' : 'paused'} : null;
+  renderRuns($('#artifact-queue'), runs, queue, runId => attempt(async () => { await post(`${base}/runs/${runId}/cancel`); await reload(); }), () => attempt(async () => { for (const queueId of paused) await post(`${base}/queues/resume`,{queueId}); await reload(); }),async (runId,id,input)=>{await post(`${base}/runs/${runId}/approvals/${id}`,input);await reload();},runId=>attempt(async()=>{await post(`${base}/runs/${runId}/continue`);await reload();}),prefix);
 }
 $('#comment-text').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('#comment-form').requestSubmit(); } });
 $('#comment-form').addEventListener('submit', event => { event.preventDefault(); attempt(async () => {
@@ -210,11 +218,22 @@ $('#selection-label').textContent=t('先选取页面内容或直接填写批注'
 $('#comment-text').placeholder=t('输入批注…');
 attempt(async () => {
   if (!projectId || !artifactId) throw new Error(t('链接缺少项目或 Artifact ID。请从项目文件栏打开。'));
-  const data = await bootstrap(); await reload();
+  const data = await bootstrap(); hereId = data.hostId; await reload();
+  // An Artifact that runs on another server opens on that server (project-hosts.js, artifactHome): framed
+  // in a page of this one, its preview could not sign in. Links copied or kept from here still work.
+  const home = artifactHome(state.project, data.hosts, data.hostId);
+  if (home) {
+    const there = new URL(location.pathname + location.search, home.url); there.searchParams.delete('embed');
+    if (!embedded) { location.replace(await signedIn(home.id, there.href)); return; }
+    const note = $('#remote-preview-note'), link = node('a', '', t('在 {host} 上打开', { host: home.name || home.id }));
+    link.href = there.href; link.target = '_blank'; link.rel = 'noopener'; link.addEventListener('click', signedInClick(home.id, link));
+    note.replaceChildren(node('span', '', t('这个 Artifact 运行在 {host} 上，在那台电脑的页面里打开。', { host: home.name || home.id })), link); note.hidden = false;
+    clearTimeout(loadingNotice); $('#preview-empty').replaceChildren(); return;
+  }
   // Comments run where the artifact runs: the project's artifact host, whichever server serves this page.
   choices = initChoices(data,'',{hostId:artifactHostOf(state.project)||data.hostId});
   // Voice input, once a machine transcribes (Settings → 语音转写).
-  if (data.features?.voiceInput) { $('#comment-dictate').hidden = false; mountDictation({ button: $('#comment-dictate'), textarea: $('#comment-text'), onError: showError }); }
+  if (data.features?.voiceInput) { $('#comment-dictate').hidden = false; mountDictation({ button: $('#comment-dictate'), textarea: $('#comment-text'), controls: $('#comment-form .composer-controls'), onError: showError, keywords: () => [state.project?.name] }); }
   await loadStatus();
 
   if (innerWidth <= 850) showComments(false);
@@ -224,7 +243,7 @@ attempt(async () => {
   const localHostId = data.hostId;
   // Streamed comment replies arrive as run.live: merge the small runtime view instead of
   // downloading the project; any other change reloads it as before.
-  const refreshRuntime = async () => { if (!state) return; const live = await api(`${base}/runtime`); if (!state) return; mergeRuntime(state, live, localHostId); renderComments(); };
+  const refreshRuntime = async () => { if (!state) return; const live = await api(`${base}/runtime`); if (!state) return; mergeRuntime(state, {...live, messages:(live.messages || []).filter(message => !message.sessionId && message.artifactId === artifactId)}, localHostId); renderComments(); };
   listenChanges(change => { if (change.projectId && change.projectId !== projectId) return; statusStale ||= Boolean(change.reconnect); fullStale ||= Boolean(change.reconnect) || change.type !== 'run.live'; if (refreshTimer) return; refreshTimer = setTimeout(() => { refreshTimer = null; const reconnect = statusStale, full = fullStale; statusStale = fullStale = false; attempt(async () => { if (!full) await refreshRuntime(); else if (await reload() || reconnect) await loadStatus(); }); },180); });
   let polling = false;
   const poll = setInterval(async () => { if (document.hidden || polling) return; polling = true; try { await reload(); await loadStatus(); } catch (error) { showError(error); } finally { polling = false; } },4000);

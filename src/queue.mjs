@@ -12,7 +12,10 @@ const noActiveTurn = e => e?.message === 'no_active_turn';
 const active = status => status === 'running' || status === 'waiting';
 function error(message, status = 400) { return Object.assign(new Error(message), { status, statusCode: status }); }
 const scrub = text => String(text ?? '').replace(/\b(?:Bearer)\s+[\w.\-~+/]+=*/gi, 'Bearer [REDACTED]').replace(/\bsk-[A-Za-z0-9_-]{12,}/g, '[REDACTED]').replace(/((?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_KEY)\s*[=:]\s*)[^\s,"']+/gi, '$1[REDACTED]');
-const mappingKey = (hostId, run) => `${hostId}:${run.profileId}:${run.sessionId || `artifact:${run.artifactId}`}`;
+// Each Artifact comment thread (a comment and its replies) has its own native session (0.2.4). The
+// Artifact-wide session of earlier versions is not resumed: a thread's first run reads the history file.
+const artifactThread = run => `artifact:${run.artifactId}${run.annotationId ? ':' + run.annotationId : ''}`;
+const mappingKey = (hostId, run) => `${hostId}:${run.profileId}:${run.sessionId || artifactThread(run)}`;
 function rememberNative(state, run, hostId, metadata) {
   // Only explicitly exposed public IDs are persisted, never entire protocol events.
   if (typeof metadata?.nativeSessionId === 'string' && /^[\w-]{1,150}$/.test(metadata.nativeSessionId)) {
@@ -24,6 +27,25 @@ function rememberNative(state, run, hostId, metadata) {
   if (typeof metadata?.reasoningEffort === 'string') run.actualReasoningEffort = metadata.reasoningEffort;
 }
 
+// Replies hidden by background work reported after their turn ended (fixed in _applyOutput): a
+// finished run with no reply whose last assistant segment is marked narration, although nothing of
+// the turn itself (a tool call, a steer) followed it. Returns those segments.
+const BACKGROUND = 'Background native event: ';
+export function hiddenReplies(state, hostId) {
+  const byRun = new Map();
+  for (const m of state.messages) if (m.runId) { if (!byRun.has(m.runId)) byRun.set(m.runId, []); byRun.get(m.runId).push(m); }
+  const found = [];
+  for (const run of state.runs) {
+    if (run.hostId !== hostId || active(run.status) || run.status === 'queued' || !run.endedAt) continue;
+    const messages = byRun.get(run.id) || [];
+    const segments = messages.filter(m => m.role === 'assistant' && m.kind !== 'background_reply');
+    const last = segments.at(-1);
+    if (!last || segments.some(m => m.kind !== 'narration')) continue;
+    if (messages.some(m => m.createdAt > last.createdAt && m.createdAt <= run.endedAt && ['tool', 'steer', 'narration'].includes(m.kind) && !m.text?.startsWith(BACKGROUND))) continue;
+    found.push(last);
+  }
+  return found;
+}
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); promise.catch(() => {}); return { promise, resolve, reject }; };
 
 export class QueueManager {
@@ -91,7 +113,9 @@ export class QueueManager {
         if (event.text) s.messages.push({...this._message(current, 'assistant', event.text), id:event.id, createdAt:event.at, kind:'background_reply'});
         continue;
       }
-      if ((event.type === 'tool' || event.type === 'narration') && event.assistantId) {
+      // Only while the turn runs: after it ends the resident still reports background work to this
+      // run (as tool records), and those must not turn the finished reply into narration.
+      if ((event.type === 'tool' || event.type === 'narration') && event.assistantId && current.status === 'running') {
         const segment = s.messages.find(m => m.id === assistantId);
         if (segment) { segment.kind = 'narration'; assistantId = event.assistantId; }
       }
@@ -123,6 +147,10 @@ export class QueueManager {
             markUnread(s, run);
           }
         });
+        state = await this.store.read(project.id);
+      }
+      if (hiddenReplies(state, this.hostId).length) {
+        await this.store.mutate(project.id, 'messages.replies-restored', s => { for (const m of hiddenReplies(s, this.hostId)) delete m.kind; });
         state = await this.store.read(project.id);
       }
       for (const queueId of new Set(state.runs.filter(r => r.status === 'queued' && r.hostId === this.hostId).map(r => r.queueId))) this._kick(project.id, queueId);
@@ -168,7 +196,8 @@ export class QueueManager {
         session.hostId=this.hostId;session.profileId=input.profileId;session.model=input.model;
         session.selection={model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode};
       }
-      const queueId = input.sessionId ? `session:${input.sessionId}` : `artifact:${input.artifactId}:${this.hostId}`;
+      // Comment threads run in parallel, each in its own queue; replies within a thread wait their turn.
+      const queueId = input.sessionId ? `session:${input.sessionId}` : `${artifactThread(input)}:${this.hostId}`;
       const item = { id: randomUUID(), requestId: input.requestId, queueId, text: input.text, profileId: input.profileId, model: input.model, reasoningEffort: input.reasoningEffort || null, permissionMode, hostId: this.hostId, status: 'queued', createdAt: now() };
       for (const field of ['sessionId', 'artifactId', 'annotationId']) if (input[field]) item[field] = input[field];
       // A slash command reaches the CLI verbatim (Claude) or as a mapped native request (Codex).
@@ -346,6 +375,8 @@ export class QueueManager {
         await commit();
         return this.approvals.request(projectId,runId,request,AbortSignal.any([controller.signal,requestSignal]));
       };
+      // The agent reads the shared history files; views deferred after recent commits are written first.
+      await this.store.flushDerived?.(projectId);
       const result = await this.runner.execute({ cwd: state.project.path, prompt, profileId: run.profileId, model: run.model, reasoningEffort: run.reasoningEffort, permissionMode: run.permissionMode ?? 'auto', nativeSessionId, previousUsage, sessionKey: this._sessionKey(projectId, run), command: run.command, onEvent, onApproval, signal: controller.signal });
       await commit();
       await this.store.mutate(projectId, 'run.finished', s => {

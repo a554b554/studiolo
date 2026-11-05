@@ -70,19 +70,31 @@ test('commits survive restart; derived files rebuild and paths remain machine-lo
   assert.match(await fs.readFile(path.join(root, 'sessions', `${id}.md`), 'utf8'), /Hello/);
 });
 
+// Views follow a commit after a short delay and only for the conversations it changed.
 test('derived views are rewritten only when their content changes, and restored if altered on disk', async t => {
   const { store, project, root } = await fixture(t);
   const id = randomUUID(), other = randomUUID();
   await store.mutate(project.id, 'sessions', s => { for (const sid of [id, other]) s.sessions.push({ id: sid, title: sid, createdAt: new Date().toISOString() }); });
+  await store.flushDerived(project.id);
   const untouched = path.join(root, 'sessions', `${other}.md`), changed = path.join(root, 'sessions', `${id}.md`);
   const before = (await fs.stat(untouched)).mtimeMs;
   await new Promise(resolve => setTimeout(resolve, 20));
   await store.mutate(project.id, 'message', s => { s.messages.push({ id: randomUUID(), sessionId: id, role: 'user', text: 'Only here', createdAt: new Date().toISOString() }); });
+  assert.doesNotMatch(await fs.readFile(changed, 'utf8'), /Only here/, 'written after the delay, not in the commit');
+  await store.flushDerived(project.id);
   assert.equal((await fs.stat(untouched)).mtimeMs, before, 'an unrelated session view is not rewritten');
   assert.match(await fs.readFile(changed, 'utf8'), /Only here/);
   await fs.rm(changed); await fs.writeFile(untouched, 'edited outside the platform');
   await store.mutate(project.id, 'touch', s => { s.project.group = 'changed'; });
-  assert.match(await fs.readFile(changed, 'utf8'), /Only here/);
+  await store.flushDerived(project.id);
+  assert.equal(await fs.readFile(untouched, 'utf8'), 'edited outside the platform', 'a project-only change leaves conversation views alone');
+  await fs.rm(path.join(root, 'state.json'));
+  await store.mutate(project.id, 'touch both', s => { for (const session of s.sessions) session.title += '!'; });
+  await new Promise(resolve => setTimeout(resolve, store.deriveDelay + 300));
+  assert.match(await fs.readFile(changed, 'utf8'), /Only here/, 'the timer writes the views');
+  await assert.rejects(fs.access(path.join(root, 'state.json')), 'state.json waits for the project to be quiet');
+  await store.flushDerived(project.id);
+  assert.ok((await fs.stat(path.join(root, 'state.json'))).isFile());
   assert.doesNotMatch(await fs.readFile(untouched, 'utf8'), /edited outside/);
 });
 
@@ -93,6 +105,7 @@ test('readable session history separates operation logs without losing either', 
     s.messages.push({id:randomUUID(),sessionId:id,role:'system',text:'TOOL_LOG'});
     s.messages.push({id:randomUUID(),sessionId:id,role:'assistant',text:'FINAL_REPLY',progressText:'INTERIM_PROGRESS'});
   });
+  await store.flushDerived(project.id);
   const chat=await fs.readFile(path.join(root,'sessions',id+'.md'),'utf8');
   const logs=await fs.readFile(path.join(root,'sessions',id+'.operations.md'),'utf8');
   assert.match(chat,/FINAL_REPLY/);assert.doesNotMatch(chat,/TOOL_LOG|INTERIM_PROGRESS/);
@@ -174,6 +187,7 @@ test('derived-view failures surface in read-only API state and clear after succe
   const original = store._derive;
   store._derive = async () => { throw new Error('Markdown write unavailable'); };
   await store.mutate(project.id, 'renamed', s => s.project.name = 'Persisted');
+  await store.flushDerived(project.id);
   const state = await store.read(project.id);
   assert.equal(state.project.name, 'Persisted');
   assert.equal(state.storageWarning, 'Markdown write unavailable');
@@ -182,6 +196,7 @@ test('derived-view failures surface in read-only API state and clear after succe
   assert.equal(JSON.parse(await fs.readFile(path.join(eventDir, last), 'utf8')).state?.storageWarning, undefined);
   store._derive = original;
   await store.mutate(project.id, 'rebuild', () => {});
+  await store.flushDerived(project.id);
   assert.equal((await store.read(project.id)).storageWarning, undefined);
 });
 

@@ -27,7 +27,7 @@ test('conversation rename validates input and persists a manual title',async t=>
  assert.equal(s.titleSource,'pending');
  for(const title of ['', '   ', 123, 'a\nb', 'x'.repeat(121)])await assert.rejects(api(route,'PATCH',{title}),e=>e.status===400);
  await api(route,'PATCH',{title:'  我的标题  '});
- const state=await app.store.read(p.id);assert.equal(state.sessions[0].title,'我的标题');assert.equal(state.sessions[0].titleSource,'manual');
+ await app.store.flushDerived(p.id);const state=await app.store.read(p.id);assert.equal(state.sessions[0].title,'我的标题');assert.equal(state.sessions[0].titleSource,'manual');
  assert.match(await fs.readFile(path.join(p.path,'.studio','sessions',s.id+'.md'),'utf8'),/^# 我的标题/);
  await assert.rejects(api(`/api/projects/${p.id}/sessions/missing`,'PATCH',{title:'test'}),e=>e.status===404);
 });
@@ -182,4 +182,13 @@ test('paired host forwards approval to the owning live CLI channel',async t=>{
  let approval;for(let i=0;i<100;i++){approval=(await callA(`/api/projects/${p.id}`)).runs[0].approvals?.[0];if(approval)break;await new Promise(r=>setTimeout(r,15));}assert.ok(approval);
  await callA(`/api/projects/${p.id}/runs/${r.id}/approvals/${approval.id}`,'POST',{decision:'allow'});
  assert.equal((await callB(`/api/projects/${p.id}`)).runs[0].approvals[0].status,'approved');assert.equal(a.app.queue.approvals.pending.size,0);
+});
+
+test('resolving an Artifact comment thread closes its agent process unless the thread still has work',async t=>{
+ const released=[];const {api,app}=await setup(t,{runner:{...runner,release:async prefix=>{released.push(prefix);}}});
+ const p=await api('/api/projects','POST',{name:'threads'}),aid=crypto.randomUUID(),ids=[crypto.randomUUID(),crypto.randomUUID()],[c1,c2]=ids;
+ await app.store.mutate(p.id,'test.threads',s=>{s.artifacts.push({id:aid,name:'A',root:'.',entry:'index.html',createdAt:new Date().toISOString()});for(const id of ids)s.annotations.push({id,artifactId:aid,text:'x',anchor:{kind:'page'},anchorStatus:'attached',status:'open',createdAt:new Date().toISOString()});s.runs.push({id:crypto.randomUUID(),requestId:crypto.randomUUID(),queueId:`artifact:${aid}:${c2}:other-host`,artifactId:aid,annotationId:c2,status:'running',hostId:'other-host',profileId:'fake',model:'test',text:'x'});});
+ await api(`/api/projects/${p.id}/annotations/${c1}`,'PATCH',{status:'resolved'});
+ await api(`/api/projects/${p.id}/annotations/${c2}`,'PATCH',{status:'resolved'});
+ assert.deepEqual(released.filter(x=>x.includes('artifact:')),[`${p.id}:artifact:${aid}:${c1}:`]);
 });

@@ -16,7 +16,7 @@ async function setup(t){
 test('synced folders are discovered live without registration and histories rebase on the new host',async t=>{
  const {a,b,dir}=await setup(t);const p=await a.createProject({name:'Same name'});const sid=randomUUID();
  await a.mutate(p.id,'fixture',s=>{s.sessions.push({id:sid,title:'中文'});s.messages.push({id:randomUUID(),sessionId:sid,role:'user',text:'persistent conversation'});});
- await fs.writeFile(path.join(p.path,'index.html'),'<h1>作品</h1>');
+ await a.flushDerived(p.id);await fs.writeFile(path.join(p.path,'index.html'),'<h1>作品</h1>');
  const target=path.join(b.projectRoot,p.id);await fs.cp(p.path,target,{recursive:true});
  const [discovered]=await b.listProjects();assert.equal(discovered.id,p.id);assert.equal(discovered.path,target);assert.equal(discovered.ownerHostId,'a');
  assert.equal((await b.read(p.id)).messages[0].text,'persistent conversation');

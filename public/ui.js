@@ -56,7 +56,7 @@ function streamingBody(text, fresh) {
   let target = text, shown = fresh && !reduced ? 0 : text.length, painted = -1, frame = 0, done = false, last = 0, rate = text.length / 500;
   const paint = () => {
     if (painted === shown) return;
-    const scroller = body.closest('.messages'), stick = scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 100;
+    const scroller = body.closest('.messages'), stick = scroller && following(scroller);
     body.replaceChildren(markdown(target.slice(0,shown))); painted = shown;
     if (stick) scroller.scrollTop = scroller.scrollHeight;
   };
@@ -82,10 +82,36 @@ function streamingBody(text, fresh) {
   step();
   return body;
 }
+// Whether a conversation follows new output (app.js sets `studioFollow` from the reader's own scrolling).
+export const following = scroller => scroller.studioFollow ?? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 100;
+// A reply that streamed inside a run's live timeline, by message id: when the run ends its element
+// leaves the timeline at once and the reply's own article takes its place without easing in.
+const handedOff = new Set();
 const reducedMotion = () => globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 // Arrivals ease in once; the class goes so a later move in the DOM does not replay it.
 const easeIn = el => { el.classList.add('enter'); el.addEventListener('animationend',() => el.classList.remove('enter'),{once:true}); return el; };
-const rawRecord = record => node(record.role === 'assistant' ? 'p' : 'pre',record.role === 'assistant' ? 'raw-said' : 'raw-record',record.text);
+// Tool records of ended runs arrive as previews (`truncated` is the full length):
+// a record shown in an opened raw log fetches its run's records once and fills in the full text.
+let recordSource = null; const fullRecords = new Map();
+export function setRecordSource(load) { recordSource = load; fullRecords.clear(); }
+function fullRecord(record) {
+  if (!recordSource || !record.runId) return Promise.resolve(undefined);
+  let pending = fullRecords.get(record.runId);
+  if (!pending) {
+    pending = recordSource(record.runId).then(list => new Map(list.map(message => [message.id, message.text])));
+    pending.catch(() => fullRecords.delete(record.runId));
+    fullRecords.set(record.runId, pending);
+    for (const key of [...fullRecords.keys()].slice(0, -20)) fullRecords.delete(key);
+  }
+  return pending.then(texts => texts.get(record.id));
+}
+const rawRecord = record => {
+  const el = node(record.role === 'assistant' ? 'p' : 'pre',record.role === 'assistant' ? 'raw-said' : 'raw-record',record.text);
+  if (!record.truncated) return el;
+  el.classList.add('raw-preview'); el.append(node('span','raw-more',`… ${t('正在加载完整记录…')}`));
+  fullRecord(record).then(text => { if (text !== undefined) { el.textContent = text; el.classList.remove('raw-preview'); } else el.lastChild.remove(); }, () => el.lastChild?.remove());
+  return el;
+};
 // What the agent said between steps. A segment it is still writing streams in place and keeps its
 // element when a tool call turns it into narration, so the text never jumps or restarts.
 function liveSaid(entry) {
@@ -131,7 +157,7 @@ function liveRun(item, runs) {
   const now = node('span','activity-now'), meta = node('span','activity-meta'), counter = node('span','activity-elapsed'), steps = node('span');
   now.append(pulse,label,target); meta.append(counter,steps,node('span','activity-toggle','Raw log'));
   summary.append(now,meta,node('span','live-progress')); details.append(summary); head.append(name,when); section.append(head,list,details);
-  const entries = new Map(); let current = item, filled = 0, ended = false;
+  const entries = new Map(); let current = item, filled = 0, ended = false, streamKey = null;
   const fill = () => {
     if (!details.open) return;
     if (current.activity.length < filled) { details.replaceChildren(summary); filled = 0; }
@@ -143,6 +169,7 @@ function liveRun(item, runs) {
   const end = (run, animate) => {
     summary.className = ''; summary.replaceChildren(...activitySummary(current,run).childNodes);
     if (ended) return; ended = true; section.classList.add('ended');
+    if (streamKey && entries.has(streamKey)) { entries.get(streamKey).remove(); handedOff.add(streamKey); }
     if (!animate || reducedMotion()) { head.remove(); list.remove(); return; }
     for (const el of [head,list]) {
       el.style.overflow = 'hidden';
@@ -156,6 +183,7 @@ function liveRun(item, runs) {
     const agent = run || next.agent || {};
     name.textContent = agentLabel(agent,agent); when.textContent = time(run?.startedAt || next.since);
     const wanted = timeline(next.activity);
+    streamKey = next.stream?.id || null;
     if (next.stream) wanted.push({type:'stream',key:next.stream.id,text:next.stream.text || '',at:next.stream.createdAt});
     const nodes = wanted.map((entry, index) => {
       entry.last = index === wanted.length - 1;
@@ -232,37 +260,45 @@ export function reconcileChildren(container, nodes) {
 // Keyed render for the live conversation: unchanged items keep their DOM nodes, so streaming
 // refreshes do not rebuild every message, collapse open logs or reset text selection. Items keyed
 // by a request `slot` keep their place when the server's record replaces the page's own. Within
-// one conversation (`scope`), what arrives after the first render eases in.
-export function syncMessages(container, messages, runs, trailing = [], {pending = [], scope = ''} = {}) {
+// one conversation (`scope`), what arrives after the first render eases in. A long conversation shows
+// only its later items: `skip(total)` says how many to leave out at the top, `leading(skipped)` gives
+// the nodes shown above them. Returns the number left out.
+export function syncMessages(container, messages, runs, trailing = [], {pending = [], scope = '', skip = () => 0, leading = () => []} = {}) {
   const language = getLanguage(), same = container.studioItems?.language === language && container.studioItems.scope === scope;
   const previous = container.studioItems?.language === language ? container.studioItems.items : new Map();
   const items = new Map(), nodes = [];
-  for (const item of conversationItems(messages,runs,pending)) {
+  const all = conversationItems(messages,runs,pending), start = Math.max(0, Math.min(skip(all.length), all.length - 1));
+  for (const item of all.slice(start)) {
     const key = `${item.kind}:${item.slot || item.key || item.message.id}`;
     const run = item.message && runs?.find(run => run.id === item.message.runId);
     const signature = JSON.stringify([item, run && [run.profileId, run.model, run.actualModel, run.reasoningEffort, run.actualReasoningEffort]]);
     let entry = previous.get(key);
     if (entry?.signature !== signature) {
-      if (entry?.element.studioLive && item.kind === 'activity') { entry.element.studioLive(item, runs); entry = { ...entry, signature }; }
+      // An ended timeline is never revived: a late snapshot that shows its run executing rebuilds it.
+      if (entry?.element.studioLive && item.kind === 'activity' && !(item.live && entry.element.classList.contains('ended'))) { entry.element.studioLive(item, runs); entry = { ...entry, signature }; }
       else if (entry?.element.studioStream && item.kind === 'message') { entry.element.studioStream(item, runs); entry = { ...entry, signature }; }
       else {
         const element = renderItem(item, runs, entry?.element, true);
         // A recorded user message replaces the page's own copy silently; agent output eases in.
-        if (!entry && same && (item.message?.role !== 'user' || item.message.pending)) easeIn(element);
+        const handed = item.kind === 'message' && handedOff.delete(item.message.id);
+        if (!entry && same && !handed && (item.message?.role !== 'user' || item.message.pending)) easeIn(element);
         entry = { signature, element };
       }
     }
     items.set(key, entry); nodes.push(entry.element);
   }
   container.studioItems = { language, scope, items };
-  reconcileChildren(container, [...nodes, ...trailing]);
+  reconcileChildren(container, [...leading(start), ...nodes, ...trailing]);
   for (const el of nodes) if (el.studioScroll !== undefined) { el.scrollTop = el.studioScroll === Infinity ? el.scrollHeight : el.studioScroll; delete el.studioScroll; }
+  return start;
 }
 // Mirrors how the server folds a machine's live runtime into project state: executing runs are
 // replaced, their messages upserted, and this machine's native runtime entries refreshed. Streamed
-// output then costs a few kilobytes per tick instead of the whole project.
+// output then costs a few kilobytes per tick instead of the whole project. A run this page has not
+// loaded yet (a tick that beats the reload after sending) is added with its messages: messages
+// without their run read as a finished turn, and the message just sent would show a second time.
 export function mergeRuntime(state, live, hostId) {
-  for (const run of live?.runs || []) { const index = state.runs.findIndex(r => r.id === run.id); if (index >= 0) state.runs[index] = run; }
+  for (const run of live?.runs || []) { const index = state.runs.findIndex(r => r.id === run.id); if (index >= 0) state.runs[index] = run; else state.runs.push(run); }
   for (const message of live?.messages || []) { const index = state.messages.findIndex(m => m.id === message.id); if (index >= 0) state.messages[index] = message; else state.messages.push(message); }
   const runtime = { ...state.nativeRuntime };
   for (const key of Object.keys(runtime)) if (key.endsWith(`:${hostId}`)) delete runtime[key];

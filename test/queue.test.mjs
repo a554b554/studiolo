@@ -42,6 +42,43 @@ test('late resident answers are durable chat messages without replacing the orig
  assert.deepEqual((await reloaded.read(f.project.id)).messages.filter(m=>m.role==='assistant'),answers);
 });
 
+test('background work reported after a turn ends leaves its reply a reply', async t => {
+  // The resident keeps the finished turn's onEvent for background work; such a record once turned
+  // the reply into narration, so it showed only in the Raw log.
+  let callback;
+  const f = await fixture(t, async ({onEvent}) => { callback = onEvent; onEvent({type:'text',text:'The answer.'}); return {text:'The answer.'}; });
+  await f.submit('question');
+  await waitFor(async () => (await f.read()).runs[0].status === 'succeeded');
+  await callback({type:'tool',text:'Background native event: Started acc · model'});
+  await callback({type:'reply',text:'Background finished'});
+  const state = await f.read();
+  assert.deepEqual(state.messages.filter(m => m.role === 'assistant').map(m => [m.kind, m.text]), [[undefined, 'The answer.'], ['background_reply', 'Background finished']]);
+  assert.ok(state.messages.some(m => m.kind === 'tool' && m.text.startsWith('Background native event: ')), 'the late record is still kept');
+  assert.deepEqual(conversationItems(state.messages, state.runs).filter(i => i.kind === 'message' && i.message.role === 'assistant').map(i => i.message.text), ['The answer.', 'Background finished']);
+});
+
+test('startup restores replies hidden by late background records, and only those', async t => {
+  const {hiddenReplies} = await import('../src/queue.mjs');
+  const f = await fixture(t, async () => ({text:'ok'}));
+  const at = n => `2026-11-04T00:00:0${n}.000Z`;
+  await f.store.mutate(f.project.id, 'seed', s => {
+    const run = (id, status, endedAt, hostId = 'a') => ({id, status, endedAt, hostId, queueId:'q', sessionId:f.sessions[0]});
+    s.runs.push(run('hidden', 'succeeded', at(3)), run('narrated', 'failed', at(3)), run('replied', 'succeeded', at(3)), run('peer', 'succeeded', at(3), 'b'));
+    const m = (id, runId, role, createdAt, kind, text = id) => ({id, runId, role, createdAt, text, sessionId:f.sessions[0], ...(kind ? {kind} : {})});
+    s.messages.push(
+      m('h1', 'hidden', 'assistant', at(1), 'narration'), m('h2', 'hidden', 'system', at(5), 'tool', 'Background native event: Started acc · model'),
+      m('n1', 'narrated', 'assistant', at(1), 'narration'), m('n2', 'narrated', 'system', at(2), 'tool', 'Read: {}'),
+      m('r1', 'replied', 'assistant', at(1), 'narration'), m('r2', 'replied', 'system', at(2), 'tool', 'Read: {}'), m('r3', 'replied', 'assistant', at(2)),
+      m('p1', 'peer', 'assistant', at(1), 'narration'));
+  });
+  assert.deepEqual(hiddenReplies(await f.read(), 'a').map(m => m.id), ['h1'], 'narration before a tool call of the turn stays narration; another host repairs its own');
+  await f.queue.close();
+  const restarted = await new QueueManager({store:f.store, hostId:'a', runner:{execute:async () => ({text:'ok'})}}).init();
+  t.after(() => restarted.close());
+  const kinds = Object.fromEntries((await f.read()).messages.filter(m => m.role === 'assistant').map(m => [m.id, m.kind]));
+  assert.deepEqual(kinds, {h1:undefined, n1:'narration', r1:'narration', r3:undefined, p1:'narration'});
+});
+
 test('account is fixed, model and effort may change per message; waiting replies survive restart without replay', async t => {
   const calls=[];
   const f=await fixture(t,async args=>{calls.push(args);return {text:'Permission was denied',status:'waiting',error:'Permission or user input required: Edit'};});
@@ -175,25 +212,37 @@ test('restart interrupts owned active runs, retains pending work, never replays 
   assert.equal(executions, 0);
 });
 
-test('all comments of one artifact share a queue and completion does not resolve comments', async t => {
-  let concurrent = 0, max = 0;
+test('comment threads of one artifact run in parallel, each in its own session; replies in a thread wait; completion does not resolve comments', async t => {
+  const aid = randomUUID(), annotations = [randomUUID(), randomUUID()], started = [], gates = new Map();
   const f = await fixture(t, async args => {
-    concurrent++; max = Math.max(max, concurrent);
-    assert.match(args.prompt, /Artifact comment evidence:/);
-    assert.match(args.prompt, /Artifact configuration \(paths relative to project\):.*"root":"app"/);
-    await new Promise(resolve => setTimeout(resolve, 20)); concurrent--;
-    return { text: 'Updated it' };
+    // A thread's first turn carries the Artifact, the evidence and the note on parallel threads; a reply is a delta.
+    if (!args.nativeSessionId) { assert.match(args.prompt, /Artifact configuration \(paths relative to project\):.*"root":"app"/); assert.match(args.prompt, /handled at the same time by separate agents/); }
+    const thread = annotations.find(id => args.prompt.includes(id)), index = started.length;
+    started.push({ thread, nativeSessionId: args.nativeSessionId || null });
+    await new Promise(resolve => gates.set(index, resolve));
+    return { text: 'Updated it', nativeSessionId: 'native-' + thread };
   });
-  const aid = randomUUID(), annotations = [randomUUID(), randomUUID()];
   await f.store.mutate(f.project.id, 'artifact', s => {
     s.artifacts.push({ id: aid, name: 'App', root: 'app', createdAt: new Date().toISOString() });
     s.annotations = annotations.map(id => ({ id, artifactId: aid, text: 'fix', status: 'open', anchorStatus: 'orphaned', anchor: { kind: 'element', selector: '#gone' }, createdAt: new Date().toISOString() }));
   });
-  for (const id of annotations) await f.queue.submit(f.project.id, { requestId: randomUUID(), artifactId: aid, annotationId: id, text: 'fix', profileId: 'codex', model: 'test' });
+  const submit = id => f.queue.submit(f.project.id, { requestId: randomUUID(), artifactId: aid, annotationId: id, text: 'fix', profileId: 'codex', model: 'test' });
+  for (const id of annotations) await submit(id);
+  await submit(annotations[0]); // a reply in the first thread
+  // Both threads start before either finishes; the reply waits behind its own thread only.
+  await waitFor(() => started.length === 2);
+  assert.deepEqual(started.map(s => s.thread).sort(), [...annotations].sort());
+  assert.ok(started.every(s => s.nativeSessionId === null), 'each thread starts its own session');
+  gates.get(started.findIndex(s => s.thread === annotations[1]))();
+  await waitFor(async () => (await f.read()).runs.filter(r => r.status === 'succeeded').length === 1);
+  assert.equal(started.length, 2, 'the reply does not start while its thread is still running');
+  gates.get(started.findIndex(s => s.thread === annotations[0]))();
+  await waitFor(() => started.length === 3);
+  assert.deepEqual(started[2], { thread: annotations[0], nativeSessionId: 'native-' + annotations[0] });
+  gates.get(2)();
   await waitFor(async () => (await f.read()).runs.every(r => r.status === 'succeeded'));
-  assert.equal(max, 1);
   const s = await f.read();
-  assert.equal(s.runs[0].queueId, s.runs[1].queueId);
+  assert.equal(new Set(s.runs.map(r => r.queueId)).size, 2);
   assert.ok(s.annotations.every(a => a.status === 'open' && a.anchorStatus === 'orphaned'));
 });
 

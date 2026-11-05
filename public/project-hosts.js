@@ -13,5 +13,9 @@ export const readyHosts = project => Object.entries(replicasOf(project)).filter(
 // ready replica. null means unrestricted (a project without an owner record).
 export const runHosts = project => isSynced(project) ? readyHosts(project) : project?.ownerHostId ? [project.ownerHostId] : null;
 export const artifactHostOf = project => (isSynced(project) && syncOf(project).artifactHostId) || project?.ownerHostId || null;
+// The server an Artifact runs on, when that is another server than the one this page came from (`selfId`).
+// Its pages open there: a page here cannot frame it, because the preview's sign-in cookie never crosses
+// sites (src/artifacts.mjs, SameSite=Strict), and a link there works from any device on the tailnet.
+export const artifactHome = (project, hosts, selfId) => { const id = artifactHostOf(project); if (!id || id === selfId) return null; const host = hosts?.find(h => h.id === id); return host?.url ? host : null; };
 // In-memory defaults for the new fields; a journal write records them only when they change.
 export function migrateProject(project) { project.sync = syncOf(project); project.replicas = replicasOf(project); if (project.head === undefined) project.head = null; return project; }

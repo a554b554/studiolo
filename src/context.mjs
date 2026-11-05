@@ -5,6 +5,8 @@ import {createHash} from 'node:crypto';
 // copy of the platform prompt (or replay the conversation) on every user turn.
 // `knowledge` ({text, hash}, from subagents.mjs) is machine-specific shared knowledge: sent with the
 // bootstrap turn and again only when its hash differs from the one the previous turn carried.
+// Comment threads on one Artifact run at the same time, each in its own agent session (0.2.4).
+export const PARALLEL_COMMENTS = 'Other comments on this Artifact may be handled at the same time by separate agents working in the same project files. Re-read a file right before you edit it and keep edits focused on this comment. Changes you did not make come from those agents: keep them and fit your change around them, never revert or overwrite them. If this comment truly conflicts with another change, decide the resolution yourself, preferring one that satisfies both, and say in your answer what you chose.';
 export function buildContext(state, run, nativeSessionId, hostId, knowledge = null) {
   // Slash-command runs carry no platform prompt, so they do not count as the bootstrap turn.
   const prior = state.runs.filter(r => r.id !== run.id && r.hostId === hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.status === 'succeeded' && !r.command);
@@ -41,7 +43,7 @@ export function buildContext(state, run, nativeSessionId, hostId, knowledge = nu
   if (artifact && annotation) {
     const config = Object.fromEntries(['id','name','root','entry','command','port','dataPaths'].filter(k => artifact[k] !== undefined).map(k => [k,artifact[k]]));
     const evidence = {id:annotation.id, artifactId:annotation.artifactId, anchor:{...annotation.anchor,screenshot:undefined}};
-    const detail = `Artifact configuration (paths relative to project): ${JSON.stringify(config)}\nArtifact comment evidence: ${JSON.stringify(evidence)}${annotation.anchor?.screenshotPath ? '\nScreenshot evidence file: '+path.join(root, annotation.anchor.screenshotPath) : ''}`;
+    const detail = `Artifact configuration (paths relative to project): ${JSON.stringify(config)}\nArtifact comment evidence: ${JSON.stringify(evidence)}${annotation.anchor?.screenshotPath ? '\nScreenshot evidence file: '+path.join(root, annotation.anchor.screenshotPath) : ''}\n${PARALLEL_COMMENTS}`;
     evidenceHash = createHash('sha256').update(detail).digest('hex');
     if (bootstrap || prior.at(-1)?.context?.evidenceHash !== evidenceHash) parts.push(detail);
     else parts.push(`Comment: ${annotation.id}`);

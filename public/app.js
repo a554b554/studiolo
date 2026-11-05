@@ -1,16 +1,16 @@
 import {initAccountUsage} from './account-usage.js';
 import { t, getLanguage, onLanguageChange, initLanguage, setLanguage } from './i18n.js';
-import { api, post, upload, projectURL, requestId } from './api.js';
+import { api, post, upload, projectURL, requestId, signedInClick } from './api.js';
 import { initTheme, setTheme } from './themes.js';
 import { view, draftKey, rememberSelection, previousSelection } from './state.js';
-import { syncMessages, mergeRuntime } from './ui.js';
-import { category, visibleItems, moreButton } from './lifecycle.js';
+import { syncMessages, mergeRuntime, following, setRecordSource } from './ui.js';
+import { category, visibleItems, moreButton, contextMenu } from './lifecycle.js';
 import { mountDictation } from './dictation.js';
 import { $, node, button, icon, empty, time, showError, clearError, attempt, showDialog, initDialogs, bootstrap, initChoices, listenChanges, renderRuns, statuses, messageContent } from './ui.js';
 import { platformCommands, codexCommands, parseSlash, mergeCommands, createSlashMenu } from './commands.js';
 import { initAccounts } from './accounts.js';
 import { setAccountDirectory, accountName, familyName, recorded, steerCount } from './conversation.js';
-import { isSynced, runHosts, readyHosts } from './project-hosts.js';
+import { isSynced, runHosts, readyHosts, artifactHome } from './project-hosts.js';
 import { openProjectSettings } from './project-settings.js';
 import { notifyResults } from './notify.js';
 import { initFailover } from './failover.js';
@@ -27,6 +27,7 @@ const panes = initPanes({ onPaneToggle: open => tabs.setOpen(open) });
 const tabs = initTabs({ panes,
   artifactName: (projectId, id) => (projectId === view.projectId ? view.project?.artifacts : [])?.find(a => a.id === id)?.name || '',
   artifactRunning: (projectId, id) => projectId === view.projectId && Boolean(artifactStatus.get(id)?.running || artifactStatus.get(id)?.persistent?.running),
+  artifactHome: projectId => projectId === view.projectId ? homeOfArtifacts() : null,
   onActiveChange: tab => markOpenResource(tab) });
 $('#connection').textContent=t('连接中'); $('#session-title').textContent=t('选择项目'); $('#prompt').placeholder=t('输入消息…');
 let choices = () => ({}), refreshTimer, loadVersion = 0, messageSignature = '', navigationSignature = '', artifactSignature = '';
@@ -34,6 +35,47 @@ let projectSelectionPending=false;
 const pendingRequests = new Map();
 const formBody = form => Object.fromEntries(new FormData(form));
 const path = () => projectURL(view.projectId);
+// The page loads one conversation of a project at a time, with tool records of ended runs as
+// previews; an opened raw log fetches its run's records in full.
+const viewURL = (id, sessionId) => `${projectURL(id)}?session=${encodeURIComponent(sessionId || 'latest')}`;
+const loadedSession = () => view.project?.page ? view.project.page.sessionId : view.sessionId;
+setRecordSource(runId => api(`${projectURL(view.projectId)}/runs/${encodeURIComponent(runId)}/records`));
+// Recently opened conversations: returning to one shows it at once while a fresh copy
+// loads. At most RECENT_COUNT, and at most about RECENT_CHARS characters of message text in all.
+const recent = new Map(), RECENT_COUNT = 10, RECENT_CHARS = 40e6;
+function keepRecent(state) {
+  const sessionId = state?.page?.sessionId; if (!sessionId) return;
+  const key = `${state.project.id}:${sessionId}`; recent.delete(key);
+  recent.set(key, {state, chars: state.messages.reduce((sum, m) => sum + (m.text?.length || 0), 0)});
+  let total = 0; for (const entry of recent.values()) total += entry.chars;
+  for (const [old, entry] of recent) { if (recent.size <= RECENT_COUNT && total <= RECENT_CHARS) break; recent.delete(old); total -= entry.chars; }
+}
+// The cached view of a conversation; without one named, of the conversation the project opens by default.
+function recentView(projectId, sessionId) {
+  for (const [key, entry] of [...recent].reverse()) {
+    const {state} = entry; if (state.project.id !== projectId) continue;
+    if (state.page.sessionId !== (sessionId || visibleItems(state.sessions).at(-1)?.id)) continue;
+    recent.delete(key); recent.set(key, entry); return state;
+  }
+  return null;
+}
+// While a conversation shows from the cache or is loading, sending waits for its fresh copy: whether
+// a message steers the running turn or starts a new one depends on current runs.
+let revalidating = null;
+function revalidate() {
+  const pending = reloadProject(), tracked = pending.catch(() => {}).finally(() => { if (revalidating === tracked) revalidating = null; });
+  revalidating = tracked; attempt(() => pending);
+}
+// Long conversations show their last PAGE items, about 20 turns. The number hidden above stays fixed while
+// new output arrives below, and shrinks by PAGE when the reader asks for earlier ones.
+const PAGE = 60; let hiddenAbove = null, expansions = 0;
+const resetWindow = () => { hiddenAbove = null; expansions = 0; };
+function showEarlier() {
+  const container = $('#messages'), fromBottom = container.scrollHeight - container.scrollTop;
+  hiddenAbove = Math.max(0, (hiddenAbove || 0) - PAGE); expansions++; messageSignature = '';
+  renderConversation(); container.scrollTop = container.scrollHeight - fromBottom;
+}
+const earlierControl = count => button(t('显示更早的内容（还有 {count} 项）',{count}), showEarlier, 'quiet show-earlier');
 // Last selection, theme and language follow the user to other devices; localStorage
 // keeps this browser's copy for when no server answers.
 const savePreferences = patch => api('/api/settings/ui',{method:'PUT',body:patch}).catch(() => {});
@@ -59,7 +101,6 @@ document.querySelectorAll('[data-resource]').forEach(tab => tab.addEventListener
   $('#files-section').hidden = view.resource !== 'files'; $('#artifacts').hidden = view.resource !== 'artifacts';
   if (view.resource === 'artifacts') attempt(pollArtifacts);
 }));
-$('#chat-new').addEventListener('click', () => { if (!view.projectId) return showError(new Error(t('请先打开项目'))); attempt(() => createProjectSession(view.projectId)); });
 $('#update-reload').addEventListener('click', () => location.reload());
 
 // Uploads: files from the OS file manager or a file picker go to the project's uploads/ folder.
@@ -144,11 +185,12 @@ dropZone($('.explorer'), uploadToProject);
 $('#attach').addEventListener('click', () => $('#attach-input').click());
 $('#attach-input').addEventListener('change', event => { const files = [...event.target.files]; event.target.value = ''; attempt(() => addAttachments(files)); });
 // Voice input: the button shows once a machine transcribes (features.voiceInput, Settings → 语音转写).
-// Text lands at the caret and the input event keeps the draft logic in sync.
-let dictation = { setEnabled() {} }, dictationMounted = false;
+// Text streams in at the caret and the input event keeps the draft logic in sync; leaving the
+// conversation keeps what was said so far in its draft.
+let dictation = { setEnabled() {}, settle() {} }, dictationMounted = false;
 function syncDictation(enabled) {
   $('#dictate').hidden = !enabled;
-  if (enabled && !dictationMounted) { dictationMounted = true; dictation = mountDictation({ button: $('#dictate'), textarea: $('#prompt'), onError: showError }); }
+  if (enabled && !dictationMounted) { dictationMounted = true; dictation = mountDictation({ button: $('#dictate'), textarea: $('#prompt'), controls: $('#composer .composer-controls'), onError: showError, keywords: () => [view.project?.project.name, view.project?.sessions.find(item => item.id === view.sessionId)?.title] }); }
 }
 
 // Interactive controls, matching the terminal CLIs: Esc / ■ stops the current turn but keeps the
@@ -417,8 +459,10 @@ function renderConversation() {
   $('#prompt').disabled = !writable || stranded; $('#send').disabled = !writable || !machineOnline || stranded; $('#attach').disabled = !writable || stranded; dictation.setEnabled(writable && !stranded);
   renderAttachments();
   $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):stranded?t('此项目的文件只在 {hosts}，这个对话不能继续；请分叉到那里继续。',{hosts:allowedHosts.map(hostName).join('、')}):t('输入消息…');
-  const messages = view.project?.messages.filter(message => message.sessionId === view.sessionId) || [];
-  const runs = view.project?.runs.filter(run => run.sessionId === view.sessionId) || [];
+  // Another conversation's messages are still loading: only what this page sent shows meanwhile.
+  const loading = Boolean(view.sessionId && loadedSession() !== view.sessionId);
+  const messages = loading ? [] : view.project?.messages.filter(message => message.sessionId === view.sessionId) || [];
+  const runs = loading ? [] : view.project?.runs.filter(run => run.sessionId === view.sessionId) || [];
   // While this conversation executes, sending steers that turn; the user can queue instead or stop.
   const activeRun = runs.filter(run => ['running','waiting'].includes(run.status)).at(-1);
   const steering = Boolean(activeRun && writable && machineOnline);
@@ -447,17 +491,20 @@ function renderConversation() {
   forkLinks.replaceChildren(...(source?[link(t('分叉自：{title}',{title:source.title}),source.id)]:[]),...(session?.forks||[]).map(id=>view.project.sessions.find(s=>s.id===id)).filter(s=>s&&category(s)==='active').map(s=>link(t('分叉：{title}',{title:s.title}),s.id)),...(stranded&&writable?[button(t('分叉以继续'),()=>attempt(()=>forkSession(view.project.project,session)),'quiet fork-link')]:[]));
   nativeStatus.textContent=session?[who,!machineOnline?t('执行电脑离线'):native?.connected?t('原生会话 · {status}',{status:native.busy?t('执行中'):t('已连接')}):t('原生会话 · 待连接')].filter(Boolean).join(' · '):'';
   const pending = view.project ? outboxFor(view.sessionId) : [];
-  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,messages,runs,pending.map(p => [p.requestId,p.failed,Boolean(p.sentAt)])]);
+  const signature = JSON.stringify([getLanguage(),view.projectId,view.sessionId,loading,messages,runs,pending.map(p => [p.requestId,p.failed,Boolean(p.sentAt)])]);
   if (signature !== messageSignature) {
     messageSignature = signature; const container = $('#messages');
-    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+    const nearBottom = following(container);
     // Some transports persist incremental output on runs until the final assistant message.
     const trailing = [];
     for (const run of runs.filter(run => ['running','waiting'].includes(run.status))) {
       if (!messages.some(message => message.runId === run.id && message.role === 'assistant') && (run.output || run.partialText)) { const article = node('article','message message-assistant'); article.append(node('div','message-header',`${run.profileId} · ${statuses[run.status]}`),node('div','message-body',run.output || run.partialText)); trailing.push(article); }
     }
-    syncMessages(container,messages,runs,trailing,{pending,scope:`${view.projectId}:${view.sessionId}`});
-    if (!container.childNodes.length) container.append(empty(session ? writable ? t('发送消息开始这个会话。') : t('恢复后可继续这个对话。') : view.project ? category(view.project.project)==='active' ? t('新建会话后选择 agent 发送消息。') : t('暂无对话。') : t('打开一个项目以开始。')));
+    // Messages arriving after loading are the conversation itself, not new output: they must not ease in.
+    // Revealing earlier items is not new output either (the scope changes, so nothing eases in).
+    syncMessages(container,messages,runs,trailing,{pending,scope:`${view.projectId}:${view.sessionId}${loading ? ':loading' : ''}:${expansions}`,
+      skip:total => loading ? 0 : (hiddenAbove ??= Math.max(0, total - PAGE)),leading:count => count ? [earlierControl(count)] : []});
+    if (!container.childNodes.length) container.append(empty(loading ? t('加载中…') : session ? writable ? t('发送消息开始这个会话。') : t('恢复后可继续这个对话。') : view.project ? category(view.project.project)==='active' ? t('新建会话后选择 agent 发送消息。') : t('暂无对话。') : t('打开一个项目以开始。')));
     if (nearBottom || !messages.length) container.scrollTop = container.scrollHeight;
   }
   const queueId = `session:${view.sessionId}`;
@@ -465,15 +512,51 @@ function renderConversation() {
     runId => attempt(async () => { if (!stopRequests.has(runId)) stopRequests.set(runId, Date.now()); await post(`${path()}/runs/${runId}/interrupt`); await reloadProject(); }), stopRequests);
   markSeen();
 }
+// The conversation follows new output only while the reader is at its end. Only the reader's own
+// scrolling (wheel, touch, keys, the scrollbar) changes that, so output growing under the view or a
+// smooth scroll in progress never does; reading further up, new output just appends below.
+const messagesView = $('#messages'); let scrolledAt = 0; messagesView.studioFollow = true;
+for (const type of ['wheel','touchmove','pointerdown']) messagesView.addEventListener(type, () => { scrolledAt = Date.now(); }, {passive:true});
+document.addEventListener('keydown', event => { if (/^(Page(Up|Down)|Home|End|Arrow(Up|Down)| )$/.test(event.key)) scrolledAt = Date.now(); });
+messagesView.addEventListener('scroll', () => {
+  if (Date.now() - scrolledAt >= 1500) return;
+  messagesView.studioFollow = messagesView.scrollHeight - messagesView.scrollTop - messagesView.clientHeight < 24;
+  // Scrolling to the top of a shortened conversation brings in the earlier items.
+  if (hiddenAbove && messagesView.scrollTop < 200) showEarlier();
+}, {passive:true});
+function toBottom(smooth = false) { messagesView.studioFollow = true; messagesView.scrollTo({top:messagesView.scrollHeight,behavior:smooth && !matchMedia('(prefers-reduced-motion: reduce)').matches ? 'smooth' : 'auto'}); }
 function selectSession(id) {
-  view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey()); view.sessionId = id; openDraft(); messageSignature = ''; renderNavigation(); renderConversation(); remember(); closeDrawer(); $('#messages').scrollTop = $('#messages').scrollHeight;
+  dictation.settle(); view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey()); view.sessionId = id; resetWindow();
+  // A recently opened conversation shows at once with this project's current runs, then refreshes.
+  const cached = loadedSession() !== id && recentView(view.projectId, id);
+  if (cached) view.project = {...view.project, messages: cached.messages, page: cached.page};
+  openDraft(); messageSignature = ''; renderNavigation(); renderConversation(); remember(); closeDrawer(); toBottom();
+  if (cached || loadedSession() !== id) revalidate();
+}
+function showProjectView(id, state, opened) {
+  if (view.projectId !== id) artifactStatus.clear();
+  view.projectId = id; view.project = state; tabs.showProject(id);
+  view.sessionId = state.page?.sessionId ?? null;
+  if (opened) { resetWindow(); openDraft(); }
+  messageSignature = '';
+  renderNavigation(); renderConversation(); renderArtifacts(); renderPath(); remember(); closeDrawer(); if (opened) toBottom();
 }
 async function selectProject(id, sessionId) {
   const version=++loadVersion;projectSelectionPending=true;
+  let settle; const tracked = revalidating = new Promise(resolve => { settle = resolve; });
   try {
-  view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey());
+  dictation.settle(); view.drafts.set(draftKey(),$('#prompt').value); flushDraft(draftKey());
+  // A recently opened conversation of that project shows at once; the fresh view replaces it below.
+  const cached = recentView(id, sessionId), shown = cached?.page.sessionId;
+  if (cached) showProjectView(id, cached, true);
   let state;
-  try { state = await api(projectURL(id)); }
+  try {
+    state = await api(viewURL(id, sessionId));
+    if (version !== loadVersion) return;
+    // A conversation that is no longer shown opens the latest one instead (the server picks the same).
+    const shown = visibleItems(state.sessions), chosen = shown.some(s => s.id === sessionId) ? sessionId : shown.at(-1)?.id || null;
+    if (chosen !== state.page?.sessionId) state = await api(viewURL(id, chosen));
+  }
   catch (error) {
     if(version!==loadVersion)return;
     const registered = view.bootstrap.projects.find(project => project.id === id);
@@ -482,27 +565,37 @@ async function selectProject(id, sessionId) {
     $('#prompt').value = ''; renderNavigation(); renderConversation(); renderPath(); renderArtifacts(); $('#files').replaceChildren(empty(t('项目所在电脑上线后可读取文件。'))); showError(error); return;
   }
   if (version !== loadVersion) return;
-  if (view.projectId !== id) artifactStatus.clear();
-  view.projectId = id; view.project = state; tabs.showProject(id);
-  view.sessionId = visibleItems(state.sessions).some(session => session.id === sessionId) ? sessionId : visibleItems(state.sessions).at(-1)?.id || null;
-  openDraft(); messageSignature = '';
-  renderNavigation(); renderConversation(); renderArtifacts(); renderPath(); remember(); closeDrawer(); attempt(pollArtifacts); await loadFiles(); $('#messages').scrollTop = $('#messages').scrollHeight;
-  } finally { if(version===loadVersion)projectSelectionPending=false; }
+  applied(++stateSeq, state.runs); keepRecent(state);
+  showProjectView(id, state, !cached || state.page?.sessionId !== shown);
+  attempt(pollArtifacts); await loadFiles();
+  } finally { if(version===loadVersion)projectSelectionPending=false; settle(); if (revalidating === tracked) revalidating = null; }
 }
+// Responses can arrive out of order (an event refresh, the poll and the runtime view overlap), and a
+// snapshot read just before a run ended still shows it executing without its last output. A run never
+// executes again once it ended, so a state that shows one executing is stale: it is dropped, and so
+// is a full view older than the last one applied, and a runtime view older than either.
+let stateSeq = 0, appliedFull = 0, appliedLive = 0; const endedRuns = new Set();
+const executing = run => ['queued','running','waiting'].includes(run.status);
+const stale = (seq, runs) => seq < appliedFull || runs.some(run => executing(run) && endedRuns.has(run.id));
+function applied(seq, runs) { appliedFull = seq; for (const run of runs) if (!executing(run)) endedRuns.add(run.id); }
 async function reloadProject() {
   if (!view.projectId) return;
-  const id = view.projectId, state = await api(projectURL(id)); if (view.projectId !== id || projectSelectionPending) return;
-  view.project = state;
-  if(!visibleItems(state.sessions).some(s=>s.id===view.sessionId)){view.sessionId=visibleItems(state.sessions).at(-1)?.id||null;openDraft();remember();}
+  // A response for a conversation the page has left is dropped; the switch reloads on its own.
+  const seq = ++stateSeq, id = view.projectId, sid = view.sessionId, state = await api(viewURL(id, sid)); if (view.projectId !== id || view.sessionId !== sid || projectSelectionPending || stale(seq, state.runs)) return;
+  applied(seq, state.runs); view.project = state; keepRecent(state);
+  if(!visibleItems(state.sessions).some(s=>s.id===view.sessionId)){view.sessionId=visibleItems(state.sessions).at(-1)?.id||null;resetWindow();openDraft();remember();}
   renderNavigation(); renderConversation(); renderArtifacts(); renderPath();
+  if (view.sessionId && view.sessionId !== state.page?.sessionId) await reloadProject();
 }
 // Uncommitted streamed output only changes the executing runs, so a run.live tick refreshes
 // them from the small runtime view; every other change still reloads the whole project.
 async function refreshRuntime() {
   if (!view.projectId || !view.project || projectSelectionPending) return;
-  const id = view.projectId, live = await api(`${projectURL(id)}/runtime`);
-  if (view.projectId !== id || projectSelectionPending || view.project?.project.id !== id) return;
-  mergeRuntime(view.project, live, view.bootstrap.hostId);
+  const seq = ++stateSeq, id = view.projectId, live = await api(`${projectURL(id)}/runtime`);
+  if (view.projectId !== id || projectSelectionPending || view.project?.project.id !== id || seq < Math.max(appliedFull, appliedLive)) return;
+  const gone = new Set((live.runs || []).filter(run => endedRuns.has(run.id) || view.project.runs.some(r => r.id === run.id && !executing(r))).map(run => run.id));
+  mergeRuntime(view.project, {...live, runs:(live.runs || []).filter(run => !gone.has(run.id)), messages:(live.messages || []).filter(message => !gone.has(message.runId) && message.sessionId === loadedSession())}, view.bootstrap.hostId);
+  appliedLive = seq;
   renderConversation();
 }
 function renderPath() { if(view.project?.storageWarning)showError(new Error(t('记录阅读视图更新失败：')+view.project.storageWarning)); const el = $('#project-path'); el.replaceChildren(node('span','',t('项目目录')),node('code','',view.project?.project.path || '—')); }
@@ -520,12 +613,22 @@ function appendFiles(container, entries, projectId) {
   for (const entry of entries) {
     if (entry.type === 'directory') {
       const folder = node('details'), summary = node('summary','',entry.name), children = node('div'); folder.append(summary,children); let loaded = false;
+      summary.addEventListener('contextmenu', event => fileMenu(event, projectId, entry));
       folder.addEventListener('toggle', () => { if (folder.open && !loaded) attempt(async () => { const result = await api(`${projectURL(projectId)}/files?path=${encodeURIComponent(entry.path)}`); children.replaceChildren(); appendFiles(children,result,projectId); loaded = true; }); }); container.append(folder);
     } else {
       const file = button(entry.name, () => tabs.open(projectId, {kind:'file', path:entry.path}), `tree-file${open?.kind === 'file' && open.path === entry.path ? ' current' : ''}`);
-      file.dataset.path = entry.path; file.title = entry.path; container.append(file);
+      file.dataset.path = entry.path; file.title = entry.path; file.addEventListener('contextmenu', event => fileMenu(event, projectId, entry)); container.append(file);
     }
   }
+}
+// Right-click on the tree. The OS file manager opens on the server's desktop, so it is offered only to a page
+// on that machine (features.reveal, set for 127.0.0.1) for a project whose files are there; otherwise greyed.
+const fileManagerLabels = { explorer: '在文件资源管理器中显示', finder: '在访达中显示', files: '在文件管理器中显示' };
+function fileMenu(event, projectId, entry) {
+  const manager = view.bootstrap?.features?.reveal, filesHost = view.project?.filesHostId;
+  const here = Boolean(manager) && filesHost === view.bootstrap?.hostId;
+  const hint = here ? '' : manager ? t('项目文件在 {host} 上，只能在那台电脑上打开', {host: hostName(filesHost)}) : t('仅在本机客户端打开本机的文件时可用');
+  contextMenu(event, entry.name, [{label: t(fileManagerLabels[manager] || '在文件资源管理器中显示'), disabled: !here, hint, run: () => attempt(() => post(`${projectURL(projectId)}/reveal`, {path: entry.path}))}]);
 }
 // The file tree and the Artifact list mark what the side pane shows.
 function markOpenResource(tab) {
@@ -540,10 +643,12 @@ const artifactBusy = new Map();
 const artifactURL = (projectId, id) => `${projectURL(projectId)}/artifacts/${encodeURIComponent(id)}`;
 const artifactPage = (projectId, id) => `/artifact.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(id)}`;
 const browsePage = (projectId, id) => `/open.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(id)}`;
+// Artifacts of a project that runs on another server open on that server (project-hosts.js, artifactHome).
+const homeOfArtifacts = () => artifactHome(view.project?.project, view.bootstrap?.hosts, view.bootstrap?.hostId);
 function iconButton(name, label, action, className = '') { const el = button('', action, `icon-btn ${className}`.trim()); el.title = label; el.setAttribute('aria-label', label); el.append(icon(name)); return el; }
 function renderArtifacts() {
   const artifacts = view.project?.artifacts || [];
-  const signature = JSON.stringify([getLanguage(),view.projectId,artifacts.map(a=>[a.id,a.name,a.root,a.entry,Boolean(a.command)]),view.project?.artifactDiscoveryError,artifacts.map(a=>{const s=artifactStatus.get(a.id);return s?[s.running,s.error||'',s.persistent?.running,s.persistent?.port,s.persistent?.error||'']:null;}),[...artifactBusy]]);
+  const home = homeOfArtifacts(), signature = JSON.stringify([getLanguage(),view.projectId,home?.url,artifacts.map(a=>[a.id,a.name,a.root,a.entry,Boolean(a.command)]),view.project?.artifactDiscoveryError,artifacts.map(a=>{const s=artifactStatus.get(a.id);return s?[s.running,s.error||'',s.persistent?.running,s.persistent?.port,s.persistent?.error||'']:null;}),[...artifactBusy]]);
   if (signature !== artifactSignature) {
     artifactSignature = signature;
     const list = $('#artifact-list'); list.replaceChildren();
@@ -561,8 +666,9 @@ function renderArtifacts() {
       const persist = iconButton('i-persist', t(resident ? '停止常驻运行' : '常驻运行：作为独立服务器运行，Studiolo 关闭后继续'), () => attempt(() => changeArtifact(artifact, resident ? 'stop' : 'persist')), 'persist'); persist.disabled = busy; persist.setAttribute('aria-pressed', String(resident));
       // Two ways out of the workbench: edit mode (the Artifact with its comments and toolbar) and browse
       // mode (the Artifact alone, like any web application).
-      const windowLink = (href, label, name) => { const link = node('a','icon-btn'); link.href = href; link.target = '_blank'; link.rel = 'noopener'; link.title = label; link.setAttribute('aria-label', label); link.append(icon(name)); return link; };
-      row.append(main,play,persist,windowLink(artifactPage(view.projectId, artifact.id), t('在新窗口中以编辑模式打开'), 'i-annotate'),windowLink(browsePage(view.projectId, artifact.id), t('在新窗口中打开（仅浏览）'), 'i-external'));
+      // A click opens it signed in (api.js, openSignedIn); the link itself, as copied, has no ticket.
+      const windowLink = (href, label, name) => { const link = node('a','icon-btn'); link.href = href; link.target = '_blank'; link.rel = 'noopener'; link.addEventListener('click', signedInClick(home?.id || view.bootstrap.hostId, link)); link.title = label; link.setAttribute('aria-label', label); link.append(icon(name)); return link; };
+      row.append(main,play,persist,windowLink((home?.url || '') + artifactPage(view.projectId, artifact.id), t('在新窗口中以编辑模式打开'), 'i-annotate'),windowLink((home?.url || '') + browsePage(view.projectId, artifact.id), t('在新窗口中打开（仅浏览）'), 'i-external'));
       const openTab = () => tabs.open(view.projectId, {kind:'artifact', artifactId:artifact.id});
       row.addEventListener('click', event => { if (!event.target.closest('button, a')) openTab(); });
       row.addEventListener('keydown', event => { if ((event.key === 'Enter' || event.key === ' ') && event.target === row) { event.preventDefault(); openTab(); } });
@@ -748,10 +854,15 @@ function outboxFor(sessionId) {
 let sending = Promise.resolve();
 async function deliver(request) {
   request.failed = null; request.sentAt = null; showOutbox(request);
-  const send = () => post(`${projectURL(request.projectId)}/messages`,request.body), result = sending.then(send,send);
+  // A send whose answer is lost (the connection dropped after the server got it) times out rather than
+  // holding up every later send; if the server did record it, it counts as sent.
+  const send = () => api(`${projectURL(request.projectId)}/messages`,{method:'POST',body:request.body,timeout:30000}), result = sending.then(send,send);
   sending = result.catch(() => {});
   try { await result; }
-  catch (error) { request.failed = error.message || String(error); showOutbox(request); throw error; }
+  catch (error) {
+    if (error.name === 'TimeoutError') { const state = await api(viewURL(request.projectId, request.sessionId)).catch(() => null); if (state && recorded(request, state.messages, state.runs)) { request.sentAt = Date.now(); pendingRequests.delete(request.pendingKey); if (view.projectId === request.projectId) await reloadProject().catch(() => {}); renderConversation(); return; } }
+    request.failed = error.message || String(error); showOutbox(request); throw error;
+  }
   request.sentAt = Date.now(); pendingRequests.delete(request.pendingKey);
   if (view.projectId === request.projectId) await reloadProject();
 }
@@ -769,6 +880,11 @@ $('#messages').addEventListener('studio:outbox', event => {
   renderAttachments(); renderConversation();
 });
 $('#composer').addEventListener('submit', event => { event.preventDefault(); const mode = sendMode; sendMode = 'auto'; attempt(async () => {
+  if (!$('#prompt').value.trim() || !view.sessionId) return;
+  // A conversation shown from the cache or still loading is refreshed first (see revalidate).
+  const target = view.sessionId, deadline = Date.now() + 10000;
+  while (revalidating && Date.now() < deadline) await Promise.race([revalidating, new Promise(resolve => setTimeout(resolve, 1000))]);
+  if (view.sessionId !== target) return;
   const text = $('#prompt').value.trim(), chosen = choices(); if (!text || !view.sessionId) return;
   const command = parseSlash(text);
   if (command && await runLocalCommand(command)) { $('#prompt').value = ''; draftSent(draftKey()); return; }
@@ -788,7 +904,7 @@ $('#composer').addEventListener('submit', event => { event.preventDefault(); con
   view.outbox.set(id,request);
   $('#prompt').value = ''; draftSent(originalKey); view.attachments.delete(originalKey); renderAttachments();
   renderConversation();
-  const messages = $('#messages'); messages.scrollTo({top:messages.scrollHeight,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
+  toBottom(true);
   await deliver(request);
 }); });
 
@@ -805,11 +921,12 @@ async function start() {
   // server reports its current release on every bootstrap, so after an update the page offers a reload;
   // peers and the desktop client report theirs, and Settings → 版本 flags any that differ.
   const page = { version: view.bootstrap.version, build: view.bootstrap.build };
-  let latest = { ...page, clientVersion: view.bootstrap.clientVersion }, clientVersion = null, versionKey = '';
+  // A version stays open while it gains features (CHANGELOG.md), so the client also reports its build within it.
+  let latest = { ...page, clientVersion: view.bootstrap.clientVersion, clientBuild: view.bootstrap.clientBuild || 0 }, clientVersion = null, clientBuild = 0, linkBrowser = null, versionKey = '';
   const renderVersions = () => {
     const stale = Boolean(latest.build && page.build && latest.build !== page.build), hosts = view.bootstrap.hosts || [], local = hosts.find(h => h.local);
-    const peers = hosts.filter(h => !h.local), mismatch = peers.some(h => h.version && h.version !== latest.version), oldClient = Boolean(clientVersion && latest.clientVersion && compareVersions(clientVersion, latest.clientVersion) < 0);
-    const key = JSON.stringify([getLanguage(), page, latest, clientVersion, peers.map(h => [h.id, h.name, h.version])]);
+    const peers = hosts.filter(h => !h.local), mismatch = peers.some(h => h.version && h.version !== latest.version), clientOrder = clientVersion && latest.clientVersion ? compareVersions(clientVersion, latest.clientVersion) : 0, oldClient = Boolean(clientVersion && latest.clientVersion) && (clientOrder < 0 || clientOrder === 0 && latest.clientBuild > clientBuild);
+    const key = JSON.stringify([getLanguage(), page, latest, clientVersion, clientBuild, linkBrowser, peers.map(h => [h.id, h.name, h.version])]);
     if (key === versionKey) return; versionKey = key;
     $('#update-banner').hidden = !stale;
     $('#update-text').textContent = latest.version && latest.version !== page.version ? t('Studiolo 已更新到 {version}，刷新页面以使用新版本。', {version: latest.version}) : t('Studiolo 已更新，刷新页面以使用新版本。');
@@ -820,13 +937,38 @@ async function start() {
     row(t('网页'), page.version, stale ? t('需要刷新') : '', stale);
     row(t('服务器（{name}）', {name: local?.name || view.bootstrap.hostId}), latest.version);
     for (const host of peers) row(t('服务器（{name}）', {name: host.name || host.id}), host.version, host.version && host.version !== latest.version ? t('版本不同') : '', true);
-    if (clientVersion) row(t('桌面客户端'), clientVersion, oldClient ? t('有新版本 {version}', {version: latest.clientVersion}) : '', true);
+    if (clientVersion) row(t('桌面客户端'), clientBuild ? t('{version}（构建 {build}）', {version: clientVersion, build: clientBuild}) : clientVersion, oldClient ? (clientOrder < 0 ? t('有新版本 {version}', {version: latest.clientVersion}) : t('有新构建 {build}', {build: latest.clientBuild})) : '', true);
+    // update_client (desktop/src-tauri/src/lib.rs) installs the signed bundle this server offers
+    // (src/client-update.mjs) and restarts. The 0.2.0 client has no updater: installed by hand once.
+    if (oldClient && window.__TAURI__?.core?.invoke) {
+      const update = button(t('更新客户端'), async () => {
+        update.disabled = true; update.textContent = t('正在更新…');
+        try { if (!await window.__TAURI__.core.invoke('update_client')) showError(new Error(t('这台服务器还没有新版本的客户端安装包'))); }
+        catch (error) { showError(new Error(/not (?:found|allowed)/i.test(String(error)) ? t('这个客户端还不能自动更新，请手动安装一次新版本') : t('更新失败：{error}', {error: String(error)}))); }
+        finally { update.disabled = false; update.textContent = t('更新客户端'); }
+      }, 'primary');
+      list.append(update);
+    }
+    if (linkBrowser !== null) {
+      const label = node('label', 'settings-check'), box = node('input'); box.type = 'checkbox'; box.checked = !linkBrowser;
+      box.addEventListener('change', () => attempt(async () => { await window.__TAURI__.core.invoke('set_link_mode', {browser: !box.checked}); linkBrowser = !box.checked; }));
+      label.append(box, node('span', '', t('在客户端窗口中打开 Artifact 窗口和其他服务器的页面（默认用默认浏览器；其他链接总是用默认浏览器）')));
+      list.append(label);
+    }
     if (page.build) list.append(node('p', 'small muted', t('构建 {build}', {build: page.build})));
   };
-  window.__TAURI__?.app?.getVersion?.().then(version => { clientVersion = version; renderVersions(); }).catch(() => {});
+  // The 0.2.0 client has no client_build command: build 0.
+  // The desktop client opens Studiolo pages (Artifact windows, other servers) in windows of its own and
+  // everything else in the default browser; it learns which servers are Studiolo's from here
+  // (desktop/src-tauri/src/lib.rs, Links). Clients before build 2 have neither command.
+  const invoke = window.__TAURI__?.core?.invoke;
+  const nameServers = hosts => invoke?.('known_servers', {origins: (hosts || []).map(h => h.url).filter(Boolean)}).catch(() => {});
+  nameServers(view.bootstrap.hosts);
+  invoke?.('link_mode').then(browser => { linkBrowser = browser; renderVersions(); }).catch(() => {});
+  window.__TAURI__?.app?.getVersion?.().then(async version => { clientBuild = await window.__TAURI__.core.invoke('client_build').catch(() => 0); clientVersion = version; renderVersions(); }).catch(() => {});
   $('#version-badge').addEventListener('click', () => { $('#settings-open').click(); $('#version-heading').scrollIntoView({block: 'start'}); });
   renderVersions(); onLanguageChange(renderVersions);
-  const checkBuild = fresh => { latest = { version: fresh.version, build: fresh.build, clientVersion: fresh.clientVersion }; view.bootstrap.hosts = fresh.hosts; renderVersions(); };
+  const checkBuild = fresh => { latest = { version: fresh.version, build: fresh.build, clientVersion: fresh.clientVersion, clientBuild: fresh.clientBuild || 0 }; view.bootstrap.hosts = fresh.hosts; nameServers(fresh.hosts); renderVersions(); };
   const ui = view.bootstrap.ui || {};
   if (ui.theme) setTheme(ui.theme); if (ui.language && ui.language !== getLanguage()) setLanguage(ui.language);
   document.querySelectorAll('[data-theme-picker]').forEach(el => el.addEventListener('change', () => savePreferences({theme:el.value})));

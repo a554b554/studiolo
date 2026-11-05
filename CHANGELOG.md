@@ -2,6 +2,53 @@
 
 The server reports its release (`/api/identity`, `/api/bootstrap`); the topbar and Settings → 版本 show it, together with the release of every other registered server and of the desktop client. The desktop client has its own release and is rebuilt only when the client itself changes, since its UI comes from the server.
 
+## 0.2.4 (2026-11-04)
+
+Server, web front end and desktop client 0.2.4 (Windows, macOS).
+
+- Right-click a file or folder in Files → 在文件资源管理器中显示 (在访达中显示 on a Mac) opens it in the system file manager with the file selected. It works only for a page on the same computer as the server that holds the files (`127.0.0.1` / `localhost`); anywhere else the item is greyed out and says why.
+- An Artifact added to a project whose files are on another computer now shows up. The server answering the project view asks the computer with the files to look for new Artifacts, and pulls its journal when something changed. Before, refreshing kept showing the old list.
+- The sidebar's main button creates a project, and every chat lives in a project (the project's ＋, ⋯ → 新建对话, `/new`). The small ＋ beside 「项目」 is gone.
+- Artifact comments in different threads run in parallel, each in its own agent session; replies in one thread still queue behind it. Each thread's agent is told that other threads may be editing the same files at the same time. Resolving an idle thread closes its agent process. A thread from before 0.2.4 starts a new session at its next reply.
+- Switching conversations is quick again; on large projects it could take more than 10 s in the Windows client.
+  - The page loads only the open conversation (`?session=`, `?artifact=`). Tool records of ended runs arrive as 500-character previews, and the full record loads when a Raw log is opened (`GET …/runs/<id>/records`). For the largest project, 32.6 MB per load became 0.70 MB.
+  - The readable history files (`history-index.md`, `sessions/*.md`, `artifacts/*.md`, `state.json`) are written shortly after a change, and only for the conversations and Artifacts that changed. They are always written before an agent run starts.
+  - After a change the server applies only the new journal events instead of reading the whole journal again.
+  - The ten most recently opened conversations show at once from a cache while a fresh copy loads; sending waits for that copy.
+  - Long conversations show their last 60 items. 「显示更早的内容」 or scrolling to the top shows 60 more, and the reading position stays put.
+- A reply no longer disappears into the Raw log a few minutes after its turn. When Claude reported background work after a turn had ended (a background command or a subagent finishing), the finished reply was turned into narration. The 17 replies hidden this way are restored when each server starts.
+
+## 0.2.3 (2026-11-04)
+
+Server, web front end and desktop client 0.2.3 (Windows, macOS).
+
+- Voice input shows what it hears as you speak. Tap the microphone and a voice bar replaces the composer's controls: a live waveform, ✕ to cancel (Esc) and ✓ to finish (Enter). The words appear in the message box at the cursor while you talk, like an input method, through OpenAI's realtime transcription (`gpt-live-transcribe`). The server only mints a two-minute client secret (`/api/transcribe/realtime`, forwarded to the computer that holds the OpenAI key); the page streams audio to OpenAI itself and commits a turn at each pause. If the connection drops, what was already transcribed stays and the rest is transcribed in one piece on ✓. Hold-to-talk is gone. The desktop client streams its native microphone (`start_streaming`); older clients fall back to recording and uploading.
+- Conversations can be dragged in the Windows client again. Tauri's own file drop handler swallowed every drag in the page, so a drag showed a forbidden sign.
+- A reply no longer vanishes when its turn ends in a long conversation. A snapshot of the turn still running could arrive after the final one and fold the reply back into the closed timeline until the next refresh; the page now applies snapshots in order and never brings an ended turn back, and the server reads again when a turn ends while it assembles the view.
+- Streaming no longer pulls you away from what you are reading. Only your own scrolling decides whether the view follows: at the bottom it follows the reply, scrolled up it stays where it is and new output is added at the end.
+- A sent message no longer shows twice (once recorded, once 「发送中」 under a 「启动中」 placeholder). The small live refresh dropped a turn the page had not loaded yet but kept its messages; it now adds the turn. Requests that get no answer time out (reads after 60 s, sends after 30 s, after which the page checks whether the server recorded the send), so one hung request no longer stops every later refresh or send.
+- One stuck check of which computers are online no longer freezes the whole server. Every page request shared it, so project views, sends and the host list all hung while the server still looked connected; callers now get the last known answer after 8 s.
+- The attachment button is a line-drawn paperclip instead of the 📎 emoji.
+
+## 0.2.2 (2026-11-01)
+
+Server, web front end and desktop client 0.2.2 (Windows, macOS).
+
+- Artifacts of a project that runs on another computer open on that computer. Their ↗ links (and so 复制链接) go to that server's address, the side-pane tab offers its windows instead of a blank frame, and old links to this server's Artifact pages forward there. A page here could not frame them: the preview's sign-in cookie never reaches another site, so the frame stayed white.
+- Links in the desktop client open again, in the default browser (client 0.2.2 build 2). Settings → 版本 can keep Artifact windows and other servers' pages in client windows instead.
+- Artifact windows open signed in, with no token or device approval in the browser that shows them, on this computer or another: the page asks its server for a one-time sign-in link (60 s, one use), forwarded to the Artifact's server when it runs elsewhere. Copied links carry no ticket, so whoever opens one still signs in.
+
+## 0.2.1 (2026-11-01)
+
+Server, web front end and desktop client 0.2.1 (Windows, macOS).
+
+- The composer's pickers (computer, account, model, effort, permissions) are as wide as the value they show, not their longest option. The row keeps even gaps, and Send stays on the same line unless the composer is too narrow. Chromium only (web and the Windows client); Safari and the Mac client keep the old widths.
+- The composer row stays on one line while a turn runs, too: Stop, 排队 and 插话 stay together on the right, and the long pickers (account, model, permissions) shorten with "…" to make room. Only a composer too narrow even for that wraps the pickers, and the actions then keep a line of their own.
+- Narrow windows and phones show the conversation again. Below 900 px it fell into a 0-wide column and the page looked empty (since 0.2.0).
+- The account usage panel's height is adjustable: drag its top edge (double-click resets). Accounts that don't fit scroll inside the panel, under its title and above its footer. By default it takes up to 45% of the sidebar, and the project list always keeps room for a few rows.
+- Voice input works in the Mac client on a tailnet server. WKWebView has no microphone for a plain-http page, so the client records natively and the page uploads the recording.
+- One-click client updates: Settings → 版本 shows 「更新客户端」 when the server has a newer desktop client, including a newer build of the same version. The client downloads the signed bundle from that server, installs it and restarts. The 0.2.0 client is the last one installed by hand.
+
 ## 0.2.0 (2026-10-31)
 
 Server and web/desktop front end, desktop client 0.2.0.

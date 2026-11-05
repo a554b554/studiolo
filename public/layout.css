@@ -99,6 +99,16 @@ body.left-closed .sidebar .handle,body.right-closed .explorer .handle,body.pane-
 .unread-dot{width:7px;height:7px;background:var(--blue);box-shadow:none}
 .project-row .unread-dot,.project-row .nav-spinner{margin:0}
 .account-usage{background:var(--panel);padding:12px 14px 8px}
+/* The usage panel's height is dragged at its top edge (panes.js) and kept in this browser; the account
+   list scrolls inside it, the title and footer stay. Unsized, it takes what it needs up to 45% of the
+   sidebar. Either way the project list keeps room for a few rows. */
+.usage-handle{flex:none;margin-top:auto;height:7px;margin-bottom:-4px;position:relative;z-index:2;cursor:row-resize;touch-action:none}
+.usage-handle::after{content:"";position:absolute;left:0;right:0;top:3px;height:1px;background:transparent;transition:background .12s}
+.usage-handle:hover::after,.usage-handle.active::after{background:var(--blue);height:2px;top:2px}
+.sidebar .account-usage{margin-top:0;display:flex;flex-direction:column;min-height:0;max-height:min(45%,calc(100% - 160px))}
+.sidebar .account-usage.sized{max-height:calc(100% - 160px)}
+.account-usage>.quota-head,.account-usage>.quota-footer{flex:none}
+.account-usage>.quota-rows{flex:1 1 auto;min-height:0;overflow:auto;align-content:start;scrollbar-width:thin;overscroll-behavior:contain}
 .sidebar-foot{padding:8px 14px 10px;font-size:11px;color:var(--faint)}
 .sidebar:has(.account-usage){overflow:hidden}
 .sidebar .panel-inner:has(.account-usage){overflow:hidden}
@@ -124,6 +134,8 @@ body.pane-max .conversation{visibility:hidden}
 .message-header{color:var(--faint);font-size:11.5px}
 .message-header strong{color:var(--muted);font-weight:550;font-size:12px}
 .markdown pre,.raw-record{background:var(--code-bg);border-radius:8px}
+.raw-more{color:var(--muted);font-style:italic}
+.show-earlier{display:block;margin:0 auto 18px}
 .markdown :not(pre)>code{font-family:var(--mono);font-size:.88em;background:var(--code-bg);border:var(--line) solid var(--border);border-radius:5px;padding:.05em .35em}
 .run-activity{border-radius:10px}
 .composer-wrap{border-top:0;padding:6px max(24px,calc((100% - 760px)/2)) 14px}
@@ -131,10 +143,25 @@ body.pane-max .conversation{visibility:hidden}
 .composer:focus-within{border-color:var(--faint)}
 .composer textarea{min-height:44px;resize:none;outline:0}
 .composer textarea:focus-visible{outline:0}
+/* Each picker is as wide as its chosen value (not its longest option), so the row keeps even gaps
+   and wraps only when it really does not fit. */
 .composer-controls{gap:4px}
-.composer-controls select{border:0;background:transparent;color:var(--muted);font-size:12px;padding:4px 6px;border-radius:6px;max-width:170px}
+.composer-controls select{border:0;background:transparent;color:var(--muted);font-size:12px;padding:4px 6px;border-radius:6px;max-width:170px;field-sizing:content;text-overflow:ellipsis}
 .composer-controls select:hover{background:var(--hover);color:var(--ink)}
 .composer-controls .send{border-radius:99px;padding:6px 14px}
+/* Two groups: the pickers, where the long ones (account, model, permissions) shorten (…) when the row
+   is tight, and the actions (Stop, 排队, Send/插话), which stay together at the right of the same line.
+   A composer too narrow even for the shortened pickers wraps them, and the actions move to a line of
+   their own at the right. */
+.composer{container:composer/inline-size}
+.composer-controls:has(.composer-pickers){flex-wrap:nowrap}
+.composer-pickers{display:flex;align-items:center;gap:4px;flex:1 1 auto;min-width:0}
+.composer-pickers select{flex:none}
+.composer-pickers :is(#profile,#model,#permission){flex:0 1 auto;min-width:4.5em}
+.composer-pickers>button{flex:none}
+.composer-actions{display:flex;align-items:center;gap:4px;flex:none;margin-left:auto}
+.composer-actions .send{margin-left:0}
+@container composer (max-width:640px){.composer-controls:has(.composer-pickers),.composer-pickers{flex-wrap:wrap}}
 .compose-note{text-align:center;color:var(--faint);font-size:10.5px;margin-top:6px}
 
 /* ---------- resources panel ---------- */
@@ -205,6 +232,10 @@ body.pane-closed .side-pane{border-left-color:transparent}
 .pane-empty .i{width:28px;height:28px;stroke-width:1.4}
 .art-body{flex:1;min-height:0;display:flex;background:var(--bg)}
 .art-body iframe{flex:1;border:0;width:100%;height:100%;background:var(--bg)}
+.art-remote{margin:auto;max-width:360px;padding:24px;text-align:center;color:var(--muted);font-size:13px}
+.art-remote-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
+.art-remote-actions a{padding:6px 12px;border:var(--line) solid var(--border);border-radius:8px;color:var(--ink);text-decoration:none;font-size:12px}
+.art-remote-actions a:hover{background:var(--hover)}
 .ed-head{display:flex;align-items:center;gap:8px;padding:5px 8px 5px 14px;border-bottom:var(--line) solid var(--border);min-width:0;min-height:40px}
 .crumbs{display:flex;align-items:center;gap:4px;min-width:0;flex:1;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden}
 .crumbs b{color:var(--ink);font-weight:600}
@@ -247,6 +278,8 @@ dialog{border-radius:14px;background:var(--raised)}
 /* ---------- narrow screens: panels become drawers ---------- */
 @media(max-width:900px){
   .workspace{display:grid;grid-template-columns:0 minmax(0,1fr) 0 0!important;position:relative}
+  /* The panels below are fixed drawers, out of the grid: without this the conversation would fall into the 0-wide first column. */
+  .conversation{grid-column:2}
   .side-pane{position:fixed;inset:44px 0 0;z-index:18;border-left:0;transform:translateX(102%)}
   @media(prefers-reduced-motion:no-preference){.side-pane,.panel{transition:transform .22s cubic-bezier(.3,.7,.2,1)}}
   body:not(.pane-closed) .side-pane{transform:none}

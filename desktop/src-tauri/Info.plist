@@ -2,9 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Merged into the macOS bundle by Tauri. Studiolo servers answer plain http on the tailnet
      (WireGuard-encrypted), and App Transport Security would otherwise let the window reach only a
-     server on this computer. The exception covers *.ts.net only. -->
+     server on this computer. The exception covers *.ts.net only.
+     The microphone text is shown when voice input first records (src/recorder.rs). -->
 <plist version="1.0">
 <dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Studiolo records your voice for voice input and sends it to your Studiolo server to be transcribed.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSExceptionDomains</key>

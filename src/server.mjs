@@ -34,16 +34,19 @@ import {SubagentPolicy,SubagentKnowledge} from './subagents.mjs';
 import {PeerIndex} from './peer-index.mjs';
 import {DEFAULT_PORT,DEFAULT_PREVIEW_PORT,defaultStateDir,defaultProjectRoot,legacyProjectRoot} from './defaults.mjs';
 import {moveLegacyProjects} from './move-projects.mjs';
+import {serveClientUpdate} from './client-update.mjs';
+import {reveal as revealInFileManager,fileManager} from './reveal.mjs';
+import {pageView,runRecords} from './page-view.mjs';
 
 const here=path.dirname(fileURLToPath(import.meta.url));const publicRoot=path.resolve(here,'../public');
 const localAddress=x=>['127.0.0.1','::1','::ffff:127.0.0.1'].includes(x);
 const DRAFT_LIMIT=200000,EDIT_LIMIT=1024*1024;
 // A text file's version for the editor: the first 16 hex characters of the SHA-256 of its bytes.
 export const fileVersion=bytes=>createHash('sha256').update(bytes).digest('hex').slice(0,16);
-// The release this server runs: `version` (package.json, raised on every deploy, see CHANGELOG.md), the
-// desktop client release shipped with it (`clientVersion`) and `build`, a hash of the code, which an open page
+// The release this server runs: `version` (package.json, the open version until it is fixed, see CHANGELOG.md), the
+// desktop client release shipped with it (`clientVersion`, `clientBuild`) and `build`, a hash of the code, which an open page
 // compares with later bootstraps to offer a reload after an update.
-async function buildInfo(){const hash=createHash('sha256');for(const [dir,pattern] of [[publicRoot,/\.(js|css|html)$/],[here,/\.mjs$/]])for(const name of (await fs.readdir(dir)).filter(n=>pattern.test(n)).sort())hash.update(name+'\0').update(await fs.readFile(path.join(dir,name)));const read=async rel=>{try{return JSON.parse(await fs.readFile(path.resolve(here,rel),'utf8')).version||null;}catch{return null;}};return {version:await read('../package.json')||'0.0.0',clientVersion:await read('../desktop/src-tauri/tauri.conf.json'),build:hash.digest('hex').slice(0,16)};}
+async function buildInfo(){const hash=createHash('sha256');for(const [dir,pattern] of [[publicRoot,/\.(js|css|html)$/],[here,/\.mjs$/]])for(const name of (await fs.readdir(dir)).filter(n=>pattern.test(n)).sort())hash.update(name+'\0').update(await fs.readFile(path.join(dir,name)));const read=async(rel,key='version')=>{try{return JSON.parse(await fs.readFile(path.resolve(here,rel),'utf8'))[key]??null;}catch{return null;}};return {version:await read('../package.json')||'0.0.0',clientVersion:await read('../desktop/src-tauri/tauri.conf.json'),clientBuild:await read('../desktop/package.json','build')||0,build:hash.digest('hex').slice(0,16)};}
 const categoryName=name=>{if(typeof name!=='string'||!name.trim()||[...name.trim()].length>60||/[\r\n\x00-\x1f]/.test(name))throw httpError('分类名称需为 1–60 个字符的单行文本');return name.trim();};
 const equals=(a,b)=>typeof a==='string'&&typeof b==='string'&&Buffer.byteLength(a)===Buffer.byteLength(b)&&timingSafeEqual(Buffer.from(a),Buffer.from(b));
 async function body(req){let size=0;const chunks=[];for await(const chunk of req){size+=chunk.length;if(size>2*1024*1024)throw httpError('请求过大',413);chunks.push(chunk);}const buf=Buffer.concat(chunks).toString('utf8');try{return buf?JSON.parse(buf):{};}catch{throw httpError('无效 JSON');}}
@@ -72,7 +75,12 @@ export async function createStudio(options={}){
   // every peer in the host index; the accounts of this machine and their quota are appended when a
   // conversation starts.
   const subagentPolicy=new SubagentPolicy({file:path.join(projectRoot,'.studio-settings.json'),hostId});const subagentKnowledge=new SubagentKnowledge({runner,accountUsage,policy:subagentPolicy,helperPath:path.resolve(here,'../scripts/subagent.mjs')});
-  let replicas=null;const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),hooks:{beforeRun:(p,run,say,signal)=>replicas?.barrier(p,run,say,signal),afterRun:p=>replicas?.afterRun(p)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,forwarder:tailnet?.forwarder,tailnetName:tailnet?.dnsName,platformPorts:()=>[server?.address()?.port].filter(Boolean),bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set();const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
+  let replicas=null;const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),hooks:{beforeRun:(p,run,say,signal)=>replicas?.barrier(p,run,say,signal),afterRun:p=>replicas?.afterRun(p)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,forwarder:tailnet?.forwarder,tailnetName:tailnet?.dnsName,platformPorts:()=>[server?.address()?.port].filter(Boolean),bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set(),handoffs=new Map();
+  // Sign-in handoff: a signed-in page opens a Studiolo page in the default browser, or on another server,
+  // with a one-time ticket (60 s) instead of making that browser sign in again. A signed-in page can
+  // already approve devices on every server (/api/hosts/:id/devices), so a ticket grants nothing new.
+  const mintHandoff=()=>{const now=Date.now();for(const [ticket,expires] of handoffs)if(expires<now)handoffs.delete(ticket);if(handoffs.size>=100)throw httpError('登录票据过多，请稍后再试',429);const ticket=randomBytes(24).toString('hex');handoffs.set(ticket,now+60000);return ticket;};
+  const unsubscribe=store.subscribe(event=>{for(const res of clients)res.write('event: change\ndata: '+JSON.stringify(event)+'\n\n');});
   const uiState=new UiState({file:path.join(projectRoot,'.studio-ui.json'),hostId});
   const peerIndex=new PeerIndex({store,policy:subagentPolicy,ui:uiState,hostId});
   const app=await buildInfo();
@@ -92,6 +100,8 @@ export async function createStudio(options={}){
   const replicaActions={
     'commit-now':pid=>replicas.commitNow(pid),commit:(pid,i)=>replicas.commit(pid,{force:i.force===true}),push:(pid,i)=>replicas.push(pid,i.hostId),drop:pid=>replicas.drop(pid),footprint:pid=>replicas.footprint(pid),
     status:async pid=>({hostId,status:replicas.status.get(pid)||null}),
+    // A project view on a server without the files asks this one to read the Artifact manifest.
+    'discover-artifacts':pid=>artifacts.discover(pid),
     // Copies can take hours: they run in the background and report through status.
     add:async(pid,i)=>{replicas.add(pid,{replace:i.replace===true}).catch(()=>{});return {started:true};},
     pull:async(pid,i)=>{replicas.pull(pid,{force:i.force===true}).catch(e=>replicas.report(pid,{phase:'error',error:e.message}));return {started:true};},
@@ -133,6 +143,7 @@ export async function createStudio(options={}){
   const accountAuth=options.accountAuth||new AccountAuth({runner,onSuccess:async id=>{accountChanged();await login.refresh(id).catch(()=>{});}});
   const login=options.accountLogin||new AccountLogin({accounts,runner,oauth:accountAuth,onChange:accountChanged});
   const accountsView=async()=>{const list=await accounts.list();return (await runner.profiles()).map(p=>({...p,seed:list.find(a=>a.id===p.id)?.seed,lastError:list.find(a=>a.id===p.id)?.lastError||null}));};
+  const revealFile=options.reveal||revealInFileManager;
   const uploadLimit=options.uploadLimit??Number(process.env.STUDIO_UPLOAD_LIMIT||100*1024*1024);
   const transcribeLimit=options.transcribeLimit??Number(process.env.STUDIO_TRANSCRIBE_LIMIT||TRANSCRIBE_LIMIT);
   // Voice input (Settings → 语音转写, README「语音输入」): one machine keeps an OpenAI API key, like an account
@@ -161,9 +172,13 @@ export async function createStudio(options={}){
     const bearer=req.headers.authorization?.startsWith('Bearer ')?req.headers.authorization.slice(7):null;const cookie=/studio_session=([^;]+)/.exec(req.headers.cookie||'')?.[1];const ownHost=new URL(origin).hostname;const local=localAddress(req.socket.remoteAddress)&&['127.0.0.1','localhost','[::1]'].includes(ownHost)&&localAddress(bind);
     // Reachability probe for other origins (the desktop client's launcher, failover in another server's page): name, id and release only, no auth.
     if(pathname==='/api/identity'&&req.method==='GET'&&req.headers.origin&&req.headers.origin!==origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');return send(res,{protocol:2,hostId,name:machine.name,version:app.version});}
+    // Desktop client updates (client-update.mjs): signed bundles, no auth.
+    if(pathname.startsWith('/api/client/')&&await serveClientUpdate(req,res,{pathname,origin,dist:options.clientDist||path.resolve(here,'../desktop/dist'),clientVersion:app.clientVersion,clientBuild:app.clientBuild,build:Number(url.searchParams.get('build'))||0}))return;
     if(req.headers.origin&&req.headers.origin!==origin)throw httpError('跨站请求已拒绝',403);
     const peer=Boolean(token)&&equals(bearer,token);const trustedTailnet=tailnet?.trustedHosts?.has(ownHost.toLowerCase())&&localAddress(req.socket.remoteAddress);
     const sessionCookie=sid=>res.setHeader('Set-Cookie',`studio_session=${sid}; HttpOnly; SameSite=Strict; Path=/`);
+    const handoff=/^\/api\/handoff\/([0-9a-f]{48})$/.exec(pathname);
+    if(handoff&&req.method==='GET'){const expires=handoffs.get(handoff[1]);handoffs.delete(handoff[1]);if(!expires||expires<Date.now())throw httpError('这个登录链接已失效，请回到 Studiolo 重新打开',401);const sid=randomBytes(32).toString('hex');sessions.add(sid);sessionCookie(sid);const next=url.searchParams.get('next')||'/';res.writeHead(303,{Location:/^\/(?![/\\])/.test(next)?next:'/','Cache-Control':'no-store'});res.end();return;}
     let device=null;
     if(devices){
       // Device allowlist: the tailnet only carries the connection. A browser or app presents the secret it
@@ -172,7 +187,7 @@ export async function createStudio(options={}){
       if(!local&&!peer&&tailnet?.trustedHosts&&!trustedTailnet)throw httpError('需要访问令牌',401);
       if(pathname==='/api/device/login'&&req.method==='POST'){const input=await body(req);const known=await devices.identify({id:input.id,name:input.name,secret:input.secret,agent:req.headers['user-agent']});if(known.status==='approved')sessionCookie(devices.createSession(known.id));return send(res,{status:known.status,device:known});}
       if(['/api/auth','/api/login'].includes(pathname)&&req.method==='POST'){const input=await body(req);const known=devices.byBearer(input.token);if(!known)throw httpError('访问令牌不正确',401);sessionCookie(devices.createSession(known.id));return send(res,{ok:true,device:known});}
-      if(!local&&!peer){device=devices.session(cookie)||devices.byBearer(bearer);if(!device)throw Object.assign(httpError('此设备尚未获准访问',401),{code:'device'});}
+      if(!local&&!peer){device=devices.session(cookie)||devices.byBearer(bearer);if(!device&&!sessions.has(cookie))throw Object.assign(httpError('此设备尚未获准访问',401),{code:'device'});}
     }else{
       if(['/api/auth','/api/login'].includes(pathname)&&req.method==='POST'){const input=await body(req);if(!token||!equals(input.token,token))throw httpError('访问令牌不正确',401);const sid=randomBytes(32).toString('hex');sessions.add(sid);sessionCookie(sid);return send(res,{ok:true});}
       if(!(token?peer||sessions.has(cookie):local||trustedTailnet))throw httpError('需要访问令牌',401);
@@ -180,6 +195,9 @@ export async function createStudio(options={}){
     let parentOrigin=origin;if(req.headers['x-studio-parent-origin']){if(req.headers['x-studio-hop']!=='1')throw httpError('无效预览来源',403);const candidate=new URL(req.headers['x-studio-parent-origin']);if(!['http:','https:'].includes(candidate.protocol)||candidate.origin!==req.headers['x-studio-parent-origin'])throw httpError('无效预览来源');parentOrigin=candidate.origin;}
     if(pathname==='/api/logout'&&req.method==='POST'){sessions.delete(cookie);devices?.endSession(cookie);res.setHeader('Set-Cookie','studio_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,{ok:true});}
     if(pathname==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});res.write('event: change\ndata: {}\n\n');clients.add(res);const timer=setInterval(()=>res.write(': heartbeat\n\n'),15000);req.on('close',()=>{clearInterval(timer);clients.delete(res)});return;}
+    // Sign-in handoff (above): a ticket for this server, or one from another server through the peer token.
+    const mint=/^\/api\/hosts\/([^/]+)\/handoff$/.exec(pathname);
+    if(mint&&req.method==='POST'){if(mint[1]===hostId)return send(res,{ticket:mintHandoff()});if(req.headers['x-studio-hop'])throw httpError('Host not found',404);const host=await hosts.get(mint[1],origin);return send(res,await hosts.request(host,`/api/hosts/${encodeURIComponent(mint[1])}/handoff`,{method:'POST',data:{}}));}
     // Account management and quota, for this machine or (forwarded) for another online host.
     let accountPath=pathname==='/api/account-usage'||pathname.startsWith('/api/accounts')?pathname:null;
     const viaHost=/^\/api\/hosts\/([^/]+)(\/(?:accounts|account-usage|devices)(?:\/.*)?)$/.exec(pathname);
@@ -233,6 +251,13 @@ export async function createStudio(options={}){
       if(bound)return send(res,await hosts.request(bound,'/api/transcribe'+url.search,{method:'POST',raw:audio.bytes,headers:{'Content-Type':req.headers['content-type']},timeout:90000}));
       throw httpError('还没有设置语音转写：在设置 → 语音转写里添加 OpenAI API key',503);
     }
+    // Live dictation: a short-lived OpenAI client secret from the machine with the key; the page then streams to OpenAI itself.
+    if(pathname==='/api/transcribe/realtime'&&req.method==='POST'){
+      if(await openaiTranscriber.available())return send(res,await openaiTranscriber.realtimeSecret(transcribeOptions(url,req.headers)));
+      const bound=req.headers['x-studio-hop']?null:await transcriptionHost(origin);
+      if(bound)return send(res,await hosts.request(bound,'/api/transcribe/realtime'+url.search,{method:'POST',timeout:30000}));
+      throw httpError('还没有设置语音转写：在设置 → 语音转写里添加 OpenAI API key',503);
+    }
     if(pathname==='/api/settings/transcription')return send(res,await transcriptionSettings(req,origin,['PUT'].includes(req.method)?await body(req):{}));
     // Subagent routing rules (shared) plus a preview of the section this machine would append to a new conversation.
     if(pathname==='/api/settings/subagents'){
@@ -244,7 +269,7 @@ export async function createStudio(options={}){
     if(pathname==='/api/settings/ui'){if(req.method==='GET')return send(res,await uiState.read());if(req.method==='PUT')return send(res,await uiState.set(await body(req)));throw httpError('Method not allowed',405);}
     if(pathname==='/api/archives'&&req.method==='GET')return send(res,await listArchives(store));
     if(pathname==='/api/identity')return send(res,{protocol:2,hostId,name:machine.name,...app,profiles:await runner.profiles(),transcribe:await openaiTranscriber.available(),...(req.headers['x-studio-hop']?{files:hosts.files}:{})});
-    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,...app,features:{voiceInput:Boolean(await transcriptionHost(origin)),transcribe:Boolean(await transcriptionHost(origin)),deviceAllowlist:Boolean(devices)},device:device?{id:device.id,name:device.name}:null,projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin)),ui:await uiState.read()});
+    if(pathname==='/api/bootstrap')return send(res,{protocol:2,hostId,...app,features:{voiceInput:Boolean(await transcriptionHost(origin)),transcribe:Boolean(await transcriptionHost(origin)),deviceAllowlist:Boolean(devices),reveal:local?fileManager():null},device:device?{id:device.id,name:device.name}:null,projects:await store.listProjects(),profiles:await runner.profiles(),hosts:hosts.visible(await hosts.online(origin)),ui:await uiState.read()});
     // Server registry (machine.json). Registering B on A also registers A on B through B's
     // /api/peer/hello, so the user does it once; removal tells the peer the same way.
     if(pathname==='/api/hosts'&&req.method==='GET')return send(res,await hosts.configured(origin));
@@ -265,6 +290,9 @@ export async function createStudio(options={}){
       if(typeof input.digest==='string'&&input.known===undefined&&input.events===undefined){const names=await store.journalNames(pid),digest=journalDigest(names);return send(res,digest===input.digest?{same:true,digest,names:[],events:[]}:{names,events:[],digest});}
       await store.importJournal(pid,input.events||[]);const result=await store.journal(pid,input.known||[]);return send(res,{...result,digest:journalDigest(result.names)});}
     let state=await store.read(pid);const project=state.project;
+    // A run's full tool records for the page's raw log, from this server's own copy of the journal.
+    const recordsRoute=/^\/runs\/([^/]+)\/records$/.exec(tail);
+    if(recordsRoute&&req.method==='GET')return send(res,runRecords(state,recordsRoute[1]));
     if(tail==='/runtime'&&req.method==='GET'){const live=queue.overlay(pid,state);const ids=new Set([...queue.live.values()].filter(x=>x.projectId===pid).map(x=>x.runId));return send(res,{runs:live.runs.filter(r=>ids.has(r.id)),messages:live.messages.filter(m=>ids.has(m.runId)),nativeRuntime:runner.runtime?.(`${pid}:`)||{}});}
     // Peer side of replica work (sync-engine.mjs); /peer/versions/<id> hands out a manifest.
     const peerAction=/^\/peer\/([a-z-]+)$/.exec(tail),peerVersion=/^\/peer\/versions\/([^/]+)$/.exec(tail);
@@ -376,9 +404,20 @@ export async function createStudio(options={}){
       return send(res,result);
     }
     if(inactive(state.project)&&req.method!=='GET')throw httpError('项目已归档或删除，请先恢复',409);
-    if(!tail&&req.method==='GET'){const discovery=inactive(state.project)?{}:await artifacts.discover(pid,state);if(discovery.changed)state=await store.read(pid);state=queue.overlay(pid,state);const nativeRuntime=runner.runtime?.(`${pid}:`)||{};
+    // The complete project view: artifacts discovered, uncommitted live output overlaid, runs
+    // executing on other online machines refreshed, every conversation bound to its machine. A run of
+    // this machine that ended since the read has left the live overlay too, so the read is repeated:
+    // the page would otherwise get it executing without its last output.
+    // Artifacts are discovered where the files are: a server holding only the metadata asks the file host,
+    // and the journal it then pulls brings the new Artifacts here.
+    const discover=async()=>{if(inactive(state.project))return {};const files=fileHost(state);if(files===hostId||req.headers['x-studio-hop'])return artifacts.discover(pid,state);
+      try{const host=await hosts.get(files,origin);const result=await hosts.request(host,`/api/projects/${pid}/peer/discover-artifacts`,{method:'POST',data:{},timeout:4000});if(result.changed)await hosts.sync(store,host,pid);return result;}catch{return {};}};
+    const assemble=async()=>{const discovery=await discover();const ended=()=>state.runs.some(r=>r.status==='running'&&(!r.hostId||r.hostId===hostId)&&!queue.controllers.has(r.id));if(discovery.changed||ended())state=await store.read(pid);state=queue.overlay(pid,state);const nativeRuntime=runner.runtime?.(`${pid}:`)||{};
       if(!req.headers['x-studio-hop'])await Promise.all((await hosts.online(origin)).filter(h=>!h.local&&state.runs.some(r=>r.hostId===h.id&&['running','waiting','queued'].includes(r.status))).map(async h=>{try{const live=await hosts.request(h,`/api/projects/${pid}/runtime`);for(const r of live.runs){const i=state.runs.findIndex(x=>x.id===r.id&&x.hostId===h.id);if(i>=0)state.runs[i]=r;}for(const message of live.messages){const i=state.messages.findIndex(x=>x.id===message.id);if(i>=0)state.messages[i]=message;else state.messages.push(message);}Object.assign(nativeRuntime,live.nativeRuntime);}catch{}}));
-      return send(res,{...state,sessions:state.sessions.map(s=>sessionBinding(state,s.id)),artifactDiscoveryError:discovery.error||undefined,nativeRuntime});}
+      return {...state,filesHostId:fileHost(state),sessions:state.sessions.map(s=>sessionBinding(state,s.id)),artifactDiscoveryError:discovery.error||undefined,nativeRuntime};};
+    // The web page asks for one conversation (?session=) or one Artifact's threads (?artifact=), with
+    // tool records of ended runs as previews; without either, the full view.
+    if(!tail&&req.method==='GET'){const sessionId=url.searchParams.get('session'),artifactId=url.searchParams.get('artifact');const full=await assemble();return send(res,sessionId||artifactId?pageView(full,{sessionId,artifactId}):full);}
     if(tail==='/sessions'&&req.method==='POST'){const input=await readBody();if(input.title!==undefined&&(typeof input.title!=='string'||[...input.title.trim()].length>120||/[\r\n\x00-\x1f]/.test(input.title)))throw httpError('请输入 1–120 个字符的单行标题');const session={id:randomUUID(),createdHostId:hostId,title:input.title?.trim()||'新会话',createdAt:new Date().toISOString()};session.titleSource=needsTitle(session)?'pending':'manual';await store.mutate(pid,'session.created',s=>s.sessions.push(session));return send(res,session,201);}
     // A fork starts unbound: the first send picks its computer and account.
     const forkRoute=/^\/sessions\/([^/]+)\/fork$/.exec(tail);if(forkRoute&&req.method==='POST'){await readBody();const source=state.sessions.find(s=>s.id===forkRoute[1]&&!s.deletedAt);if(!source)throw httpError('会话不存在',404);if(inactive(project))throw httpError('项目已归档或删除，请先恢复',409);const at=new Date().toISOString(),session={id:randomUUID(),createdHostId:hostId,title:`${source.title} · 分叉`.slice(0,120),titleSource:'manual',createdAt:at,forkOf:{projectId:pid,sessionId:source.id,at}};await store.mutate(pid,'session.forked',s=>{s.sessions.push(session);const from=s.sessions.find(x=>x.id===source.id);from.forks=[...(from.forks||[]),session.id];});return send(res,session,201);}
@@ -402,6 +441,8 @@ export async function createStudio(options={}){
     const cancel=/^\/runs\/([^/]+)\/cancel$/.exec(tail);if(cancel&&req.method==='POST'){await queue.cancel(pid,cancel[1]);return send(res,{ok:true});}
     // Stop the current turn but keep the native process and session (Esc in the CLIs).
     const interrupt=/^\/runs\/([^/]+)\/interrupt$/.exec(tail);if(interrupt&&req.method==='POST'){await queue.interrupt(pid,interrupt[1]);return send(res,{ok:true});}if(tail==='/queues/resume'&&req.method==='POST'){const input=await readBody();await queue.resume(pid,input.queueId);return send(res,{ok:true});}
+    // Show in File Explorer: only for a page on this machine (127.0.0.1), and only where the files are.
+    if(tail==='/reveal'&&req.method==='POST'){if(!local)throw httpError('只能在这台电脑上用 127.0.0.1 打开 Studiolo 时使用',403);if(files!==hostId)throw httpError('项目文件不在这台电脑上',409);const rel=typeof input.path==='string'?input.path:'';const target=await safePath(project.path,rel);await revealFile(target,{directory:(await fs.stat(target)).isDirectory()});return send(res,{ok:true});}
     if(tail==='/files'){const rel=url.searchParams.get('path')||'';const dir=await safePath(project.path,rel);const entries=await fs.readdir(dir,{withFileTypes:true});const results=[];for(const entry of entries.filter(e=>!['.git','node_modules'].includes(e.name))){const p=path.posix.join(rel.replaceAll('\\','/'),entry.name);try{await safePath(project.path,p);results.push({name:entry.name,path:p,type:entry.isDirectory()?'directory':'file'});}catch{}}return send(res,results.sort((a,b)=>a.type===b.type?a.name.localeCompare(b.name):a.type==='directory'?-1:1));}
     // Text files carry a version (fileVersion); an edit names the version it started from and is refused once the file changed.
     const fileMeta=(rel,bytes,info)=>({path:rel,version:fileVersion(bytes),size:info.size,mtime:info.mtime.toISOString()});
@@ -418,13 +459,16 @@ export async function createStudio(options={}){
     if(tail==='/artifacts'&&req.method==='POST')return send(res,await artifacts.create(pid,await readBody()),201);
     const art=/^\/artifacts\/([^/]+)\/(start|persist|stop|status|snapshot|restore|annotations)$/.exec(tail);if(art){const aid=art[1],action=art[2];if(action==='status')return send(res,await artifacts.status(pid,aid,parentOrigin,origin));if(req.method!=='POST')throw httpError('需要 POST',405);if(action==='start')return send(res,await artifacts.start(pid,aid,parentOrigin,origin));if(action==='persist')return send(res,await artifacts.persist(pid,aid,parentOrigin,origin));if(action==='stop'){await artifacts.halt(pid,aid);return send(res,{running:false});}if(action==='snapshot')return send(res,await artifacts.snapshot(pid,aid));if(action==='restore')return send(res,await artifacts.restore(pid,aid,(await readBody()).snapshotId));if(action==='annotations'){const input=await readBody();if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);await artifacts.lookup(pid,aid);if(!input.text?.trim()||!input.requestId)throw httpError('需要批注文本及 requestId');let annotation=state.annotations.find(a=>a.requestId===input.requestId);if(!annotation){const annotationId=randomUUID();const anchor=await saveAnchorEvidence(project,annotationId,input.anchor||{});annotation={id:annotationId,requestId:input.requestId,artifactId:aid,text:input.text.trim(),anchor,anchorStatus:'attached',status:'open',createdAt:new Date().toISOString()};await store.mutate(pid,'annotation.created',s=>{if(!s.annotations.some(a=>a.requestId===input.requestId))s.annotations.push(annotation);else annotation=s.annotations.find(a=>a.requestId===input.requestId);});}const run=await queue.submit(pid,{...input,artifactId:aid,annotationId:annotation.id,queueId:'artifact:'+aid,hostId});return send(res,{annotation,run},201);}}
     const evidence=/^\/annotations\/([^/]+)\/evidence$/.exec(tail);if(evidence&&req.method==='GET'&&artifactHostOf(project)&&artifactHostOf(project)!==hostId&&!req.headers['x-studio-hop'])return hosts.proxy(await filesOnline(artifactHostOf(project),origin),req,res,pathname);if(evidence&&req.method==='GET'){const annotation=state.annotations.find(a=>a.id===evidence[1]);if(!annotation)throw httpError('批注不存在',404);return sendImage(res,await readAnchorEvidence(project,annotation));}
-    const ann=/^\/annotations\/([^/]+)$/.exec(tail);if(ann&&req.method==='PATCH'){const input=await readBody();let result;await store.mutate(pid,'annotation.updated',s=>{const a=s.annotations.find(a=>a.id===ann[1]);if(!a)throw httpError('批注不存在',404);if(input.status){if(!['open','resolved'].includes(input.status))throw httpError('无效状态');a.status=input.status;}if(input.anchorStatus){if(!['attached','orphaned','unlocated'].includes(input.anchorStatus))throw httpError('无效锚点状态');a.anchorStatus=input.anchorStatus;}result=a;});return send(res,result);}
+    const ann=/^\/annotations\/([^/]+)$/.exec(tail);if(ann&&req.method==='PATCH'){const input=await readBody();let result;await store.mutate(pid,'annotation.updated',s=>{const a=s.annotations.find(a=>a.id===ann[1]);if(!a)throw httpError('批注不存在',404);if(input.status){if(!['open','resolved'].includes(input.status))throw httpError('无效状态');a.status=input.status;}if(input.anchorStatus){if(!['attached','orphaned','unlocated'].includes(input.anchorStatus))throw httpError('无效锚点状态');a.anchorStatus=input.anchorStatus;}result=a;});
+      // A resolved thread with nothing left to run closes its agent process; a later reply resumes its native session.
+      if(result.status==='resolved'&&!(await store.read(pid)).runs.some(r=>r.annotationId===result.id&&['queued','running','waiting'].includes(r.status)))await runner.release?.(`${pid}:artifact:${result.artifactId}:${result.id}:`);
+      return send(res,result);}
     throw httpError('接口不存在',404);
   }
   const server=http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)send(res,{error:e.message,...(e.status&&typeof e.code==='string'?{code:e.code}:{})},e.status||400);else res.end();}));const port=options.port??Number(process.env.STUDIO_PORT||DEFAULT_PORT);try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,bind,resolve)});if(tailnet)await tailnet.forwarder.expose(server.address().port);await queue.init();artifacts.resumePersistent().catch(error=>console.error('常驻 Artifact 恢复失败：',error.message));}catch(error){unsubscribe();await queue.close();await artifacts.close();if(server.listening)await new Promise(r=>server.close(r));throw error;}
   let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{await purger.reconcile().catch(e=>{purger.lastError=e.message;});const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;for(const h of peers)try{await hosts.syncIndex(peerIndex,h);}catch(e){hosts.lastSyncError=e.message;}const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
   // Projects soft-deleted before hard deletion existed are removed once, after startup.
   const legacyPurge=purger.reconcile({legacy:true}).catch(e=>{purger.lastError=e.message;console.error('Project purge failed: '+e.message);});
-  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);for(const timer of editCommits.values())clearTimeout(timer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await devices?.close();await new Promise(r=>server.close(r));}};
+  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);for(const timer of editCommits.values())clearTimeout(timer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await store.flushAll?.();await devices?.close();await new Promise(r=>server.close(r));}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}

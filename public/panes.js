@@ -4,14 +4,16 @@ import { $ } from './ui.js';
 // this browser (localStorage); whether the side pane is open belongs to the project (tabs.js).
 // Dragging a handle below its snap width collapses that panel; a double click restores the default.
 const DEF = { left: 280, right: 300, pane: 520 }, MIN = { left: 200, right: 220, pane: 320 }, SNAP = { left: 140, right: 140, pane: 220 }, CHAT_MIN = 360;
+// The project list keeps USAGE_ROOM above the account usage panel (layout.css).
+const USAGE_ROOM = 160;
 const KEY = 'studio-layout';
 const narrow = matchMedia('(max-width:900px)');
 function load() { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; } }
 export function initPanes({ onPaneToggle }) {
   const saved = load(), body = document.body, ws = $('#workspace');
-  const layout = { left: saved.left || DEF.left, right: saved.right || DEF.right, pane: saved.pane || DEF.pane, leftOpen: saved.leftOpen !== false, rightOpen: saved.rightOpen !== false, paneOpen: false, paneMax: false };
+  const layout = { left: saved.left || DEF.left, right: saved.right || DEF.right, pane: saved.pane || DEF.pane, leftOpen: saved.leftOpen !== false, rightOpen: saved.rightOpen !== false, paneOpen: false, paneMax: false, usage: saved.usage || null };
   let restored = false;
-  const save = () => { try { localStorage.setItem(KEY, JSON.stringify({ left: layout.left, right: layout.right, pane: layout.pane, leftOpen: layout.leftOpen, rightOpen: layout.rightOpen })); } catch {} };
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify({ left: layout.left, right: layout.right, pane: layout.pane, leftOpen: layout.leftOpen, rightOpen: layout.rightOpen, usage: layout.usage })); } catch {} };
   // The side pane may grow until the chat would drop below CHAT_MIN.
   const maxW = (side, live) => {
     if (side === 'left') return 480;
@@ -73,6 +75,27 @@ export function initPanes({ onPaneToggle }) {
     });
     handle.addEventListener('dblclick', () => { layout[side] = DEF[side]; apply(); save(); });
   });
+  // The account usage panel at the foot of the sidebar: its top edge sets its height (null: as tall as
+  // it needs, layout.css caps it); the account list scrolls inside.
+  const usage = $('#account-usage'), usageHandle = $('#usage-handle');
+  const sizeUsage = height => { usage.style.height = height ? height + 'px' : ''; usage.classList.toggle('sized', Boolean(height)); };
+  sizeUsage(layout.usage);
+  usageHandle.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    event.preventDefault(); usageHandle.setPointerCapture(event.pointerId);
+    // At least the title, the footer and one account stay visible.
+    const rows = usage.querySelector('.quota-rows'), y0 = event.clientY, h0 = usage.getBoundingClientRect().height;
+    const min = h0 - (rows?.clientHeight || 0) + (rows?.firstElementChild?.offsetHeight || 40), max = usage.parentElement.clientHeight - USAGE_ROOM; let height = h0;
+    body.classList.add('resizing'); usageHandle.classList.add('active');
+    const move = ev => { height = Math.round(Math.max(min, Math.min(max, h0 - (ev.clientY - y0)))); sizeUsage(height); };
+    const up = () => {
+      usageHandle.removeEventListener('pointermove', move); usageHandle.removeEventListener('pointerup', up); usageHandle.removeEventListener('pointercancel', up);
+      body.classList.remove('resizing'); usageHandle.classList.remove('active');
+      layout.usage = height; save();
+    };
+    usageHandle.addEventListener('pointermove', move); usageHandle.addEventListener('pointerup', up); usageHandle.addEventListener('pointercancel', up);
+  });
+  usageHandle.addEventListener('dblclick', () => { layout.usage = null; sizeUsage(null); save(); });
   addEventListener('keydown', event => {
     if (!(event.ctrlKey || event.metaKey)) return;
     if (event.key.toLowerCase() === 'b' && !event.shiftKey) { event.preventDefault(); toggle(event.altKey ? 'right' : 'left'); }

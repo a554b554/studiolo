@@ -65,9 +65,40 @@ function validateState(state) {
   }
 }
 
+// Which readable views a commit changes: the conversations and Artifacts its records belong to.
+// The history index is always rewritten. Without a change list (a full state) everything is.
+function dirtyViews(before, after, patch) {
+  if (!Array.isArray(patch)) return null;
+  const sessions = new Set(), artifacts = new Set(), indexes = new Map();
+  const find = (collection, id) => {
+    let index = indexes.get(collection);
+    if (!index) { index = new Map(); for (const state of [before, after]) for (const record of state?.[collection] || []) index.set(record.id, record); indexes.set(collection, index); }
+    return index.get(id);
+  };
+  for (const op of patch) {
+    const [collection, id] = op.path || [];
+    if (collection === 'messages') {
+      const message = find('messages', id); if (!message) continue;
+      if (message.sessionId) sessions.add(message.sessionId);
+      const artifactId = message.artifactId || (message.annotationId && find('annotations', message.annotationId)?.artifactId);
+      if (artifactId) artifacts.add(artifactId);
+    } else if (collection === 'sessions') sessions.add(id);
+    else if (collection === 'annotations') { const annotation = find('annotations', id); if (annotation) artifacts.add(annotation.artifactId); }
+    else if (collection === 'artifacts') artifacts.add(id);
+  }
+  return { sessions, artifacts };
+}
+// The order a distributed journal is replayed in.
+const eventOrder = (a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id);
+const later = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; };
+
 /** Immutable transaction files are authoritative; state.json and Markdown are rebuildable. */
 export class Store {
-  constructor({ stateDir = defaultStateDir(), hostId, projectRoot } = {}) {
+  // Readable views are written after the commit, not in it: the Markdown of
+  // the conversations and Artifacts that changed `deriveDelay` ms later, state.json once the project
+  // has been quiet for `stateDelay` ms (at most four times that after its first change). A run
+  // flushes its project first, so the agent reads current history; close() flushes everything.
+  constructor({ stateDir = defaultStateDir(), hostId, projectRoot, deriveDelay = 1500, stateDelay = 15000, verifyInterval = 60000 } = {}) {
     if (!hostId) throw error('hostId is required');
     this.stateDir = path.resolve(stateDir);
     this.hostId = hostId;
@@ -80,6 +111,56 @@ export class Store {
     this.eventLoads = new Map();
     this.derivedCache = new Map();
     this.journalCache = new Map();
+    this.deriveDelay = deriveDelay;
+    this.stateDelay = stateDelay;
+    this.derivePending = new Map();
+    // Journal replays (_loadDistributed): one at a time per journal; every file rechecked this often.
+    this.journalLocks = new Map();
+    this.verifyInterval = verifyInterval;
+  }
+
+  _scheduleDerive(id, root, dirty) {
+    let pending = this.derivePending.get(id);
+    if (!pending) { pending = { root, all: false, markdown: false, sessions: new Set(), artifacts: new Set(), patches: [], since: Date.now() }; this.derivePending.set(id, pending); }
+    pending.root = root; pending.markdown = true;
+    // Views of a journal still missing parents cannot be built yet; only a local commit reports that.
+    if (!dirty?.patch && dirty !== null) pending.strict = true;
+    // `patch`: imported changes, resolved against the state when the views are written.
+    if (!dirty) pending.all = true;
+    else if (dirty.patch) pending.patches.push(dirty.patch);
+    else { for (const sid of dirty.sessions) pending.sessions.add(sid); for (const aid of dirty.artifacts) pending.artifacts.add(aid); }
+    pending.timer ||= later(() => this.flushDerived(id, { state: false }), this.deriveDelay);
+    clearTimeout(pending.stateTimer);
+    pending.stateTimer = later(() => this.flushDerived(id), Math.max(0, Math.min(this.stateDelay, pending.since + 4 * this.stateDelay - Date.now())));
+  }
+
+  // Writes the pending views of a project now; `state: false` leaves state.json for its own timer.
+  async flushDerived(id, { state = true } = {}) {
+    if (!this.derivePending.has(id)) return;
+    return this._serial(id, async () => {
+      const pending = this.derivePending.get(id);
+      if (!pending) return;
+      clearTimeout(pending.timer); pending.timer = null;
+      const work = { strict: pending.strict, all: pending.all, markdown: pending.markdown, sessions: pending.sessions, artifacts: pending.artifacts, patches: pending.patches, state };
+      Object.assign(pending, { strict: false, all: false, markdown: false, sessions: new Set(), artifacts: new Set(), patches: [] });
+      if (state) { clearTimeout(pending.stateTimer); this.derivePending.delete(id); }
+      if (!work.markdown && !state) return;
+      try {
+        const entry = this._entry(id);
+        if (entry.stub) return;
+        const current = (await this._load(pending.root)).state;
+        for (const patch of work.patches) { const views = dirtyViews(null, current, patch); for (const sid of views.sessions) work.sessions.add(sid); for (const aid of views.artifacts) work.artifacts.add(aid); }
+        await this._derive(pending.root, current, work);
+        this.derivedErrors.delete(id);
+      } catch (e) { if (work.strict) { this.lastDerivedError = e.message; this.derivedErrors.set(id, e.message); } }
+    });
+  }
+
+  async flushAll() { await Promise.all([...this.derivePending.keys()].map(id => this.flushDerived(id))); }
+
+  _cancelDerive(id) {
+    const pending = this.derivePending.get(id);
+    if (pending) { clearTimeout(pending.timer); clearTimeout(pending.stateTimer); this.derivePending.delete(id); }
   }
 
   async init() {
@@ -160,6 +241,7 @@ export class Store {
     this.journalCache.delete(root);
     for (const filename of this.derivedCache.keys()) if (filename.startsWith(root + path.sep)) this.derivedCache.delete(filename);
     this.derivedErrors.delete(id);
+    this._cancelDerive(id);
     await this._serial('registry', async () => {
       const before = this.registry.projects.length;
       this.registry.projects = this.registry.projects.filter(p => p.id !== id);
@@ -325,32 +407,87 @@ export class Store {
     return previous;
   }
 
+  // The distributed journal replays every event in (sequence, id) order onto the root snapshot. A new
+  // event made the cached replay stale and every read replayed thousands of events again (300–450 ms on
+  // a large project). When the journal only gained events that sort after everything already applied,
+  // applying just those to the cached state is the same replay, so that is done instead.
+  // Anything else (an event from a concurrent branch that sorts earlier, a
+  // file gone or replaced, an error) and a periodic check of every file's identity take the full
+  // replay. One journal is replayed by one load at a time, so no event is applied twice.
   async _loadDistributed(root, names) {
-    const base=await this._loadEvents(root,false,true);
-    const prints=await Promise.all(names.map(name=>fingerprint(root,name)));
-    const cached=this.eventCache.get(root);
-    const signature=(this.eventCache.get(root+':legacy')?.fingerprints||[base.id]).join('|')+':'+prints.join('|');
-    if(cached?.signature===signature)return cached.event;
-    let parsed=this.journalCache.get(root)||new Map();
-    const events=[];
-    for(let i=0;i<names.length;i++){
-      let event=parsed.get(prints[i]);
-      if(!event){event=JSON.parse(await fs.readFile(path.join(root,'events',names[i]),'utf8'));parsed.set(prints[i],event);}
-      if(event.schemaVersion!==2 || event.projectId!==base.state.project.id || !Array.isArray(event.parents) || !event.parents.length || !Array.isArray(event.changes) || names[i]!==`v2-${String(event.sequence).padStart(12,'0')}-${event.id}.json`)throw error('Invalid distributed journal event',409);
-      events.push(event);
-    }
-    this.journalCache.set(root,new Map(prints.map(x=>[x,parsed.get(x)])));
-    events.sort((a,b)=>a.sequence-b.sequence||a.id.localeCompare(b.id));
-    const seen=new Map([[base.id,base.sequence]]),tips=new Set([base.id]);
-    const state=clone(base.state);
+    const previous=this.journalLocks.get(root)||Promise.resolve();
+    let release;const lock=new Promise(resolve=>{release=resolve;});const chained=previous.then(()=>lock);
+    this.journalLocks.set(root,chained);
+    await previous;
+    try{
+      const base=await this._loadEvents(root,false,true);
+      const baseKey=(this.eventCache.get(root+':legacy')?.fingerprints||[base.id]).join('|');
+      const cached=this.eventCache.get(root);
+      if(cached?.baseKey===baseKey&&Date.now()-cached.verifiedAt<this.verifyInterval&&cached.names.length<=names.length&&cached.names.every((name,i)=>name===names[i])){
+        if(cached.names.length===names.length)return cached.event;
+        try{return await this._applyNew(root,cached,names,base);}
+        catch{this.eventCache.delete(root);}
+      }
+      return await this._replay(root,names,base,baseKey);
+    }finally{release();if(this.journalLocks.get(root)===chained)this.journalLocks.delete(root);}
+  }
+
+  _checkEvent(event,name,base){
+    if(event.schemaVersion!==2 || event.projectId!==base.state.project.id || !Array.isArray(event.parents) || !event.parents.length || !Array.isArray(event.changes) || name!==`v2-${String(event.sequence).padStart(12,'0')}-${event.id}.json`)throw error('Invalid distributed journal event',409);
+  }
+
+  _applyEvents(state,events,seen,tips){
     for(const event of events){
       if(seen.has(event.id)||event.parents.some(id=>!seen.has(id))||event.sequence!==1+Math.max(...event.parents.map(id=>seen.get(id))))throw error('Divergent or incomplete distributed history; waiting for synchronization',409);
       applyChanges(state,event.changes);seen.set(event.id,event.sequence);
       for(const id of event.parents)tips.delete(id);tips.add(event.id);
     }
+  }
+
+  async _replay(root,names,base,baseKey){
+    const prints=await Promise.all(names.map(name=>fingerprint(root,name)));
+    const cached=this.eventCache.get(root);
+    const signature=baseKey+':'+prints.join('|');
+    if(cached?.signature===signature){cached.names=names;cached.verifiedAt=Date.now();return cached.event;}
+    let parsed=this.journalCache.get(root)||new Map();
+    const events=[];
+    for(let i=0;i<names.length;i++){
+      let event=parsed.get(prints[i]);
+      if(!event){event=JSON.parse(await fs.readFile(path.join(root,'events',names[i]),'utf8'));parsed.set(prints[i],event);}
+      this._checkEvent(event,names[i],base);
+      events.push(event);
+    }
+    this.journalCache.set(root,new Map(prints.map(x=>[x,parsed.get(x)])));
+    events.sort(eventOrder);
+    const seen=new Map([[base.id,base.sequence]]),tips=new Set([base.id]);
+    const state=clone(base.state);
+    this._applyEvents(state,events,seen,tips);
     validateState(state);if(state.project.id!==base.state.project.id)throw error('Project identity changed in journal',409);migrateProject(state.project);
     const last=events.at(-1),result={...last,state,tips:[...tips].sort()};
-    this.eventCache.set(root,{signature,event:result});return result;
+    this.eventCache.set(root,{signature,baseKey,names,prints,seen,tips,last,verifiedAt:Date.now(),event:result});return result;
+  }
+
+  // The cached replay state is advanced in place; a failure drops the cache and replays in full.
+  async _applyNew(root,cached,names,base){
+    const fresh=names.slice(cached.names.length);
+    const prints=await Promise.all(fresh.map(name=>fingerprint(root,name)));
+    const parsed=this.journalCache.get(root)||new Map();
+    const events=[];
+    for(let i=0;i<fresh.length;i++){
+      let event=parsed.get(prints[i]);
+      if(!event){event=JSON.parse(await fs.readFile(path.join(root,'events',fresh[i]),'utf8'));parsed.set(prints[i],event);}
+      this._checkEvent(event,fresh[i],base);
+      events.push(event);
+    }
+    events.sort(eventOrder);
+    if(eventOrder(events[0],cached.last)<=0)throw error('Journal gained an earlier event',409);
+    const state=cached.event.state;
+    this._applyEvents(state,events,cached.seen,cached.tips);
+    validateState(state);if(state.project.id!==base.state.project.id)throw error('Project identity changed in journal',409);migrateProject(state.project);
+    const last=events.at(-1),result={...last,state,tips:[...cached.tips].sort()};
+    this.journalCache.set(root,parsed);
+    cached.prints=[...cached.prints,...prints];cached.names=names;cached.signature=cached.baseKey+':'+cached.prints.join('|');cached.last=last;cached.event=result;
+    return result;
   }
 
   // Sorted journal file names, the root snapshot events (v1) first: peers compare these every
@@ -371,21 +508,21 @@ export class Store {
     return this._serial(id,async()=>{
       const entry=this._entry(id);await this._checkManagedEntry(entry);
       const root=path.join(entry.path,'.studio');await assertMetadataDirectories(root);
-      let written=0;
+      let written=0;const imported=[];
       for(const {name,event} of events){
         const valid=name.startsWith('v2-')
           ? event?.schemaVersion===2&&event.projectId===id&&name===`v2-${String(event.sequence).padStart(12,'0')}-${event.id}.json`&&Array.isArray(event.changes)&&Array.isArray(event.parents)
           : event?.schemaVersion===1&&event.state?.project?.id===id&&name===`${String(event.sequence).padStart(12,'0')}-${event.id}.json`;
         if(!journalName.test(name)||!valid)throw error('Invalid journal');
         const file=path.join(root,'events',name),text=JSON.stringify(event);
-        try{const old=await fs.readFile(file,'utf8');if(old!==text)throw error('Journal identity collision',409);}catch(e){if(e.code!=='ENOENT')throw e;await atomicWrite(file,text);written++;}
+        try{const old=await fs.readFile(file,'utf8');if(old!==text)throw error('Journal identity collision',409);}catch(e){if(e.code!=='ENOENT')throw e;await atomicWrite(file,text);written++;imported.push(name.startsWith('v2-')?event.changes:null);}
       }
       // Peers exchange empty journals every few seconds while idle. Only a file that actually
       // landed on disk invalidates in-flight reads and wakes every connected browser tab.
       if(!written)return;
       this.eventLoads.delete(`${root}:false`);this.eventLoads.delete(`${root}:true`);
       // Replicas keep their own readable history views current; a journal still missing parents is skipped.
-      if(!entry.stub)try{await this._derive(root,(await this._load(root)).state);}catch{}
+      if(!entry.stub)this._scheduleDerive(id,root,imported.every(Boolean)?{patch:imported.flat()}:null);
       this._notify(id,'journal.synced');
     });
   }
@@ -454,9 +591,9 @@ export class Store {
       if (state.project.id !== id) throw error('Project identity cannot change');
       // _commit serializes before writing. Failed callbacks never publish an event.
       const event = await this._commit(root, state, type, previous);
-      // Once the authority committed, a failed derived view must not report a failed transaction.
-      try { if (!entry.stub) await this._derive(root, event.state); this.derivedErrors.delete(id); }
-      catch (e) { this.lastDerivedError = e.message; this.derivedErrors.set(id, e.message); }
+      // Once the authority committed, a failed derived view must not report a failed transaction;
+      // the views follow shortly after (see the constructor).
+      if (!entry.stub) this._scheduleDerive(id, root, event.dirty);
       this._notify(id, type);
       return clone(result);
     });
@@ -472,14 +609,18 @@ export class Store {
     const json = syncedJson(state);
     const synced = JSON.parse(json);
     validateState(synced);
-    await assertMetadataDirectories(root);
+    // The change list and the views it touches are taken before the first await: the loaded state is
+    // the cached replay, which a concurrent read advances in place once new journal files appear.
     const header = { schemaVersion: previous ? 2 : 1, id: randomUUID(), sequence: (previous?.sequence || 0) + 1, previousId: previous?.id ?? null, createdAt: now(), hostId: this.hostId, type };
     const event = previous ? {...header, projectId:state.project.id, parents:previous.tips||[previous.id], changes:changes(previous.state,synced)} : {...header,state:synced};
+    const dirty = previous ? dirtyViews(previous.state, synced, event.changes) : null;
+    await assertMetadataDirectories(root);
     const filename = `${previous?'v2-':''}${String(header.sequence).padStart(12, '0')}-${header.id}.json`;
     await atomicWrite(path.join(root, 'events', filename), JSON.stringify(event));
+    // The cached replay stays: the next read applies this one event (see _loadDistributed).
     this.eventLoads.delete(`${root}:false`);this.eventLoads.delete(`${root}:true`);
-    this.eventCache.delete(root);
     // The callback needs the committed state; the file only contains changed fields.
+    Object.defineProperty(event, 'dirty', { value: dirty, enumerable: false });
     event.state=synced;
 
     return event;
@@ -506,9 +647,13 @@ export class Store {
     this.derivedCache.set(filename, { hash, size: info.size, mtimeMs: info.mtimeMs });
   }
 
-  async _derive(root, state) {
+  // `work` (from flushDerived) limits the Markdown to what changed and says whether state.json is due.
+  async _derive(root, state, work = null) {
     await assertMetadataDirectories(root);
-    await this._writeDerived(path.join(root, 'state.json'), JSON.stringify(state, null, 2));
+    const all = !work || work.all;
+    if (!work || work.state) await this._writeDerived(path.join(root, 'state.json'), JSON.stringify(state, null, 2));
+    if (!all && !work.markdown) return;
+    const writeSession = id => all || work.sessions.has(id), writeArtifact = id => all || work.artifacts.has(id);
     // Remove obsolete derived session exports after authoritative deletion.
     // Immutable events remain the sync journal, not a user-facing recycle bin.
     const sessionDir=path.join(root,'sessions');
@@ -528,6 +673,7 @@ export class Store {
     for (const session of state.sessions) {
       const name = `sessions/${session.id}.md`;
       if (!session.deletedAt) lines.push(`- [${String(session.title).replace(/[\[\]\r\n]/g, ' ')}](${name})${session.archivedAt ? ' · archived' : ''}`);
+      if (!writeSession(session.id)) continue;
       const messages = bySession.get(session.id) || [];
       await this._writeDerived(path.join(root, name), `# ${session.title}\n\nOperation records: [${session.id}.operations.md](${session.id}.operations.md)\n\n${format(messages.filter(m => m.role !== 'system' && m.kind !== 'narration'))}`);
       // What agents said between tool calls is part of the operation record, not the conversation.
@@ -537,6 +683,7 @@ export class Store {
     for (const artifact of state.artifacts) {
       const name = `artifacts/${artifact.id}.md`;
       lines.push(`- [${String(artifact.name).replace(/[\[\]\r\n]/g, ' ')}](${name})`);
+      if (!writeArtifact(artifact.id)) continue;
       const annotations = (byArtifact.get(artifact.id) || []).map(a => `## Comment ${a.id} · ${a.status} · ${a.anchorStatus}\n\n${a.text}\n\nAnchor: ${JSON.stringify(a.anchor)}\n\n${format(byAnnotation.get(a.id) || [])}`).join('\n');
       await this._writeDerived(path.join(root, name), `# ${artifact.name}\n\n${annotations}`);
     }

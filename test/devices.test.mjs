@@ -16,7 +16,7 @@ async function setup(t,options={}){
   const app=await createStudio({stateDir:path.join(dir,'state'),projectRoot:path.join(dir,'projects'),port:0,previewPort:0,runner,homedir:path.join(dir,'home'),env:{},deviceAllowlist:true,token:PEER,...options});
   t.after(async()=>{await app.close();await fs.rm(dir,{recursive:true,force:true});});
   // Requests name a non-loopback Host, as a tailnet browser's would; `local` ones say 127.0.0.1.
-  const call=(p,{method='GET',data,headers={},host='studiolo.test'}={})=>new Promise((resolve,reject)=>{const body=data?JSON.stringify(data):null;const req=http.request({host:'127.0.0.1',port:app.port,path:p,method,headers:{Host:host,...(body?{'Content-Type':'application/json'}:{}),...headers}},res=>{let text='';res.on('data',c=>text+=c);res.on('end',()=>{let json={};try{json=JSON.parse(text);}catch{}resolve({status:res.statusCode,json,cookie:res.headers['set-cookie']?.[0]?.split(';')[0]||null});});});req.on('error',reject);if(body)req.write(body);req.end();});
+  const call=(p,{method='GET',data,headers={},host='studiolo.test'}={})=>new Promise((resolve,reject)=>{const body=data?JSON.stringify(data):null;const req=http.request({host:'127.0.0.1',port:app.port,path:p,method,headers:{Host:host,...(body?{'Content-Type':'application/json'}:{}),...headers}},res=>{let text='';res.on('data',c=>text+=c);res.on('end',()=>{let json={};try{json=JSON.parse(text);}catch{}resolve({status:res.statusCode,json,cookie:res.headers['set-cookie']?.[0]?.split(';')[0]||null,location:res.headers.location});});});req.on('error',reject);if(body)req.write(body);req.end();});
   return {app,call,dir,local:`127.0.0.1:${app.port}`};
 }
 
@@ -92,4 +92,20 @@ test('tailnet.json with deviceAllowlist needs the peer token file',async t=>{
   await assert.rejects(loadTailnet(dir),/access-token\.txt/);
   await fs.writeFile(path.join(dir,'access-token.txt'),'x'.repeat(40)+'\n');
   const net=await loadTailnet(dir);assert.equal(net.deviceAllowlist,true);assert.equal(net.token,'x'.repeat(40));
+});
+
+test('a signed-in page hands a one-time sign-in to a browser, on this host or a peer',async t=>{
+  const a=await setup(t),b=await setup(t);
+  let r=await a.call('/api/hosts',{method:'POST',data:{name:'B',url:`http://127.0.0.1:${b.app.port}`,token:PEER},host:a.local});assert.equal(r.status,200);
+  // Only a signed-in page gets a ticket; one from A's page is minted by B through the peer hop.
+  r=await b.call(`/api/hosts/${b.app.hostId}/handoff`,{method:'POST'});assert.equal(r.status,401);
+  r=await a.call(`/api/hosts/${b.app.hostId}/handoff`,{method:'POST',host:a.local});assert.equal(r.status,200);
+  const ticket=r.json.ticket;assert.match(ticket,/^[0-9a-f]{48}$/);
+  r=await b.call(`/api/handoff/${ticket}?next=${encodeURIComponent('/open.html?project=p&artifact=x')}`);assert.equal(r.status,303);assert.equal(r.location,'/open.html?project=p&artifact=x');assert.ok(r.cookie);
+  const cookie=r.cookie;
+  r=await b.call('/api/bootstrap',{headers:{Cookie:cookie}});assert.equal(r.status,200);
+  // A ticket works once, and only leads to a page of the server that took it.
+  r=await b.call(`/api/handoff/${ticket}`);assert.equal(r.status,401);assert.equal(r.cookie,null);
+  r=await a.call(`/api/hosts/${a.app.hostId}/handoff`,{method:'POST',host:a.local});assert.equal(r.status,200);
+  r=await a.call(`/api/handoff/${r.json.ticket}?next=${encodeURIComponent('//elsewhere.example/')}`);assert.equal(r.status,303);assert.equal(r.location,'/');
 });

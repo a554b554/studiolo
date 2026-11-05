@@ -1,6 +1,7 @@
 {
   "name": "studiolo-desktop",
-  "version": "0.2.0",
+  "version": "0.2.4",
+  "build": 1,
   "private": true,
   "scripts": {
     "tauri": "tauri",

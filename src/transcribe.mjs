@@ -14,7 +14,7 @@ const SUBTYPES={webm:'webm','x-matroska':'webm',mp4:'mp4','x-m4a':'mp4',m4a:'mp4
 const sleepMs=ms=>new Promise(r=>setTimeout(r,ms));
 
 // JWTs, API keys and bearer values must never reach logs, error messages or response bodies.
-export const mask=text=>String(text??'').replace(/Bearer\s+[A-Za-z0-9._~+/-]+/gi,'Bearer […]').replace(/eyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*){0,2}/g,'eyJ…').replace(/sk-[A-Za-z0-9_-]{6,}/g,'sk-…');
+export const mask=text=>String(text??'').replace(/Bearer\s+[A-Za-z0-9._~+/-]+/gi,'Bearer […]').replace(/eyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*){0,2}/g,'eyJ…').replace(/sk-[A-Za-z0-9_-]{6,}/g,'sk-…').replace(/ek_[A-Za-z0-9_-]{6,}/g,'ek_…');
 
 // "audio/webm;codecs=opus" → {mime:'audio/webm', fileName:'audio.webm'}; unknown types are refused.
 export function audioFormat(contentType){
@@ -47,9 +47,18 @@ export const OPENAI_MODEL='gpt-transcribe';
 const OPENAI_PROMPT='一段中英夹杂的口述，多为软件开发和 AI agent 相关内容。英文术语保留原样，中文用简体，加上标点。';
 export const DEFAULT_KEYWORDS=['Studiolo','Artifact','Claude','Claude Code','Codex','SwiftUI','Xcode','Tailscale','iPhone','iPad','agent','session','prompt','commit'];
 
+// Live dictation: the page streams 24 kHz PCM straight to OpenAI's realtime
+// transcription with a short-lived client secret minted here, so neither the key nor the audio
+// passes through another Studiolo server. The session (model, hints, no server VAD: the page
+// commits at pauses) is fixed in the secret.
+export const REALTIME_SECRET_URL='https://api.openai.com/v1/realtime/client_secrets';
+export const REALTIME_URL='wss://api.openai.com/v1/realtime?intent=transcription';
+export const REALTIME_MODEL='gpt-live-transcribe';
+export const REALTIME_SECRET_TTL=120;
+
 export class OpenAITranscriber{
-  constructor({keyFile,fetch=globalThis.fetch,model=OPENAI_MODEL,timeoutMs=30000,sleep=sleepMs}={}){
-    Object.assign(this,{keyFile,fetch,model,timeoutMs,sleep});
+  constructor({keyFile,fetch=globalThis.fetch,model=OPENAI_MODEL,realtimeModel=REALTIME_MODEL,timeoutMs=30000,sleep=sleepMs}={}){
+    Object.assign(this,{keyFile,fetch,model,realtimeModel,timeoutMs,sleep});
   }
   async readKey(){
     try{return (await fs.readFile(this.keyFile,'utf8')).trim()||null;}
@@ -66,6 +75,34 @@ export class OpenAITranscriber{
     await fs.mkdir(path.dirname(this.keyFile),{recursive:true});await fs.writeFile(this.keyFile,key+'\n',{mode:0o600});
   }
   async removeKey(){await fs.rm(this.keyFile,{force:true});}
+  async realtimeSecret({keywords=[]}={}){
+    const key=await this.readKey();
+    if(!key)throw httpError('此服务器没有配置 OpenAI API key',503);
+    const transcription={model:this.realtimeModel,prompt:OPENAI_PROMPT,languages:['zh','en'],keywords:[...new Set([...DEFAULT_KEYWORDS,...keywords])]};
+    const request={expires_after:{anchor:'created_at',seconds:REALTIME_SECRET_TTL},session:{type:'transcription',audio:{input:{format:{type:'audio/pcm',rate:24000},noise_reduction:{type:'near_field'},transcription,turn_detection:null}}}};
+    let retries=0;
+    while(true){
+      let response;
+      try{response=await this.fetch(REALTIME_SECRET_URL,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(request),signal:AbortSignal.timeout(15000)});}
+      catch(error){
+        if(retries<MAX_RETRIES){await this.sleep(500*2**retries++);continue;}
+        console.error('[transcribe] realtime network error: '+mask(error?.message));
+        throw httpError('转写服务无法连接，请检查网络后重试',502);
+      }
+      if(response.ok){
+        let data;try{data=await response.json();}catch{throw httpError('转写服务返回了无法解析的结果',502);}
+        if(typeof data?.value!=='string'||!data.value)throw httpError('转写服务返回了无法解析的结果',502);
+        return {value:data.value,expiresAt:data.expires_at??null,url:REALTIME_URL,model:this.realtimeModel};
+      }
+      const detail=mask(await response.text().catch(()=>'')).slice(0,300);
+      if(RETRYABLE.has(response.status)&&retries<MAX_RETRIES){await this.sleep(500*2**retries++);continue;}
+      console.error(`[transcribe] OpenAI realtime HTTP ${response.status} ${detail}`);
+      if(response.status===401)throw httpError('OpenAI API key 无效，请检查服务器上的 openai-api-key.txt',502);
+      if(response.status===403)throw httpError('OpenAI 拒绝了这个 API key 的请求',502);
+      if(response.status===429)throw httpError(/insufficient_quota/.test(detail)?'OpenAI API 额度不足':'转写请求过于频繁，请稍后再试',429);
+      throw httpError('实时转写暂时不可用',502);
+    }
+  }
   async transcribe({bytes,mime,fileName,language,keywords=[]}){
     if(!bytes?.length)throw httpError('没有收到录音');
     const key=await this.readKey();

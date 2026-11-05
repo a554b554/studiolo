@@ -2,6 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "launcher",
   "description": "The bundled launcher page: opening a server and links in the system browser.",
-  "windows": ["main"],
-  "permissions": ["core:default", "opener:default", "notification:default"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "notification:default",
+    "allow-trust-origins"
+  ]
 }
