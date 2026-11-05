@@ -16,7 +16,7 @@ Server, web front end and desktop client 0.2.4 (Windows, macOS).
   - After a change the server applies only the new journal events instead of reading the whole journal again.
   - The ten most recently opened conversations show at once from a cache while a fresh copy loads; sending waits for that copy.
   - Long conversations show their last 60 items. 「显示更早的内容」 or scrolling to the top shows 60 more, and the reading position stays put.
-- A reply no longer disappears into the Raw log a few minutes after its turn. When Claude reported background work after a turn had ended (a background command or a subagent finishing), the finished reply was turned into narration. The 17 replies hidden this way are restored when each server starts.
+- A reply no longer disappears into the Raw log a few minutes after its turn. When Claude reported background work after a turn had ended (a background command or a subagent finishing), the finished reply was turned into narration. Replies hidden this way are restored when each server starts.
 
 ## 0.2.3 (2026-11-04)
 

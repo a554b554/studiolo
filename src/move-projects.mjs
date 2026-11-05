@@ -38,7 +38,7 @@ export async function moveLegacyProjects({from,to,stateDir,homedir=os.homedir(),
   const existing=await entries(to);
   if(existing?.length)throw new Error(`项目同时存在于旧位置 ${from} 和新位置 ${to}。请合并到 ${to} 并删除旧文件夹，或用 STUDIO_PROJECT_ROOT 指定要用的文件夹。`);
   if(existing)await fs.rmdir(to);
-  // mkdir of a drive root ("D:\", the parent of D:\studiolo-projects) fails with EPERM on Windows, even recursive.
+  // mkdir of a drive root ("E:\", the parent of E:\studiolo-projects) fails with EPERM on Windows, even recursive.
   if(!await fs.stat(path.dirname(to)).catch(()=>null))await fs.mkdir(path.dirname(to),{recursive:true});
   try{await fs.rename(from,to);}
   catch(error){throw new Error(`无法把项目从 ${from} 移到 ${to}：${error.code==='EXDEV'?'不在同一个磁盘，请手动移动或设置 STUDIO_PROJECT_ROOT':error.code==='EBUSY'||error.code==='EPERM'?'有程序正在使用这个文件夹（终端、编辑器或常驻 Artifact），关闭后重新启动':error.message}`);}

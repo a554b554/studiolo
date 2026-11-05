@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Device allowlist on this machine (README「设备白名单」): list, approve, revoke, rename or remove
 // devices, or make a token for a native client. It talks to the server on 127.0.0.1, so it runs on
-// the server machine itself (over SSH for the mini) and needs no credentials.
+// the server machine itself (over SSH for a remote one) and needs no credentials.
 import {DEFAULT_PORT} from '../src/defaults.mjs';
 
 const base=`http://127.0.0.1:${process.env.STUDIO_PORT||DEFAULT_PORT}`;

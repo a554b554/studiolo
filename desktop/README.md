@@ -55,14 +55,23 @@ which asks that server for `/api/client/update/{target}/{arch}/{current}?build={
 no sign-in), downloads the bundle, checks its signature against the public key in `tauri.conf.json`
 (`plugins.updater.pubkey`), installs it and restarts. The 0.2.0 client has no updater and is installed by hand once.
 
-The private key is `~/.tauri/studiolo-updater.key` on each machine that builds releases, never in a repo or a synced
-folder. Builds sign their bundles with it:
+The repository ships a placeholder public key. Before building a client that updates itself, make your own key
+pair and put the public key in `tauri.conf.json`:
+
+```bash
+npx tauri signer generate -w ~/.tauri/studiolo-updater.key
+```
+
+This writes the private key to `~/.tauri/studiolo-updater.key` and the public key next to it (`.pub`); paste the
+`.pub` contents into `plugins.updater.pubkey`. A client built with the placeholder runs, but refuses every update.
+Keep the private key on each machine that builds releases, never in a repo or a synced folder. Builds sign their
+bundles with it:
 
 ```bash
 export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/studiolo-updater.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 ```
 
-Each server offers the bundles in its own `desktop/dist` (gitignored), so copy them to both hosts:
+Each server offers the bundles in its own `desktop/dist` (gitignored), so copy them to every server that should offer them:
 
 - Windows: `bundle/nsis/Studiolo_<v>_x64-setup.exe` and its `.sig`.
 - macOS: `bundle/macos/Studiolo.app.tar.gz` and its `.sig`, renamed to `Studiolo_<v>_aarch64.app.tar.gz(.sig)`.
