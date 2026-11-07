@@ -43,8 +43,8 @@ async function servers(t){
  await fs.cp(p.path,path.join(b.app.store.projectRoot,p.id),{recursive:true});
  // Registration is mutual: B learns A through A's /api/peer/hello.
  const added=await a.api('/api/hosts','POST',{url:b.base,name:'B'});assert.equal(added.mutual,true);
- // Both hosts hold the files, so conversations may run on either (a synced project).
- await a.app.store.mutate(p.id,'project.synced',s=>{s.project.sync.enabled=true;s.project.replicas[b.app.hostId]={state:'ready',version:null,at:new Date().toISOString()};});
+ // Both hosts hold the files and B is allowed to run the project, so conversations may run on either.
+ await a.app.store.mutate(p.id,'project.allowed',s=>{s.project.allowedHostIds=[b.app.hostId];s.project.replicas[b.app.hostId]={state:'ready',at:new Date().toISOString()};});
  await b.app.store.discoverProjects();await merge(a.app.store,b.app.store,p.id);
  return {a,b,p,calls};
 }
@@ -81,14 +81,14 @@ test('first-message races bind once, and an artifact runs on its artifact host w
  await b.api(`${url}/artifacts/${art.id}/stop`,'POST',{});assert.equal((await a.api(`${url}/artifacts/${art.id}/status`)).running,false);
 });
 
-test('an unsynced project runs and hosts artifacts only on its owner, from either server',async t=>{
+test('a project allowed nowhere else runs and hosts artifacts only on its owner, from either server',async t=>{
  const {a,b,calls}=await servers(t);
  const p=await a.api('/api/projects','POST',{name:'Owner only'}),url=`/api/projects/${p.id}`;
  await fs.mkdir(path.join(p.path,'web'));await fs.writeFile(path.join(p.path,'web/index.html'),'<h1>Owner files</h1>');
  await wait(async()=>(await b.api('/api/projects')).some(x=>x.id===p.id&&!x.unavailable));
  const s=await b.api(url+'/sessions','POST',{title:'Elsewhere'});
  const input={sessionId:s.id,requestId:randomUUID(),text:'hi',profileId:'codex',model:'test'};
- await assert.rejects(b.api(url+'/messages','POST',{...input,hostId:b.app.hostId}),e=>e.status===409&&/not synced; it runs on/.test(e.message));
+ await assert.rejects(b.api(url+'/messages','POST',{...input,hostId:b.app.hostId}),e=>e.status===409&&/not allowed to run this project/.test(e.message));
  await b.api(url+'/messages','POST',{...input,requestId:randomUUID(),hostId:a.app.hostId});await wait(()=>calls.length===1);assert.equal(calls[0].label,'A');
  const art=await b.api(url+'/artifacts','POST',{name:'Owner preview',root:'web'});
  const live=await b.api(`${url}/artifacts/${art.id}/start`,'POST',{});assert.equal(live.hostId,a.app.hostId);

@@ -4,7 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {createStudio,fileVersion} from '../src/server.mjs';
-import {FakeTransport} from '../src/transport.mjs';
 
 // The side-pane editor: every read names the file's version, a save names the version it started
 // from, and a save over a file that changed meanwhile (an agent edited it) is refused with the new version.
@@ -12,7 +11,7 @@ const wait=async(fn,ms=15000)=>{const end=Date.now()+ms;while(Date.now()<end){if
 async function servers(t,count=1){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'studio-edit-'));const apps=[];
  const make=async label=>{
-  const app=await createStudio({stateDir:path.join(root,label,'state'),projectRoot:path.join(root,label,'projects'),port:0,previewPort:0,transport:new FakeTransport(),runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true}],execute:async()=>({text:'ok'})}});
+  const app=await createStudio({stateDir:path.join(root,label,'state'),projectRoot:path.join(root,label,'projects'),port:0,previewPort:0,runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true}],execute:async()=>({text:'ok'})}});
   apps.push(app);const base=`http://127.0.0.1:${app.port}`;
   const raw=(url,method='GET',data)=>fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});
   const api=async(url,method,data)=>{const res=await raw(url,method,data);const result=await res.json();if(!res.ok)throw Object.assign(Error(result.error),{status:res.status,body:result});return result;};

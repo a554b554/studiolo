@@ -53,10 +53,11 @@ export class QueueManager {
   // every outputCommitMs; clients see uncommitted output through overlay() meanwhile.
   // `knowledge` resolves the machine-specific shared knowledge ({text, hash} or null) appended to
   // platform prompts; see subagents.mjs. A failure there never blocks the run.
-  // `hooks.beforeRun(projectId, run, say, signal)` may refuse or delay a started run (synced projects pull
-  // files first); `hooks.afterRun(projectId, run)` runs once it ended (auto-commit). See sync-engine.mjs.
-  constructor({ store, runner, hostId, knowledge = null, hooks = {}, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
-    this.knowledge = knowledge; this.hooks = hooks;
+  // `machines` lists every registered machine with its project root and SSH address for the prompt
+  // (context.mjs); a failure there leaves the list out. `hooks.beforeRun(projectId, run, say, signal)`
+  // may refuse or delay a started run (it gives this machine a working folder, server.mjs ensureCopy).
+  constructor({ store, runner, hostId, knowledge = null, machines = null, hooks = {}, outputCommitMs = 3000, liveNotifyMs = 400, outputBufferChars = 1024 * 1024 }) {
+    this.knowledge = knowledge; this.machines = machines; this.hooks = hooks;
     this.store = store;
     this.runner = runner;
     this.hostId = hostId;
@@ -349,7 +350,8 @@ export class QueueManager {
       const nativeSessionId = state.nativeSessions[mappingKey(this.hostId, run)];
       // Slash commands go to the CLI verbatim: no platform prompt, no attachment notes.
       const knowledge = run.command || !this.knowledge ? null : await Promise.resolve().then(() => this.knowledge(run)).catch(() => null);
-      const {prompt, metadata} = run.command ? {prompt: run.text, metadata: {version:1, mode:'command', promptChars: run.text.length}} : buildContext(state, run, nativeSessionId, this.hostId, knowledge);
+      const machines = run.command || !this.machines ? null : await Promise.resolve().then(() => this.machines(run)).catch(() => null);
+      const {prompt, metadata} = run.command ? {prompt: run.text, metadata: {version:1, mode:'command', promptChars: run.text.length}} : buildContext(state, run, nativeSessionId, this.hostId, knowledge, machines);
       const previousUsage = state.runs.findLast(r => r.id !== run.id && r.hostId === this.hostId && r.profileId === run.profileId && r.queueId === run.queueId && r.nativeSessionId === nativeSessionId && r.usage?.sessionTotal)?.usage?.sessionTotal;
       await this.store.mutate(projectId, 'run.context', s => { s.runs.find(r => r.id === runId).context = metadata; });
       this.live.set(runId, live);
@@ -435,7 +437,8 @@ export class QueueManager {
       });
     } finally {
       clearTimeout(live.timer); live.timer = undefined; this.live.delete(runId); this.controllers.delete(runId); await this.approvals.expire(projectId,runId);
-      if (started && this.hooks.afterRun) await this.hooks.afterRun(projectId, runId).catch(e => this.store.mutate(projectId, 'run.after-failed', s => { const r = s.runs.find(r => r.id === runId); if (r) s.messages.push({ ...this._message(r, 'system', e.message), kind: 'status' }); }).catch(() => {}));
+      // Artifacts the run declared in this machine's copy are picked up at once.
+      Promise.resolve().then(() => this.hooks.afterRun?.(projectId)).catch(() => {});
     }
   }
 

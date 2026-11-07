@@ -36,8 +36,8 @@ test('Show in File Explorer works only for a page on this machine and a project 
  // A page that reached this server by another name (the tailnet, another computer) cannot.
  assert.equal((await call('/api/bootstrap',{host:'desktop.example.ts.net'})).json.features?.reveal??null,null);
 
- // Files that live on another host: the menu item is greyed there, and the server refuses.
- await app.store.mutate(p.id,'test.owner',s=>{s.project.ownerHostId='elsewhere';});
+ // Files that live on another host only (this host holds no copy): the menu item is greyed there, and the server refuses.
+ await app.store.mutate(p.id,'test.owner',s=>{s.project.ownerHostId='elsewhere';delete s.project.replicas[app.hostId];});
  assert.equal((await call(url)).json.filesHostId,'elsewhere');
  const refused=await call(url+'/reveal',{method:'POST',data:{path:'docs/a.md'}});
  assert.equal(refused.status,409);assert.match(refused.json.error,/不在这台电脑/);

@@ -425,10 +425,10 @@ export function initChoices(data, prefix = '', {hostId:fixedHostId} = {}) {
 }
 export function listenChanges(onChange) {
   const status = $('#connection');
-  let worker, timer, closed = false, fallback, source, sourceDown, polling = false;
+  let worker, timer, closed = false, fallback, source, sourceDown, stall, polling = false;
   const connection = online => { if (status) { status.textContent = online ? t('已连接') : t('连接中断 · 自动重连'); status.dataset.online = String(online); } };
   const closeWorker = () => { clearTimeout(fallback); fallback = undefined; worker?.port.postMessage({type:'close'}); worker?.port.close(); worker = null; };
-  const closeSource = () => { clearTimeout(sourceDown); sourceDown = undefined; source?.close(); source = null; };
+  const closeSource = () => { clearTimeout(sourceDown); sourceDown = undefined; clearInterval(stall); stall = undefined; source?.close(); source = null; };
   const poll = () => {
     if (timer || closed) return;
     closeWorker(); closeSource();
@@ -454,8 +454,12 @@ export function listenChanges(onChange) {
     closeWorker();
     source = new EventSource('/api/events');
     sourceDown = setTimeout(poll,5000);
-    source.onopen = () => { clearTimeout(sourceDown); sourceDown = undefined; connection(true); onChange({reconnect:true}); };
-    source.addEventListener('change', event => { try { onChange(JSON.parse(event.data)); } catch {} });
+    // Silence after pings is a server that stopped running, not a quiet one (events-worker.js).
+    let beat = Date.now(), pinged = false;
+    stall = setInterval(() => { if (pinged && Date.now() - beat > 15000) { connection(false); poll(); } }, 3000);
+    source.onopen = () => { beat = Date.now(); clearTimeout(sourceDown); sourceDown = undefined; connection(true); onChange({reconnect:true}); };
+    source.addEventListener('ping', () => { beat = Date.now(); pinged = true; });
+    source.addEventListener('change', event => { beat = Date.now(); try { onChange(JSON.parse(event.data)); } catch {} });
     source.onerror = () => { connection(false); sourceDown ||= setTimeout(poll,5000); };
   };
   const open = () => {
@@ -463,10 +467,12 @@ export function listenChanges(onChange) {
     try {
       if (!window.SharedWorker) { direct(); }
       else {
-        worker = new SharedWorker('/events-worker.js',{name:'studio-events-v1'});
+        // v2: the worker detects a silent server (0.2.5); a v1 worker still open in an old tab is not shared.
+        worker = new SharedWorker('/events-worker.js',{name:'studio-events-v2'});
         fallback = setTimeout(direct,5000);
         worker.port.onmessage = event => {
-          if (event.data?.type === 'connection') { connection(event.data.online); if (event.data.online) { clearTimeout(fallback); fallback = undefined; } else fallback ||= setTimeout(direct,5000); }
+          // A stalled server is the worker's to reconnect; leaving it for a stream of our own would not help.
+          if (event.data?.type === 'connection') { connection(event.data.online); if (event.data.online) { clearTimeout(fallback); fallback = undefined; } else if (!event.data.stalled) fallback ||= setTimeout(direct,5000); }
           if (event.data?.type === 'change') onChange(event.data.value);
         };
         worker.onerror = event => { event.preventDefault(); direct(); };

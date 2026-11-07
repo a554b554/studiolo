@@ -65,6 +65,14 @@ function validateState(state) {
   }
 }
 
+// When each conversation last had a message sent or answered: the latest
+// createdAt among its user and assistant messages. Opening, renaming or moving a chat does not count.
+export function lastMessageTimes(state) {
+  const last = new Map();
+  for (const m of state.messages) if (m.sessionId && (m.role === 'user' || m.role === 'assistant') && m.createdAt && !(last.get(m.sessionId) >= m.createdAt)) last.set(m.sessionId, m.createdAt);
+  return last;
+}
+
 // Which readable views a commit changes: the conversations and Artifacts its records belong to.
 // The history index is always rewritten. Without a change list (a full state) everything is.
 function dirtyViews(before, after, patch) {
@@ -301,8 +309,11 @@ export class Store {
         const { entry: current, event } = await this._loadEntry(entry.id);
         const running = [...new Set(event.state.runs.filter(r => r.status === 'running' && r.sessionId).map(r => r.sessionId))];
         // The sidebar lists every project's conversations (with forks and categories) without loading their messages.
-        const sessions = event.state.sessions.filter(s => !s.archivedAt && !s.deletedAt).map(s => ({ id: s.id, title: s.title, createdAt: s.createdAt, forkOf: s.forkOf, forks: s.forks, categoryId: s.categoryId, hostId: s.hostId }));
-        return { ...clone(event.state.project), path: current.path, replica: !current.stub, sessions: clone(sessions), ...(running.length ? { running } : {}) };
+        const last = lastMessageTimes(event.state);
+        const sessions = event.state.sessions.filter(s => !s.archivedAt && !s.deletedAt).map(s => ({ id: s.id, title: s.title, createdAt: s.createdAt, lastMessageAt: last.get(s.id) || s.createdAt || null, forkOf: s.forkOf, forks: s.forks, categoryId: s.categoryId, hostId: s.hostId }));
+        // The project's own time is its newest conversation's, so the sidebar can order projects by it.
+        const lastMessageAt = sessions.reduce((latest, s) => s.lastMessageAt > latest ? s.lastMessageAt : latest, event.state.project.createdAt || '') || null;
+        return { ...clone(event.state.project), path: current.path, replica: !current.stub, lastMessageAt, sessions: clone(sessions), ...(running.length ? { running } : {}) };
       }
       catch (e) { const { stub, ...rest } = clone(entry); return { ...rest, replica: !stub, unavailable: true, error: e.message }; }
     }));
@@ -350,6 +361,8 @@ export class Store {
     if (!entry) throw error('Project not found', 404);
     return entry;
   }
+  // Whether this host holds only the project's journal, not a working folder.
+  isStub(id) { return Boolean(this.registry.projects.find(p => p.id === id)?.stub); }
 
   async _load(root, allowMissing = false) {
     // Coalesce concurrent readers while preserving a fresh filesystem check per completed read.

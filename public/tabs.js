@@ -12,10 +12,12 @@ const IMAGE = /\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp)$/i;
 const fileIcon = path => IMAGE.test(path) ? 'i-image' : isMarkdownPath(path) || /\.(?:txt|log|csv)$/i.test(path) ? 'i-file-text' : /\.(?:m?js|ts|tsx|jsx|css|html?|json|py|sh|ps1|rs|go|java|c|cpp|h)$/i.test(path) ? 'i-file-code' : 'i-file';
 const baseName = path => path.split('/').pop() || path;
 const formatSize = bytes => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} B`;
-const keyOf = spec => spec.kind === 'artifact' ? `artifact:${spec.artifactId}` : `file:${spec.path}`;
+// A file tab shows one machine's copy of the file; `hostId` is absent when the project has one copy.
+const keyOf = spec => spec.kind === 'artifact' ? `artifact:${spec.artifactId}` : `file:${spec.hostId ? spec.hostId + ':' : ''}${spec.path}`;
+const hostParam = tab => tab.hostId ? `&host=${encodeURIComponent(tab.hostId)}` : '';
 function loadSets() { try { const value = JSON.parse(localStorage.getItem(STORE) || '{}'); return value && typeof value === 'object' ? value : {}; } catch { return {}; } }
 
-export function initTabs({ panes, artifactName = () => '', artifactRunning = () => false, artifactHome = () => null, onActiveChange = () => {} }) {
+export function initTabs({ panes, artifactName = () => '', artifactRunning = () => false, artifactHome = () => null, hostLabel = () => '', onActiveChange = () => {} }) {
   const sets = loadSets(), views = new Map();
   let projectId = null;
   const persist = () => { try { localStorage.setItem(STORE, JSON.stringify(sets)); } catch {} };
@@ -26,7 +28,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
 
   // ---------- file editor ----------
   function fileView(pid, tab) {
-    const path = tab.path, url = `${projectURL(pid)}/file?path=${encodeURIComponent(path)}`, raw = `${projectURL(pid)}/raw?path=${encodeURIComponent(path)}`;
+    const path = tab.path, url = `${projectURL(pid)}/file?path=${encodeURIComponent(path)}${hostParam(tab)}`, raw = `${projectURL(pid)}/raw?path=${encodeURIComponent(path)}${hostParam(tab)}`;
     const el = node('div', 'pane-view file'), head = node('div', 'ed-head'), crumbs = node('div', 'crumbs'), status = node('span', 'save-state'), seg = node('div', 'seg');
     const banner = node('div', 'ed-banner'), bodyEl = node('div', 'ed-body'), foot = node('div', 'ed-foot');
     const code = node('div', 'code'), gutter = node('div', 'gutter'), area = node('textarea'), preview = node('div', 'md-preview markdown markdown-doc');
@@ -43,7 +45,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
     const renderPreview = () => {
       if (!markdownFile) return;
       const scroll = preview.scrollTop;
-      preview.replaceChildren(markdown(area.value, document, { file: path, image: p => `${projectURL(pid)}/raw?path=${encodeURIComponent(p)}` }));
+      preview.replaceChildren(markdown(area.value, document, { file: path, image: p => `${projectURL(pid)}/raw?path=${encodeURIComponent(p)}${hostParam(tab)}` }));
       preview.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.replaceWith(node('span', 'image-missing', '🖼 ' + img.alt)), { once: true }));
       preview.scrollTop = scroll;
     };
@@ -106,7 +108,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
       const content = area.value;
       ed.pending = (async () => {
         try {
-          const result = await api(`${projectURL(pid)}/file`, { method: 'PUT', body: { path, content, version: ed.version ?? null } });
+          const result = await api(`${projectURL(pid)}/file${tab.hostId ? `?host=${encodeURIComponent(tab.hostId)}` : ""}`, { method: 'PUT', body: { path, content, version: ed.version ?? null } });
           ed.version = result.version; ed.base = content; ed.dirty = area.value !== content; ed.savedAt = Date.now();
         } catch (error) {
           if (error.status === 409 && error.code === 'conflict') { ed.state = 'conflict'; ed.conflictVersion = error.data?.version ?? null; }
@@ -155,7 +157,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
     const view = { el, pid, tab, kind: 'artifact', frame: null, paint() {}, check() {}, save() {}, focus() {},
       mount() {
         if (view.frame) return;
-        const home = artifactHome(pid), query = `?project=${encodeURIComponent(pid)}&artifact=${encodeURIComponent(tab.artifactId)}`;
+        const home = artifactHome(pid, tab.artifactId), query = `?project=${encodeURIComponent(pid)}&artifact=${encodeURIComponent(tab.artifactId)}`;
         if (home) {
           const link = (path, label) => { const a = node('a', 'button', label); a.href = home.url + path + query; a.target = '_blank'; a.rel = 'noopener'; a.addEventListener('click', signedInClick(home.id, a)); return a; };
           const card = node('div', 'art-remote'), actions = node('div', 'art-remote-actions');
@@ -188,7 +190,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
       const el = node('div', `ptab${tab.key === set.active ? ' active' : ''}${view?.dirty || view?.saving ? ' dirty' : ''}`);
       const title = tab.kind === 'artifact' ? artifactName(projectId, tab.artifactId) || tab.artifactId : baseName(tab.path);
       el.setAttribute('role', 'tab'); el.setAttribute('aria-selected', String(tab.key === set.active)); el.tabIndex = 0; el.draggable = true;
-      el.title = tab.kind === 'artifact' ? `Artifact · ${title}` : tab.path;
+      el.title = tab.kind === 'artifact' ? `Artifact · ${title}` : tab.hostId ? `${tab.path} · ${hostLabel(tab.hostId)}` : tab.path;
       el.append(icon(tab.kind === 'artifact' ? 'i-box' : fileIcon(tab.path), 'i i-sm ficon'));
       if (tab.kind === 'artifact' && artifactRunning(projectId, tab.artifactId)) el.append(node('i', 'run-dot'));
       el.append(node('span', 'nm', title));
@@ -225,7 +227,7 @@ export function initTabs({ panes, artifactName = () => '', artifactRunning = () 
   function open(pid, spec, { focus = true } = {}) {
     const set = setOf(pid), key = keyOf(spec);
     let tab = set.tabs.find(item => item.key === key);
-    if (!tab) { tab = { key, kind: spec.kind, ...(spec.kind === 'artifact' ? { artifactId: spec.artifactId } : { path: spec.path }) }; const at = set.tabs.findIndex(item => item.key === set.active); set.tabs.splice(at < 0 ? set.tabs.length : at + 1, 0, tab); }
+    if (!tab) { tab = { key, kind: spec.kind, ...(spec.kind === 'artifact' ? { artifactId: spec.artifactId } : { path: spec.path, ...(spec.hostId ? { hostId: spec.hostId } : {}) }) }; const at = set.tabs.findIndex(item => item.key === set.active); set.tabs.splice(at < 0 ? set.tabs.length : at + 1, 0, tab); }
     if (spec.anchor) tab.anchor = spec.anchor;
     set.active = key; set.open = true; persist();
     if (pid !== projectId) return;

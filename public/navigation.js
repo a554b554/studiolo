@@ -6,20 +6,46 @@ import { moreButton } from './lifecycle.js';
 // leaves the tree only through "Detach". Dragging a chat onto a category moves it there, onto
 // another chat creates a category holding both, and onto the project row takes it out of its
 // category. Which projects, categories and fork lists are expanded is remembered per browser.
-const STORE = 'studio-nav';
+//
+// Order: the project with the newest message first, and inside a project the
+// chat with the newest message first. A chat's time counts its forks, a category's its chats, so a
+// new message anywhere lifts the whole branch. Only the first PAGE projects are drawn; scrolling to
+// the end draws the next PAGE. A query in the search box replaces the tree with the matching
+// projects and chats.
+const STORE = 'studio-nav', PAGE = 15;
 function loadOpen() { try { const value = JSON.parse(localStorage.getItem(STORE) || '{}'); return { projects: value.projects || {}, categories: value.categories || {}, forks: value.forks || {} }; } catch { return { projects: {}, categories: {}, forks: {} }; } }
-// Roots are chats that are not forks of a chat still listed; each root carries its forks, nested.
+const stamp = session => session.lastMessageAt || session.createdAt || '';
+const later = (a, b) => (b || '') > (a || '') ? b : a || '';
+const newestFirst = (a, b) => a.activity < b.activity ? 1 : a.activity > b.activity ? -1 : 0;
+// Roots are chats that are not forks of a chat still listed; each root carries its forks, nested,
+// and `activity`, the newest message time of the chat and its forks. Newest first at every level.
 export function sessionTree(sessions) {
   const listed = new Set(sessions.map(s => s.id)), children = new Map();
   for (const session of sessions) { const parent = session.forkOf?.sessionId; if (parent && listed.has(parent) && parent !== session.id) { if (!children.has(parent)) children.set(parent, []); children.get(parent).push(session); } }
-  const build = (session, depth, seen) => ({ session, depth, forks: seen.has(session.id) ? [] : (children.get(session.id) || []).map(child => build(child, depth + 1, new Set([...seen, session.id]))) });
-  return sessions.filter(s => !s.forkOf?.sessionId || !listed.has(s.forkOf.sessionId)).map(root => build(root, 0, new Set()));
+  const build = (session, depth, seen) => {
+    const forks = (seen.has(session.id) ? [] : (children.get(session.id) || []).map(child => build(child, depth + 1, new Set([...seen, session.id])))).sort(newestFirst);
+    return { session, depth, forks, activity: forks.reduce((latest, fork) => later(latest, fork.activity), stamp(session)) };
+  };
+  return sessions.filter(s => !s.forkOf?.sessionId || !listed.has(s.forkOf.sessionId)).map(root => build(root, 0, new Set())).sort(newestFirst);
 }
 const countTree = nodes => nodes.reduce((sum, item) => sum + 1 + countTree(item.forks), 0);
+// A project's time: the newest of its own record (from the project list) and its chats (the open project's are fresher).
+export const projectActivity = model => model.sessions.reduce((latest, s) => later(latest, stamp(s)), model.project.lastMessageAt || model.project.createdAt || '');
+// Case-insensitive substring match on project names and chat titles, newest first.
+export function searchModels(models, query) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return null;
+  const results = [];
+  for (const model of models) {
+    if (model.project.name.toLowerCase().includes(needle)) results.push({ model, activity: projectActivity(model) });
+    for (const session of model.sessions) if (session.title.toLowerCase().includes(needle)) results.push({ model, session, activity: stamp(session) });
+  }
+  return results.sort(newestFirst);
+}
 
 export function createNavigation(container, hint, handlers) {
   const open = loadOpen();
-  let dragging = null, signature = '';
+  let dragging = null, signature = '', limit = PAGE, query = '';
   const save = () => { try { localStorage.setItem(STORE, JSON.stringify(open)); } catch {} };
   const isProjectOpen = model => open.projects[model.project.id] ?? model.current;
   const showHint = text => { hint.textContent = text; hint.hidden = !text; };
@@ -102,13 +128,13 @@ export function createNavigation(container, hint, handlers) {
     target(block, model, () => dragging.categoryId !== category.id, moved => handlers.moveSession(model.project, moved.sessionId, category.id), () => t('移入分类「{name}」', { name: category.name }));
     return block;
   }
-  function projectBlock(model) {
-    const { project } = model, isOpen = isProjectOpen(model);
-    const block = node('div', `project${isOpen ? ' open' : ''}${model.current ? ' current' : ''}`), row = node('div', 'project-row');
-    row.setAttribute('role', 'button'); row.tabIndex = 0; row.setAttribute('aria-expanded', String(isOpen));
+  // The project's row; in search results it only opens the project (no chevron, nothing to fold).
+  function projectRow(model, { expandable = true } = {}) {
+    const { project } = model, isOpen = expandable && isProjectOpen(model), row = node('div', 'project-row');
+    row.setAttribute('role', 'button'); row.tabIndex = 0; if (expandable) row.setAttribute('aria-expanded', String(isOpen));
     const label = node('span', 'label'); label.append(node('span', 'name', project.name)); if (model.place) label.append(node('span', 'place', model.place));
-    const chev = icon('i-chev', 'i i-xs chev');
-    row.append(chev, label);
+    if (expandable) row.append(icon('i-chev', 'i i-xs chev'));
+    row.append(label);
     if (model.running.length) row.append(handlers.runningMark());
     const dot = handlers.unreadDot(Object.values(model.unread)); if (dot) row.append(dot);
     row.append(node('span', 'count', String(model.sessions.length)));
@@ -121,35 +147,80 @@ export function createNavigation(container, hint, handlers) {
     // The row opens a project; clicking the open project's row (or its chevron) folds it.
     row.addEventListener('click', event => {
       if (event.target.closest('.row-actions')) return;
-      if (event.target.closest('.chev') || model.current && isOpen) return setOpen(!isOpen);
-      if (!isOpen) open.projects[project.id] = true, save();
+      if (expandable && (event.target.closest('.chev') || model.current && isOpen)) return setOpen(!isOpen);
+      if (expandable && !isOpen) open.projects[project.id] = true, save();
       handlers.selectProject(project.id);
     });
-    row.addEventListener('keydown', event => { if ((event.key === 'Enter' || event.key === ' ') && event.target === row) { event.preventDefault(); row.click(); } else if (event.key === 'ArrowLeft' && isOpen) setOpen(false); else if (event.key === 'ArrowRight' && !isOpen) setOpen(true); });
+    row.addEventListener('keydown', event => { if ((event.key === 'Enter' || event.key === ' ') && event.target === row) { event.preventDefault(); row.click(); } else if (expandable && event.key === 'ArrowLeft' && isOpen) setOpen(false); else if (expandable && event.key === 'ArrowRight' && !isOpen) setOpen(true); });
     target(row, model, () => Boolean(dragging.categoryId), moved => handlers.moveSession(project, moved.sessionId, null), () => t('移出分类'));
-    block.append(row);
+    return row;
+  }
+  function projectBlock(model) {
+    const { project } = model, isOpen = isProjectOpen(model);
+    const block = node('div', `project${isOpen ? ' open' : ''}${model.current ? ' current' : ''}`);
+    block.append(projectRow(model));
     const list = node('div', 'sessions');
     const categories = model.categories || [], known = new Set(categories.map(c => c.id)), roots = sessionTree(model.sessions);
-    for (const category of categories) list.append(categoryBlock(model, category, roots.filter(item => item.session.categoryId === category.id)));
-    appendTree(list, model, roots.filter(item => !known.has(item.session.categoryId)), null);
+    // Categories and loose chats together, newest activity first; a category counts its newest chat.
+    const items = [
+      ...categories.map(category => { const nodes = roots.filter(item => item.session.categoryId === category.id); return { activity: nodes[0]?.activity || category.createdAt || '', render: () => list.append(categoryBlock(model, category, nodes)) }; }),
+      ...roots.filter(item => !known.has(item.session.categoryId)).map(item => ({ activity: item.activity, render: () => appendTree(list, model, [item], null) })),
+    ].sort(newestFirst);
+    for (const item of items) item.render();
     if (!model.sessions.length) list.append(node('p', 'empty', t('暂无对话')));
     target(list, model, () => Boolean(dragging.categoryId), moved => handlers.moveSession(project, moved.sessionId, null), () => t('移出分类'));
     block.append(list);
     return block;
   }
+  // Search results: a matching project as a plain row, a matching chat as "project › title".
+  function resultRow(result) {
+    const { model, session } = result;
+    if (!session) { const block = node('div', 'project result'); block.append(projectRow(model, { expandable: false })); return block; }
+    const row = node('div', `session result${model.current && session.id === handlers.selectedSession() ? ' active' : ''}`);
+    row.setAttribute('role', 'button'); row.tabIndex = 0; row.title = `${model.project.name} › ${session.title}`; row.dataset.sessionId = session.id;
+    const name = node('span', 'session-name'); name.append(node('span', 'result-project', model.project.name + ' › '), session.title); row.append(name);
+    const end = node('span', 'end'), unread = model.unread[session.id];
+    if (model.running.includes(session.id)) end.append(handlers.runningMark()); else if (unread) { const dot = handlers.unreadDot([unread]); if (dot) end.append(dot); }
+    row.append(end);
+    const select = () => handlers.selectSession(model.project.id, session.id);
+    row.addEventListener('click', select);
+    row.addEventListener('keydown', event => { if ((event.key === 'Enter' || event.key === ' ') && event.target === row) { event.preventDefault(); select(); } });
+    return row;
+  }
+  // The next page of projects is drawn when the end of the list comes into view, or on the button.
+  const more = node('button', 'nav-more', t('显示更早的项目')); more.type = 'button';
+  const showMore = () => { limit += PAGE; rerender(); };
+  more.addEventListener('click', showMore);
+  const observer = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => { if (entries.some(e => e.isIntersecting) && more.isConnected) showMore(); }, { root: container }) : null;
   let lastModels = [];
   function rerender() { signature = ''; render(lastModels); }
   function render(models) {
     lastModels = models;
     // Rebuilding on every refresh would swallow clicks and orphan an open menu; a drag in progress
     // keeps the tree until it ends.
-    const next = JSON.stringify([models.map(m => [m.project.id, m.project.name, m.current, m.full, m.place, m.unread, m.running, m.creating, m.categories, m.sessions.map(s => [s.id, s.title, s.forkOf?.sessionId, s.categoryId])]), handlers.selectedSession(), open, handlers.language()]);
+    const next = JSON.stringify([models.map(m => [m.project.id, m.project.name, m.project.lastMessageAt, m.current, m.full, m.place, m.unread, m.running, m.creating, m.categories, m.sessions.map(s => [s.id, s.title, s.lastMessageAt, s.forkOf?.sessionId, s.categoryId])]), handlers.selectedSession(), open, handlers.language(), limit, query]);
     if (next === signature || dragging) return;
     signature = next;
     const scroll = container.scrollTop;
-    container.replaceChildren(...models.map(projectBlock));
-    if (!models.length) container.append(node('p', 'empty', t('还没有项目。')));
+    observer?.disconnect();
+    const results = searchModels(models, query);
+    if (results) {
+      container.replaceChildren(...results.map(resultRow));
+      if (!results.length) container.append(node('p', 'empty', t('没有匹配的项目或对话')));
+    } else {
+      const sorted = models.map(model => ({ model, activity: projectActivity(model) })).sort(newestFirst).map(item => item.model);
+      // The open project is drawn even past the window, in its own place.
+      container.replaceChildren(...sorted.filter((model, index) => index < limit || model.current).map(projectBlock));
+      if (!models.length) container.append(node('p', 'empty', t('还没有项目。')));
+      if (sorted.length > limit) { container.append(more); observer?.observe(more); }
+    }
     container.scrollTop = scroll;
   }
-  return { render, rerender, expand(projectId) { open.projects[projectId] = true; save(); rerender(); }, expandCategory(id) { delete open.categories[id]; save(); } };
+  more.textContent = t('显示更早的项目');
+  return {
+    render, rerender,
+    expand(projectId) { open.projects[projectId] = true; save(); rerender(); },
+    expandCategory(id) { delete open.categories[id]; save(); },
+    search(value) { const next = String(value || ''); if (next === query) return; query = next; more.textContent = t('显示更早的项目'); rerender(); },
+  };
 }

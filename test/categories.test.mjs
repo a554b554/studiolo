@@ -4,12 +4,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {createStudio} from '../src/server.mjs';
-import {FakeTransport} from '../src/transport.mjs';
 
 // Chat categories (one level, per project, in the replicated journal) and detaching a fork.
 async function server(t){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'studio-categories-'));
- const app=await createStudio({stateDir:path.join(root,'state'),projectRoot:path.join(root,'projects'),port:0,previewPort:0,transport:new FakeTransport(),runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true}],execute:async()=>({text:'ok'})}});
+ const app=await createStudio({stateDir:path.join(root,'state'),projectRoot:path.join(root,'projects'),port:0,previewPort:0,runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true}],execute:async()=>({text:'ok'})}});
  t.after(async()=>{await app.close().catch(()=>{});await fs.rm(root,{recursive:true,force:true});});
  const base=`http://127.0.0.1:${app.port}`;
  const api=async(url,method='GET',data)=>{const res=await fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});const result=await res.json();if(!res.ok)throw Object.assign(Error(result.error),{status:res.status});return result;};

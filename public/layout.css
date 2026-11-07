@@ -54,6 +54,9 @@ body.left-closed .sidebar .handle,body.right-closed .explorer .handle,body.pane-
 .nav-row:hover{background:var(--hover)}
 .section-label{display:flex;align-items:center;justify-content:space-between;padding:12px 8px 4px 18px;font-size:12px;color:var(--faint)}
 .section-label .icon-btn{width:24px;height:24px}
+.nav-search{padding:6px 8px 0}.nav-search input{width:100%;box-sizing:border-box;padding:6px 10px;border:var(--line) solid var(--border);border-radius:7px;background:var(--surface);color:var(--ink);font-size:13px;outline:0}.nav-search input:focus{border-color:var(--accent)}
+.nav-more{display:block;width:100%;margin:6px 0 2px;padding:6px 10px;border:0;border-radius:7px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.nav-more:hover{background:var(--hover);color:var(--ink)}
+.project.result{margin-top:2px}.sidebar .session.result{padding-left:10px}.result-project{color:var(--faint)}
 .sidebar .project-list{flex:1;overflow:auto;padding:0 8px 12px;scrollbar-width:thin;min-height:80px}
 .project{margin-top:2px}
 .project-row,.cat-row{display:flex;align-items:center;gap:6px;width:100%;border-radius:7px;cursor:pointer;user-select:none;min-width:0}

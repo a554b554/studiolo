@@ -221,7 +221,8 @@ attempt(async () => {
   const data = await bootstrap(); hereId = data.hostId; await reload();
   // An Artifact that runs on another server opens on that server (project-hosts.js, artifactHome): framed
   // in a page of this one, its preview could not sign in. Links copied or kept from here still work.
-  const home = artifactHome(state.project, data.hosts, data.hostId);
+  const artifact = state.artifacts?.find(a => a.id === artifactId);
+  const home = artifactHome(state.project, data.hosts, data.hostId, artifact);
   if (home) {
     const there = new URL(location.pathname + location.search, home.url); there.searchParams.delete('embed');
     if (!embedded) { location.replace(await signedIn(home.id, there.href)); return; }
@@ -230,8 +231,8 @@ attempt(async () => {
     note.replaceChildren(node('span', '', t('这个 Artifact 运行在 {host} 上，在那台电脑的页面里打开。', { host: home.name || home.id })), link); note.hidden = false;
     clearTimeout(loadingNotice); $('#preview-empty').replaceChildren(); return;
   }
-  // Comments run where the artifact runs: the project's artifact host, whichever server serves this page.
-  choices = initChoices(data,'',{hostId:artifactHostOf(state.project)||data.hostId});
+  // Comments run where the artifact runs: the machine it belongs to, whichever server serves this page.
+  choices = initChoices(data,'',{hostId:artifactHostOf(state.project, artifact)||data.hostId});
   // Voice input, once a machine transcribes (Settings → 语音转写).
   if (data.features?.voiceInput) { $('#comment-dictate').hidden = false; mountDictation({ button: $('#comment-dictate'), textarea: $('#comment-text'), controls: $('#comment-form .composer-controls'), onError: showError, keywords: () => [state.project?.name] }); }
   await loadStatus();

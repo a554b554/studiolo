@@ -10,10 +10,10 @@ import { $, node, button, icon, empty, time, showError, clearError, attempt, sho
 import { platformCommands, codexCommands, parseSlash, mergeCommands, createSlashMenu } from './commands.js';
 import { initAccounts } from './accounts.js';
 import { setAccountDirectory, accountName, familyName, recorded, steerCount } from './conversation.js';
-import { isSynced, runHosts, readyHosts, artifactHome } from './project-hosts.js';
+import { runHosts, readyHosts, artifactHome, artifactHostOf } from './project-hosts.js';
 import { openProjectSettings } from './project-settings.js';
 import { notifyResults } from './notify.js';
-import { initFailover } from './failover.js';
+import { initFailover, takeArrival } from './failover.js';
 import { draftEdited, flushDraft, draftSent, adoptDraft, refreshDraft } from './drafts.js';
 import { initPanes } from './panes.js';
 import { initTabs } from './tabs.js';
@@ -27,7 +27,8 @@ const panes = initPanes({ onPaneToggle: open => tabs.setOpen(open) });
 const tabs = initTabs({ panes,
   artifactName: (projectId, id) => (projectId === view.projectId ? view.project?.artifacts : [])?.find(a => a.id === id)?.name || '',
   artifactRunning: (projectId, id) => projectId === view.projectId && Boolean(artifactStatus.get(id)?.running || artifactStatus.get(id)?.persistent?.running),
-  artifactHome: projectId => projectId === view.projectId ? homeOfArtifacts() : null,
+  artifactHome: (projectId, artifactId) => projectId === view.projectId ? homeOf(view.project?.artifacts?.find(a => a.id === artifactId)) : null,
+  hostLabel: id => hostName(id),
   onActiveChange: tab => markOpenResource(tab) });
 $('#connection').textContent=t('连接中'); $('#session-title').textContent=t('选择项目'); $('#prompt').placeholder=t('输入消息…');
 let choices = () => ({}), refreshTimer, loadVersion = 0, messageSignature = '', navigationSignature = '', artifactSignature = '';
@@ -93,6 +94,9 @@ document.querySelectorAll('[data-close-drawer]').forEach(el => el.addEventListen
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 $('#notice').addEventListener('click', clearError);
 $('#project-new').addEventListener('click', () => showDialog('#project-dialog'));
+// The sidebar search box filters projects and chats by name (navigation.js); Esc clears it.
+$('#project-search').addEventListener('input', () => navigation.search($('#project-search').value));
+$('#project-search').addEventListener('keydown', event => { if (event.key === 'Escape' && $('#project-search').value) { event.stopPropagation(); $('#project-search').value = ''; navigation.search(''); } });
 $('#settings-open').addEventListener('click', () => { renderHosts(); showDialog('#settings-dialog'); attempt(renderArchives); attempt(renderSubagentSettings); attempt(renderDevices); attempt(renderTranscription); });
 $('#files-refresh').addEventListener('click', () => attempt(async () => { await reloadProject(); await loadFiles(); }));
 document.querySelectorAll('[data-resource]').forEach(tab => tab.addEventListener('click', () => {
@@ -152,11 +156,11 @@ async function addAttachments(files) {
 async function uploadToProject(files) {
   if (!files.length) return;
   if (!view.projectId) throw new Error(t('请先打开项目'));
-  const projectId = view.projectId, status = $('#upload-status'); let done = 0;
+  const projectId = view.projectId, host = chosenCopy(), status = $('#upload-status'); let done = 0;
   try {
     for (const file of files) {
       status.textContent = t('上传中 {done}/{total}：{name}', {done: done + 1, total: files.length, name: file.name});
-      await upload(`${projectURL(projectId)}/uploads`, file); done++;
+      await upload(withHost(`${projectURL(projectId)}/uploads`, host), file); done++;
     }
     status.textContent = t('已上传 {count} 个文件到 uploads/', {count: done});
   } finally {
@@ -328,8 +332,8 @@ async function loadHostNames() { for (const host of await api('/api/hosts')) vie
 const hostName = id => view.bootstrap?.hosts?.find(h => h.id === id)?.name || view.hostNames.get(id) || id;
 // The top bar names every server this page reaches, the serving one first.
 function renderConnectedHosts() { $('#machine-label').textContent = t('已连接：{names}',{names:(view.bootstrap?.hosts || []).map(h => h.name || h.id).join(' · ')}); }
-// Where a project's files are: only on its owner, or synced to several hosts.
-const projectPlace = project => isSynced(project) ? t('同步 · {names}',{names:readyHosts(project).map(hostName).join('、')}) + (project.diverged ? ' · ' + t('有冲突') : '') : project.ownerHostId ? t('仅 {name}',{name:hostName(project.ownerHostId)}) : '';
+// The computers a project lives on: those holding a copy and those allowed to run it.
+const projectPlace = project => { const names = [...new Set([...readyHosts(project), ...(runHosts(project) || [])])]; return names.length > 1 ? names.map(hostName).join('、') : names.length ? t('仅 {name}',{name:hostName(names[0])}) : ''; };
 // The project tree (navigation.js). The open project's own records are the freshest; the others
 // come from the project list, which carries each project's chats and categories.
 const navigation = createNavigation($('#project-list'), $('#drag-hint'), {
@@ -458,7 +462,7 @@ function renderConversation() {
   const allowedHosts=runHosts(view.project?.project),stranded=Boolean(session?.hostId&&allowedHosts&&!allowedHosts.includes(session.hostId));
   $('#prompt').disabled = !writable || stranded; $('#send').disabled = !writable || !machineOnline || stranded; $('#attach').disabled = !writable || stranded; dictation.setEnabled(writable && !stranded);
   renderAttachments();
-  $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):stranded?t('此项目的文件只在 {hosts}，这个对话不能继续；请分叉到那里继续。',{hosts:allowedHosts.map(hostName).join('、')}):t('输入消息…');
+  $('#prompt').placeholder=session&&!writable?t('已归档或删除，恢复后可继续对话'):stranded?t('此项目只允许在 {hosts} 运行，这个对话不能继续；请分叉到那里继续。',{hosts:allowedHosts.map(hostName).join('、')}):t('输入消息…');
   // Another conversation's messages are still loading: only what this page sent shows meanwhile.
   const loading = Boolean(view.sessionId && loadedSession() !== view.sessionId);
   const messages = loading ? [] : view.project?.messages.filter(message => message.sessionId === view.sessionId) || [];
@@ -530,7 +534,7 @@ function selectSession(id) {
   // A recently opened conversation shows at once with this project's current runs, then refreshes.
   const cached = loadedSession() !== id && recentView(view.projectId, id);
   if (cached) view.project = {...view.project, messages: cached.messages, page: cached.page};
-  openDraft(); messageSignature = ''; renderNavigation(); renderConversation(); remember(); closeDrawer(); toBottom();
+  openDraft(); messageSignature = ''; renderNavigation(); renderConversation(); syncResources(); remember(); closeDrawer(); toBottom();
   if (cached || loadedSession() !== id) revalidate();
 }
 function showProjectView(id, state, opened) {
@@ -584,7 +588,7 @@ async function reloadProject() {
   const seq = ++stateSeq, id = view.projectId, sid = view.sessionId, state = await api(viewURL(id, sid)); if (view.projectId !== id || view.sessionId !== sid || projectSelectionPending || stale(seq, state.runs)) return;
   applied(seq, state.runs); view.project = state; keepRecent(state);
   if(!visibleItems(state.sessions).some(s=>s.id===view.sessionId)){view.sessionId=visibleItems(state.sessions).at(-1)?.id||null;resetWindow();openDraft();remember();}
-  renderNavigation(); renderConversation(); renderArtifacts(); renderPath();
+  renderNavigation(); renderConversation(); syncResources();
   if (view.sessionId && view.sessionId !== state.page?.sessionId) await reloadProject();
 }
 // Uncommitted streamed output only changes the executing runs, so a run.live tick refreshes
@@ -598,10 +602,42 @@ async function refreshRuntime() {
   appliedLive = seq;
   renderConversation();
 }
-function renderPath() { if(view.project?.storageWarning)showError(new Error(t('记录阅读视图更新失败：')+view.project.storageWarning)); const el = $('#project-path'); el.replaceChildren(node('span','',t('项目目录')),node('code','',view.project?.project.path || '—')); }
+// Whose copy the right sidebar shows. Every machine keeps its own copy of the
+// project's files and Artifacts; the picker under the tree chooses one when there are several. It follows
+// the open conversation's machine, and a choice made there holds until another conversation opens. Files,
+// uploads, file tabs and the Artifact list all use the chosen copy.
+let pickedHost = null, pickedFor = null, shownFiles = null, pathSignature = '';
+const copies = () => view.project?.copies || [];
+function resourceHost() {
+  const list = copies().map(c => c.hostId), key = `${view.projectId}:${view.sessionId}`;
+  if (pickedFor !== key) { pickedFor = key; pickedHost = null; }
+  if (pickedHost && list.includes(pickedHost)) return pickedHost;
+  const bound = view.project?.sessions?.find(s => s.id === view.sessionId)?.hostId;
+  return list.includes(bound) ? bound : list.includes(view.project?.filesHostId) ? view.project.filesHostId : list[0] || view.project?.filesHostId || null;
+}
+// The machine to name in requests: only when the project has several copies (one copy is the default).
+const chosenCopy = () => copies().length > 1 ? resourceHost() : null;
+const withHost = (url, host = chosenCopy()) => host ? `${url}${url.includes('?') ? '&' : '?'}host=${encodeURIComponent(host)}` : url;
+const filesKey = () => `${view.projectId}:${chosenCopy() || ''}`;
+function syncResources() { renderPath(); renderArtifacts(); if (shownFiles !== filesKey()) attempt(loadFiles); }
+function renderPath() {
+  if(view.project?.storageWarning)showError(new Error(t('记录阅读视图更新失败：')+view.project.storageWarning));
+  const list = copies(), host = resourceHost(), copy = list.find(c => c.hostId === host);
+  const signature = JSON.stringify([getLanguage(), view.projectId, host, list, view.project?.project.path]);
+  if (signature === pathSignature) return; pathSignature = signature;
+  const el = $('#project-path'), label = node('span','',t('项目目录'));
+  if (list.length < 2) { el.replaceChildren(label, node('code','',copy?.path || view.project?.project.path || '—')); return; }
+  const select = node('select','copy-picker'); select.setAttribute('aria-label', t('显示哪台电脑上的文件和 Artifact')); select.title = t('显示哪台电脑上的文件和 Artifact');
+  for (const item of list) { const option = node('option','',hostName(item.hostId) + (item.online ? '' : ' · ' + t('离线'))); option.value = item.hostId; option.selected = item.hostId === host; select.append(option); }
+  select.addEventListener('change', () => { pickedHost = select.value; pickedFor = `${view.projectId}:${view.sessionId}`; syncResources(); });
+  el.replaceChildren(label, select, node('code','',copy?.path || '—'));
+}
 async function loadFiles() {
   if (!view.projectId) return;
-  const id = view.projectId, result = await api(`${projectURL(id)}/files`); if (view.projectId !== id) return;
+  const id = view.projectId, key = filesKey(), copy = copies().find(c => c.hostId === chosenCopy()); shownFiles = key;
+  if (copy && !copy.online) { $('#files').replaceChildren(empty(t('{name} 离线，读不到它的文件。', {name: hostName(copy.hostId)}))); return; }
+  let result; try { result = await api(withHost(`${projectURL(id)}/files`)); } catch (error) { if (shownFiles === key) shownFiles = null; throw error; }
+  if (view.projectId !== id || filesKey() !== key) return;
   // Top-level folders that were open stay open, so a refresh after an upload does not collapse them.
   const open = new Set([...$('#files').querySelectorAll(':scope > details[open] > summary')].map(summary => summary.textContent));
   $('#files').replaceChildren(); appendFiles($('#files'), result, id);
@@ -609,15 +645,15 @@ async function loadFiles() {
 }
 function appendFiles(container, entries, projectId) {
   if (!entries.length) { const label=empty(t('目录为空')); label.dataset.i18n='目录为空'; container.append(label); return; }
-  const open = tabs.activeTab();
+  const open = tabs.activeTab(), host = chosenCopy();
   for (const entry of entries) {
     if (entry.type === 'directory') {
       const folder = node('details'), summary = node('summary','',entry.name), children = node('div'); folder.append(summary,children); let loaded = false;
       summary.addEventListener('contextmenu', event => fileMenu(event, projectId, entry));
-      folder.addEventListener('toggle', () => { if (folder.open && !loaded) attempt(async () => { const result = await api(`${projectURL(projectId)}/files?path=${encodeURIComponent(entry.path)}`); children.replaceChildren(); appendFiles(children,result,projectId); loaded = true; }); }); container.append(folder);
+      folder.addEventListener('toggle', () => { if (folder.open && !loaded) attempt(async () => { const result = await api(withHost(`${projectURL(projectId)}/files?path=${encodeURIComponent(entry.path)}`, host)); children.replaceChildren(); appendFiles(children,result,projectId); loaded = true; }); }); container.append(folder);
     } else {
-      const file = button(entry.name, () => tabs.open(projectId, {kind:'file', path:entry.path}), `tree-file${open?.kind === 'file' && open.path === entry.path ? ' current' : ''}`);
-      file.dataset.path = entry.path; file.title = entry.path; file.addEventListener('contextmenu', event => fileMenu(event, projectId, entry)); container.append(file);
+      const file = button(entry.name, () => tabs.open(projectId, {kind:'file', path:entry.path, ...(host ? {hostId:host} : {})}), `tree-file${open?.kind === 'file' && open.path === entry.path && (open.hostId || null) === host ? ' current' : ''}`);
+      file.dataset.path = entry.path; file.dataset.host = host || ''; file.title = entry.path; file.addEventListener('contextmenu', event => fileMenu(event, projectId, entry)); container.append(file);
     }
   }
 }
@@ -625,15 +661,15 @@ function appendFiles(container, entries, projectId) {
 // on that machine (features.reveal, set for 127.0.0.1) for a project whose files are there; otherwise greyed.
 const fileManagerLabels = { explorer: '在文件资源管理器中显示', finder: '在访达中显示', files: '在文件管理器中显示' };
 function fileMenu(event, projectId, entry) {
-  const manager = view.bootstrap?.features?.reveal, filesHost = view.project?.filesHostId;
+  const manager = view.bootstrap?.features?.reveal, filesHost = chosenCopy() || view.project?.filesHostId;
   const here = Boolean(manager) && filesHost === view.bootstrap?.hostId;
   const hint = here ? '' : manager ? t('项目文件在 {host} 上，只能在那台电脑上打开', {host: hostName(filesHost)}) : t('仅在本机客户端打开本机的文件时可用');
-  contextMenu(event, entry.name, [{label: t(fileManagerLabels[manager] || '在文件资源管理器中显示'), disabled: !here, hint, run: () => attempt(() => post(`${projectURL(projectId)}/reveal`, {path: entry.path}))}]);
+  contextMenu(event, entry.name, [{label: t(fileManagerLabels[manager] || '在文件资源管理器中显示'), disabled: !here, hint, run: () => attempt(() => post(withHost(`${projectURL(projectId)}/reveal`, filesHost === view.project?.filesHostId ? null : filesHost), {path: entry.path}))}]);
 }
 // The file tree and the Artifact list mark what the side pane shows.
 function markOpenResource(tab) {
   document.querySelectorAll('#files .tree-file.current, #artifact-list .artifact-row.current').forEach(el => el.classList.remove('current'));
-  if (tab?.kind === 'file') document.querySelectorAll('#files .tree-file').forEach(el => { if (el.dataset.path === tab.path) el.classList.add('current'); });
+  if (tab?.kind === 'file') document.querySelectorAll('#files .tree-file').forEach(el => { if (el.dataset.path === tab.path && el.dataset.host === (tab.hostId || '')) el.classList.add('current'); });
   if (tab?.kind === 'artifact') document.querySelector(`#artifact-list .artifact-row[data-artifact-id="${CSS.escape(tab.artifactId)}"]`)?.classList.add('current');
 }
 // Artifacts: play / pause in the list, ∞ runs it persistently (its own server, outside Studiolo, until
@@ -643,17 +679,23 @@ const artifactBusy = new Map();
 const artifactURL = (projectId, id) => `${projectURL(projectId)}/artifacts/${encodeURIComponent(id)}`;
 const artifactPage = (projectId, id) => `/artifact.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(id)}`;
 const browsePage = (projectId, id) => `/open.html?project=${encodeURIComponent(projectId)}&artifact=${encodeURIComponent(id)}`;
-// Artifacts of a project that runs on another server open on that server (project-hosts.js, artifactHome).
-const homeOfArtifacts = () => artifactHome(view.project?.project, view.bootstrap?.hosts, view.bootstrap?.hostId);
+// An Artifact that runs on another server opens on that server: the machine whose copy declares it
+// (project-hosts.js, artifactHome).
+const homeOf = artifact => artifactHome(view.project?.project, view.bootstrap?.hosts, view.bootstrap?.hostId, artifact);
 function iconButton(name, label, action, className = '') { const el = button('', action, `icon-btn ${className}`.trim()); el.title = label; el.setAttribute('aria-label', label); el.append(icon(name)); return el; }
+// The list shows the chosen copy's Artifacts (resourceHost) when the project has several copies.
+function shownArtifacts() {
+  const all = view.project?.artifacts || [], host = chosenCopy();
+  return host ? all.filter(a => artifactHostOf(view.project.project, a) === host) : all;
+}
 function renderArtifacts() {
-  const artifacts = view.project?.artifacts || [];
-  const home = homeOfArtifacts(), signature = JSON.stringify([getLanguage(),view.projectId,home?.url,artifacts.map(a=>[a.id,a.name,a.root,a.entry,Boolean(a.command)]),view.project?.artifactDiscoveryError,artifacts.map(a=>{const s=artifactStatus.get(a.id);return s?[s.running,s.error||'',s.persistent?.running,s.persistent?.port,s.persistent?.error||'']:null;}),[...artifactBusy]]);
+  const artifacts = shownArtifacts(), host = chosenCopy();
+  const signature = JSON.stringify([getLanguage(),view.projectId,host,artifacts.map(a=>[a.id,a.name,a.root,a.entry,Boolean(a.command),a.hostId,homeOf(a)?.url]),view.project?.artifactDiscoveryError,artifacts.map(a=>{const s=artifactStatus.get(a.id);return s?[s.running,s.error||'',s.persistent?.running,s.persistent?.port,s.persistent?.error||'']:null;}),[...artifactBusy]]);
   if (signature !== artifactSignature) {
     artifactSignature = signature;
     const list = $('#artifact-list'); list.replaceChildren();
     for (const artifact of artifacts) {
-      const status = artifactStatus.get(artifact.id), busy = artifactBusy.has(artifact.id), resident = Boolean(status?.persistent?.running), running = Boolean(status?.running) || resident;
+      const status = artifactStatus.get(artifact.id), busy = artifactBusy.has(artifact.id), resident = Boolean(status?.persistent?.running), running = Boolean(status?.running) || resident, home = homeOf(artifact);
       const row = node('div','artifact-row'), main = node('div','a-main'), sub = node('div','a-sub');
       row.dataset.artifactId = artifact.id; row.tabIndex = 0; row.setAttribute('role','button'); row.title = `${artifact.root}/${artifact.entry}`;
       main.append(node('div','a-name',artifact.name),sub);
@@ -675,7 +717,7 @@ function renderArtifacts() {
       list.append(row);
     }
     if (view.project?.artifactDiscoveryError) list.append(node('p','run-error',view.project.artifactDiscoveryError));
-    if (!artifacts.length) list.append(empty(t('暂无 Artifact。')));
+    if (!artifacts.length) list.append(empty(host ? t('{name} 的副本里暂无 Artifact。', {name: hostName(host)}) : t('暂无 Artifact。')));
     markOpenResource(tabs.activeTab());
   }
   $('#artifacts-running').hidden = !artifacts.some(a => artifactStatus.get(a.id)?.running || artifactStatus.get(a.id)?.persistent?.running);
@@ -689,7 +731,7 @@ async function changeArtifact(artifact, action) {
 }
 let artifactPolling = false;
 async function pollArtifacts() {
-  const projectId = view.projectId, artifacts = view.project?.artifacts || [];
+  const projectId = view.projectId, artifacts = shownArtifacts();
   if (!projectId || artifactPolling || !artifacts.length) return;
   artifactPolling = true;
   try {
@@ -916,7 +958,12 @@ async function start() {
   $('#accounts-open').addEventListener('click', () => { $('#settings-dialog').close(); accountsUI.open($('#host').value || view.bootstrap.hostId); });
   $('#host').addEventListener('change', () => usage.setHost($('#host').value));
   syncDictation(Boolean(view.bootstrap.features?.voiceInput));
-  renderConnectedHosts(); initFailover({ hosts: () => view.bootstrap?.hosts || [], selfId: () => view.bootstrap?.hostId });
+  renderConnectedHosts();
+  // Failover hands over the open conversation and its unsent text; a message still on its way holds the switch.
+  const arrival = takeArrival();
+  initFailover({ hosts: () => view.bootstrap?.hosts || [], selfId: () => view.bootstrap?.hostId, arrival,
+    carry: () => ({ projectId: view.projectId, sessionId: view.sessionId, draft: $('#prompt')?.value || '' }),
+    busy: () => [...view.outbox.values()].some(request => !request.failed) });
   // Release check (CHANGELOG.md): this page runs the front end of the release it was loaded with. The
   // server reports its current release on every bootstrap, so after an update the page offers a reload;
   // peers and the desktop client report theirs, and Settings → 版本 flags any that differ.
@@ -973,8 +1020,9 @@ async function start() {
   if (ui.theme) setTheme(ui.theme); if (ui.language && ui.language !== getLanguage()) setLanguage(ui.language);
   document.querySelectorAll('[data-theme-picker]').forEach(el => el.addEventListener('change', () => savePreferences({theme:el.value})));
   document.querySelectorAll('[data-language-picker]').forEach(el => el.addEventListener('change', () => savePreferences({language:getLanguage()})));
-  const previous = ui.selection || previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
+  const previous = arrival?.projectId ? arrival : ui.selection || previousSelection(), projects=visibleItems(view.bootstrap.projects), project = projects.find(item => item.id === previous.projectId) || projects[0];
   if (project) await selectProject(project.id,previous.sessionId); else { renderNavigation(); renderConversation(); }
+  if (arrival?.draft && view.projectId === arrival.projectId && (view.sessionId || null) === arrival.sessionId) { const key = draftKey(); view.drafts.set(key, arrival.draft); $('#prompt').value = arrival.draft; draftEdited(key); }
   // Run output and conversation events only touch their own project; the project list
   // changes only on reconnect, project-level events or a run starting or ending in another
   // project (its spinner), so most refreshes skip it.

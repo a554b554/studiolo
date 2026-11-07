@@ -5,7 +5,7 @@ import os from 'node:os';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {randomUUID,randomBytes,timingSafeEqual,createHash} from 'node:crypto';
 import {gzip} from 'node:zlib';
-import {Store} from './store.mjs';
+import {Store,lastMessageTimes} from './store.mjs';import {keepResident} from './keep-resident.mjs';
 import {QueueManager} from './queue.mjs';
 import {CliRunner} from './runner.mjs';
 import {ArtifactManager} from './artifacts.mjs';
@@ -25,9 +25,7 @@ import {Devices} from './devices.mjs';
 import {Hosts} from './hosts.mjs';
 import {sessionBinding,journalDigest} from './journal.mjs';
 import {validateModelPermission} from '../public/model-permissions.js';
-import {isSynced,runHosts,artifactHostOf,replicasOf,syncOf} from '../public/project-hosts.js';
-import {ReplicaSync} from './sync-engine.mjs';
-import {RsyncTransport} from './transport.mjs';
+import {runHosts,artifactHostOf,replicasOf,readyHosts} from '../public/project-hosts.js';
 import {saveUpload,normalizeAttachments,assertAttachmentsExist} from './uploads.mjs';
 import {OpenAITranscriber,readAudio,transcribeOptions,DEFAULT_LIMIT as TRANSCRIBE_LIMIT} from './transcribe.mjs';
 import {SubagentPolicy,SubagentKnowledge} from './subagents.mjs';
@@ -60,6 +58,10 @@ const compressed=[];let compressedBytes=0;
 const remember=(text,zipped)=>{if(compressed.some(e=>e.text===text))return;compressed.push({text,zipped});compressedBytes+=text.length;while(compressed.length>1&&compressedBytes>16*1024*1024)compressedBytes-=compressed.shift().text.length;};
 const send=(res,data,status=200)=>{const text=JSON.stringify(data??{}),headers={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'};if(text.length<32768||!/\bgzip\b/.test(res.req?.headers['accept-encoding']||'')){res.writeHead(status,headers);res.end(text);return;}const zippedHeaders={...headers,'Content-Encoding':'gzip',Vary:'Accept-Encoding'};const cached=compressed.find(e=>e.text.length===text.length&&e.text===text);if(cached){res.writeHead(status,zippedHeaders);res.end(cached.zipped);return;}gzip(text,{level:1},(error,zipped)=>{if(error){res.writeHead(status,headers);res.end(text);return;}remember(text,zipped);res.writeHead(status,zippedHeaders);res.end(zipped);});};
 
+// The event stream's heartbeat is a named event, not an SSE comment, so pages can see it and tell a
+// server that stopped answering (paged out under memory pressure) from a quiet one. Its data
+// is not an object, so older native clients, which decode every data line as a change, skip it.
+const PING_MS=5000;
 export async function createStudio(options={}){
   const stateDir=options.stateDir||defaultStateDir();await fs.mkdir(stateDir,{recursive:true});const tailnet=await loadTailnet(stateDir);const bind=options.bind||process.env.STUDIO_BIND||'127.0.0.1';const token=options.token??process.env.STUDIO_TOKEN??tailnet?.token??'';if(!localAddress(bind)&&!token)throw new Error('非回环监听需要设置 STUDIO_TOKEN');
   // Device allowlist (README「设备白名单」): with it, `token` is the peer token hosts use for each other and every browser or app must be an approved device.
@@ -75,7 +77,7 @@ export async function createStudio(options={}){
   // every peer in the host index; the accounts of this machine and their quota are appended when a
   // conversation starts.
   const subagentPolicy=new SubagentPolicy({file:path.join(projectRoot,'.studio-settings.json'),hostId});const subagentKnowledge=new SubagentKnowledge({runner,accountUsage,policy:subagentPolicy,helperPath:path.resolve(here,'../scripts/subagent.mjs')});
-  let replicas=null;const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),hooks:{beforeRun:(p,run,say,signal)=>replicas?.barrier(p,run,say,signal),afterRun:p=>replicas?.afterRun(p)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,forwarder:tailnet?.forwarder,tailnetName:tailnet?.dnsName,platformPorts:()=>[server?.address()?.port].filter(Boolean),bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set(),handoffs=new Map();
+  const queue=new QueueManager({store,runner,hostId,knowledge:()=>subagentKnowledge.describe(),machines:()=>machinesForContext(),hooks:{beforeRun:pid=>ensureCopy(pid),afterRun:pid=>artifacts.discover(pid)}});const artifacts=new ArtifactManager({store,stateDir,previewPort:options.previewPort??Number(process.env.STUDIO_PREVIEW_PORT||DEFAULT_PREVIEW_PORT),bind,exposePort:tailnet ? port=>tailnet.forwarder.expose(port) : undefined,forwarder:tailnet?.forwarder,tailnetName:tailnet?.dnsName,platformPorts:()=>[server?.address()?.port].filter(Boolean),bridgeFile:path.join(publicRoot,'bridge.js')});await artifacts.listen();const purger=new ProjectPurger({store,runner,artifacts,stateDir,homedir:options.homedir,env:options.env});const clients=new Set(),sessions=new Set(),handoffs=new Map();
   // Sign-in handoff: a signed-in page opens a Studiolo page in the default browser, or on another server,
   // with a one-time ticket (60 s) instead of making that browser sign in again. A signed-in page can
   // already approve devices on every server (/api/hosts/:id/devices), so a ticket grants nothing new.
@@ -84,29 +86,29 @@ export async function createStudio(options={}){
   const uiState=new UiState({file:path.join(projectRoot,'.studio-ui.json'),hostId});
   const peerIndex=new PeerIndex({store,policy:subagentPolicy,ui:uiState,hostId});
   const app=await buildInfo();
-  const hosts=new Hosts({machine,version:app.version,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||DEFAULT_PORT}`:undefined),profiles:()=>runner.profiles(),files:{projectRoot:store.projectRoot,ssh:machine.ssh?{rsync:machine.rsync,...machine.ssh}:null,rsync:Boolean(machine.rsync)}});
+  const hosts=new Hosts({machine,version:app.version,publicUrl:options.publicUrl||(tailnet?.dnsName?`http://${tailnet.dnsName}:${options.port||process.env.STUDIO_PORT||DEFAULT_PORT}`:undefined),profiles:()=>runner.profiles(),files:{projectRoot:store.projectRoot,ssh:machine.ssh?{user:machine.ssh.user,host:machine.ssh.host,...(machine.ssh.port?{port:machine.ssh.port}:{})}:null}});
   // A peer is identified by what its own /api/identity reports at the given address.
   async function verifyHost({url,token}){let target;try{target=new URL(url);}catch{throw httpError('仅支持 HTTP(S) 主机地址');}if(!['http:','https:'].includes(target.protocol)||target.username||target.password)throw httpError('仅支持 HTTP(S) 主机地址');const host={url:target.origin,token};const info=await hosts.request(host,'/api/identity');if(info.protocol!==2)throw httpError('Upgrade the remote server first',409);if(info.hostId===hostId)throw httpError('不能把本机登记为远程主机');return {...host,id:info.hostId,name:info.name||info.hostId};}
   const hostName=id=>id===hostId?machine.name:machine.hosts.find(h=>h.id===id)?.name||id;
-  // Which host holds a project's working tree.
-  // Synced projects: this host while its copy is at the head, otherwise the head host.
-  const fileHost=state=>{const p=state.project;if(!isSynced(p))return p.ownerHostId||hostId;const mine=replicasOf(p)[hostId];return mine?.state==='ready'&&(!p.head||mine.version===p.head.id)?hostId:p.head?.hostId||p.ownerHostId||hostId;};
-  // Saved edits in a synced project are committed like a run's changes, once typing pauses.
-  const editCommits=new Map();const commitEdits=pid=>{clearTimeout(editCommits.get(pid));const timer=setTimeout(()=>{editCommits.delete(pid);replicas.afterRun(pid).catch(()=>{});},5000);timer.unref?.();editCommits.set(pid,timer);};
+  // Which host serves a project's files: this one while it holds a copy, otherwise the owner.
+  const fileHost=state=>{const p=state.project;return !store.isStub(p.id)&&replicasOf(p)[hostId]?.state==='ready'?hostId:p.ownerHostId||hostId;};
+  // The machine whose copy a file request reads: the one asked for, which must hold a copy (this machine:
+  // its own folder, even before the journal saying so has arrived), or fileHost.
+  const filesOf=(state,asked)=>{if(!asked)return fileHost(state);const holds=asked===hostId?!store.isStub(state.project.id):readyHosts(state.project).includes(asked);if(!holds)throw httpError(`${hostName(asked)} 上没有这个项目的副本`,404);return asked;};
+  // Every machine holding a copy of the project, owner first, with its folder when known (the right
+  // sidebar's machine picker).
+  async function copiesOf(state,origin){const p=state.project,ids=readyHosts(p).sort((a,b)=>(b===p.ownerHostId)-(a===p.ownerHostId));if(!ids.length)return [];const online=new Map((await hosts.online(origin)).map(h=>[h.id,h]));
+    return ids.map(id=>{if(id===hostId)return {hostId:id,online:true,path:store.isStub(p.id)?null:p.path};const live=online.get(id),root=live?.files?.projectRoot;return {hostId:id,online:Boolean(live),path:root?root.replace(/[\\/]+$/,'')+(/^[A-Za-z]:/.test(root)?'\\':'/')+p.id:null};});}
   // Writes to one file run one at a time, so a version check and its write are not interleaved.
   const fileLocks=new Map();const serialFile=(key,fn)=>{const next=(fileLocks.get(key)||Promise.resolve()).catch(()=>{}).then(fn);fileLocks.set(key,next);next.finally(()=>{if(fileLocks.get(key)===next)fileLocks.delete(key);}).catch(()=>{});return next;};
-  replicas=new ReplicaSync({store,hosts,hostId,machine,stateDir,transport:options.transport||new RsyncTransport({rsync:machine.rsync,sshKey:machine.sshKey}),hostName});
-  // What one replica host does for a project, run here or on that host through /peer/<action>.
-  const replicaActions={
-    'commit-now':pid=>replicas.commitNow(pid),commit:(pid,i)=>replicas.commit(pid,{force:i.force===true}),push:(pid,i)=>replicas.push(pid,i.hostId),drop:pid=>replicas.drop(pid),footprint:pid=>replicas.footprint(pid),
-    status:async pid=>({hostId,status:replicas.status.get(pid)||null}),
-    // A project view on a server without the files asks this one to read the Artifact manifest.
-    'discover-artifacts':pid=>artifacts.discover(pid),
-    // Copies can take hours: they run in the background and report through status.
-    add:async(pid,i)=>{replicas.add(pid,{replace:i.replace===true}).catch(()=>{});return {started:true};},
-    pull:async(pid,i)=>{replicas.pull(pid,{force:i.force===true}).catch(e=>replicas.report(pid,{phase:'error',error:e.message}));return {started:true};},
-  };
-  const onReplica=async(id,pid,action,input={},origin)=>id===hostId?replicaActions[action](pid,input):hosts.request(await filesOnline(id,origin),`/api/projects/${pid}/peer/${action}`,{method:'POST',data:input,timeout:6*3600000});
+  // A run on a machine without a working folder starts one: the stub marker goes and the (empty)
+  // folder becomes this machine's copy. Nothing is copied; the agent fetches what it needs from the
+  // other machines (context.mjs lists them).
+  async function ensureCopy(pid){if(store.isStub(pid))await store.setStub(pid,false);if(replicasOf((await store.read(pid)).project)[hostId]?.state!=='ready')await store.mutate(pid,'replica.ready',s=>{s.project.replicas={...replicasOf(s.project),[hostId]:{state:'ready',at:new Date().toISOString()}};});}
+  // Every registered machine with its project root and SSH address, for the agent's prompt (context.mjs).
+  async function machinesForContext(){const online=new Map((await hosts.online()).map(h=>[h.id,h]));return [{id:hostId,name:machine.name,local:true,online:true,projectRoot:store.projectRoot,ssh:hosts.files.ssh},...(machine.hosts||[]).map(h=>{const live=online.get(h.id);return {id:h.id,name:h.name||h.id,local:false,online:Boolean(live),projectRoot:live?.files?.projectRoot||null,ssh:live?.files?.ssh||null,sshKey:machine.sshKey||null};})];}
+  // Peer side: a project view on a server without the files asks this one to read the Artifact manifest.
+  const peerActions={'discover-artifacts':pid=>artifacts.discover(pid)};
   const filesOnline=async(id,origin)=>{try{return await hosts.get(id,origin);}catch{const name=machine.hosts.find(h=>h.id===id)?.name||id;throw httpError(`${name} is offline; this project's files are only there`,503);}};
   async function saveHost(host){machine.hosts=[...(machine.hosts||[]).filter(h=>h.id!==host.id),host];await writeJson(path.join(stateDir,'machine.json'),machine);hosts.cache=null;}
   // Accounts live per machine; a conversation bound to an account that no longer exists on
@@ -126,15 +128,14 @@ export async function createStudio(options={}){
         const target=s.sessions.find(x=>x.id===id);Object.assign(target,{profileId:input.profileId,model:input.model,selection:{model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode:input.permissionMode||'auto'}});return target;
       }
       if((old.createdHostId||s.project.ownerHostId)!==hostId)throw httpError('Bind on the conversation creation server',409);
-      // A conversation runs where the project's files are: the owner of an unsynced
-      // project, or a ready replica of a synced one.
-      const allowed=runHosts(s.project);if(allowed&&!allowed.includes(host.id))throw httpError(isSynced(s.project)?`${hostName(host.id)} has no ready copy of this project's files`:`This project is not synced; it runs on ${hostName(s.project.ownerHostId)}`,409);
+      // A conversation runs on the owner or on a machine allowed in the project settings.
+      const allowed=runHosts(s.project);if(allowed&&!allowed.includes(host.id))throw httpError(`${hostName(host.id)} is not allowed to run this project; allow it in the project settings`,409);
       const target=s.sessions.find(x=>x.id===id);Object.assign(target,{hostId:host.id,profileId:input.profileId,model:input.model,selection:{model:input.model,reasoningEffort:input.reasoningEffort||null,permissionMode:input.permissionMode||'auto'}});return target;
     });
   }
-  async function forward(target,pid,pathname,method,input,origin,headers){
+  async function forward(target,pid,pathname,method,input,origin,headers,timeout=30000){
     const host=await hosts.get(target,origin);await hosts.sync(store,host,pid);
-    const result=await hosts.request(host,pathname,{method,data:input,timeout:30000,headers});
+    const result=await hosts.request(host,pathname,{method,data:input,timeout,headers});
     await hosts.sync(store,host,pid);return result;
   }
   // Sign-in runs on the machine that owns the account; pages on other machines reach it through
@@ -194,7 +195,7 @@ export async function createStudio(options={}){
     }
     let parentOrigin=origin;if(req.headers['x-studio-parent-origin']){if(req.headers['x-studio-hop']!=='1')throw httpError('无效预览来源',403);const candidate=new URL(req.headers['x-studio-parent-origin']);if(!['http:','https:'].includes(candidate.protocol)||candidate.origin!==req.headers['x-studio-parent-origin'])throw httpError('无效预览来源');parentOrigin=candidate.origin;}
     if(pathname==='/api/logout'&&req.method==='POST'){sessions.delete(cookie);devices?.endSession(cookie);res.setHeader('Set-Cookie','studio_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,{ok:true});}
-    if(pathname==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});res.write('event: change\ndata: {}\n\n');clients.add(res);const timer=setInterval(()=>res.write(': heartbeat\n\n'),15000);req.on('close',()=>{clearInterval(timer);clients.delete(res)});return;}
+    if(pathname==='/api/events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});res.write('event: change\ndata: {}\n\n');clients.add(res);const timer=setInterval(()=>res.write('event: ping\ndata: 1\n\n'),PING_MS);req.on('close',()=>{clearInterval(timer);clients.delete(res)});return;}
     // Sign-in handoff (above): a ticket for this server, or one from another server through the peer token.
     const mint=/^\/api\/hosts\/([^/]+)\/handoff$/.exec(pathname);
     if(mint&&req.method==='POST'){if(mint[1]===hostId)return send(res,{ticket:mintHandoff()});if(req.headers['x-studio-hop'])throw httpError('Host not found',404);const host=await hosts.get(mint[1],origin);return send(res,await hosts.request(host,`/api/hosts/${encodeURIComponent(mint[1])}/handoff`,{method:'POST',data:{}}));}
@@ -294,50 +295,22 @@ export async function createStudio(options={}){
     const recordsRoute=/^\/runs\/([^/]+)\/records$/.exec(tail);
     if(recordsRoute&&req.method==='GET')return send(res,runRecords(state,recordsRoute[1]));
     if(tail==='/runtime'&&req.method==='GET'){const live=queue.overlay(pid,state);const ids=new Set([...queue.live.values()].filter(x=>x.projectId===pid).map(x=>x.runId));return send(res,{runs:live.runs.filter(r=>ids.has(r.id)),messages:live.messages.filter(m=>ids.has(m.runId)),nativeRuntime:runner.runtime?.(`${pid}:`)||{}});}
-    // Peer side of replica work (sync-engine.mjs); /peer/versions/<id> hands out a manifest.
-    const peerAction=/^\/peer\/([a-z-]+)$/.exec(tail),peerVersion=/^\/peer\/versions\/([^/]+)$/.exec(tail);
-    if(peerAction||peerVersion){if(req.headers['x-studio-hop']!=='1')throw httpError('Peers only',403);
-      if(peerVersion){const version=await replicas.files.readVersion(project.path,peerVersion[1]);if(!version)throw httpError('Version not found',404);return send(res,version);}
-      if(!Object.hasOwn(replicaActions,peerAction[1])||req.method!=='POST')throw httpError('接口不存在',404);return send(res,await replicaActions[peerAction[1]](pid,await body(req))??{});}
-    // Sync settings and replicas. Changes that touch files run on a host that holds them.
-    if(tail==='/sync'&&req.method==='GET'){const ids=[...new Set([hostId,...Object.keys(replicasOf(project))])];const status=Object.fromEntries(await Promise.all(ids.map(async id=>[id,await onReplica(id,pid,'status',{},origin).then(r=>r.status,()=>({phase:'offline'}))])));return send(res,{ownerHostId:project.ownerHostId,sync:syncOf(project),replicas:replicasOf(project),head:project.head,diverged:project.diverged||null,status});}
-    if(tail==='/sync'&&req.method==='PATCH'){const input=await body(req);const files=fileHost(state);
-      if(files!==hostId){if(req.headers['x-studio-hop'])throw httpError('Project files are not on this server',409);return send(res,await hosts.request(await filesOnline(files,origin),pathname,{method:'PATCH',data:input,timeout:600000}));}
-      const was=isSynced(project),next={...syncOf(project)};
-      if(typeof input.enabled==='boolean')next.enabled=input.enabled;if(['auto','manual'].includes(input.commit))next.commit=input.commit;if(typeof input.prefetch==='boolean')next.prefetch=input.prefetch;
-      if(input.artifactHostId!==undefined){if(input.artifactHostId!==null&&replicasOf(project)[input.artifactHostId]?.state!=='ready')throw httpError(`${hostName(input.artifactHostId)} has no ready copy of this project`,409);next.artifactHostId=input.artifactHostId;}
-      if(was&&!next.enabled){const owner=project.ownerHostId,copy=replicasOf(project)[owner];if(project.head&&copy?.version!==project.head.id)throw httpError(`Bring ${hostName(owner)} up to date first: an unsynced project keeps only its copy`,409);next.artifactHostId=null;}
-      // The owner keeps the copy an unsynced project runs on; it moves only to an up-to-date copy.
-      let owner=project.ownerHostId;if(input.ownerHostId!==undefined&&input.ownerHostId!==owner){const copy=replicasOf(project)[input.ownerHostId];if(!was||!next.enabled)throw httpError('Only a synced project can change its owner',409);if(copy?.state!=='ready'||project.head&&copy.version!==project.head.id)throw httpError(`${hostName(input.ownerHostId)} needs an up-to-date copy first`,409);owner=input.ownerHostId;}
-      if(!was&&next.enabled)await replicas.ensureIgnoreFile(project.path);
-      // Explicit replica entries before the owner changes: replicasOf fills in only the current owner.
-      await store.mutate(pid,'project.sync',s=>{s.project.sync=next;if(owner!==s.project.ownerHostId){s.project.replicas=replicasOf(s.project);s.project.ownerHostId=owner;}});
-      if(!was&&next.enabled)await replicas.commit(pid);
-      return send(res,(await store.read(pid)).project);}
-    if(tail==='/replicas'&&req.method==='POST'){const input=await body(req);if(!isSynced(project))throw httpError('Turn sync on first',409);const target=input.hostId||hostId;if(replicasOf(project)[target]?.state==='ready')throw httpError(`${hostName(target)} already has a copy`,409);return send(res,await onReplica(target,pid,'add',{replace:input.replace===true},origin),202);}
-    const replicaRoute=/^\/replicas\/([^/]+)(\/footprint)?$/.exec(tail);
-    if(replicaRoute&&replicaRoute[2]&&req.method==='GET')return send(res,await onReplica(replicaRoute[1],pid,'footprint',{},origin));
-    if(replicaRoute&&!replicaRoute[2]&&req.method==='DELETE'){const target=replicaRoute[1],copies=replicasOf(project);
-      if(url.searchParams.get('confirm')!=='1')throw httpError('Deleting a copy needs confirmation',400);
-      if(target===project.ownerHostId)throw httpError(`${hostName(target)} owns this project and always keeps a copy`,409);
-      if(!copies[target])throw httpError(`${hostName(target)} has no copy`,404);
-      if(!Object.entries(copies).some(([id,r])=>id!==target&&r.state==='ready'&&(!project.head||r.version===project.head.id)))throw httpError(`Another host must be up to date before ${hostName(target)} deletes its copy`,409);
-      if(syncOf(project).artifactHostId===target)await store.mutate(pid,'project.sync',s=>{s.project.sync.artifactHostId=null;});
-      return send(res,await onReplica(target,pid,'drop',{},origin));}
-    if(tail==='/commit'&&req.method==='POST'){const input=await body(req);return send(res,await onReplica(input.hostId||hostId,pid,'commit',{},origin));}
-    // Brings one copy up to the head now instead of before its next run; progress shows in /sync.
-    if(tail==='/pull'&&req.method==='POST'){const input=await body(req),target=input.hostId||hostId;if(!isSynced(project))throw httpError('This project is not synced',409);if(replicasOf(project)[target]?.state!=='ready')throw httpError(`${hostName(target)} has no copy yet; add one first`,409);if(project.diverged)throw httpError('Choose which copy to keep first',409);return send(res,await onReplica(target,pid,'pull',{},origin),202);}
-    // A diverged project keeps one host's files: it commits them as the head, the others are overwritten.
-    if(tail==='/resolve'&&req.method==='POST'){const input=await body(req);if(!project.diverged)throw httpError('This project has not diverged',409);const keep=input.hostId;if(replicasOf(project)[keep]?.state!=='ready')throw httpError(`${hostName(keep)} has no ready copy`,409);
-      const head=await onReplica(keep,pid,'commit',{force:true},origin);if(keep!==hostId)await hosts.sync(store,await hosts.get(keep,origin),pid);const others=Object.entries(replicasOf((await store.read(pid)).project)).filter(([id,r])=>id!==keep&&r.state==='ready').map(([id])=>id);
-      for(const id of others)await onReplica(id,pid,'pull',{force:true},origin).catch(()=>{});return send(res,{head,pulling:others});}
+    const peerAction=/^\/peer\/([a-z-]+)$/.exec(tail);
+    if(peerAction){if(req.headers['x-studio-hop']!=='1')throw httpError('Peers only',403);if(!Object.hasOwn(peerActions,peerAction[1])||req.method!=='POST')throw httpError('接口不存在',404);return send(res,await peerActions[peerAction[1]](pid,await body(req))??{});}
+    // Which machines may run this project: the owner always, others by this
+    // setting. Metadata only, so any server records it; `copies` lists the machines holding a folder.
+    if(tail==='/sync'&&req.method==='GET')return send(res,{ownerHostId:project.ownerHostId,allowedHostIds:runHosts(project)||[],copies:readyHosts(project)});
+    if(tail==='/sync'&&req.method==='PATCH'){const input=await body(req);if(!Array.isArray(input.allowedHostIds)||input.allowedHostIds.some(id=>typeof id!=='string'))throw httpError('allowedHostIds 需为主机 ID 数组');
+      const known=new Set([hostId,...(machine.hosts||[]).map(h=>h.id)]);const unknown=input.allowedHostIds.find(id=>!known.has(id));if(unknown)throw httpError(`Unknown machine: ${unknown}`,404);
+      await store.mutate(pid,'project.hosts',s=>{s.project.allowedHostIds=[...new Set(input.allowedHostIds)].filter(id=>id!==s.project.ownerHostId);});return send(res,(await store.read(pid)).project);}
     if(tail==='/takeover')throw httpError('Projects are shared. Choose a machine when starting a new conversation.',409);
     const bindingRoute=/^\/sessions\/([^/]+)\/bind$/.exec(tail);
     if(bindingRoute&&req.method==='POST')return send(res,await bindSession(pid,bindingRoute[1],await body(req),origin));
     // Project files live on the host that holds them (an unsynced project: its owner).
     // Other servers forward file reads, uploads and artifact creation there; this server may
-    // hold only the metadata stub.
-    const files=fileHost(state);
+    // hold only the metadata stub. Since 0.2.5 every machine's copy is its own, and the page picks
+    // whose files it shows (?host=); without it, this server's copy or the owner's.
+    const files=filesOf(state,url.searchParams.get('host'));
     if(files!==hostId&&(tail==='/uploads'&&req.method==='POST'||['/files','/file','/raw'].includes(tail)&&['GET','HEAD'].includes(req.method)||tail==='/file'&&req.method==='PUT'||tail==='/artifacts'&&req.method==='POST')){
       if(req.headers['x-studio-hop'])throw httpError('Project files are not on this server',409);
       const host=await filesOnline(files,origin);
@@ -360,8 +333,8 @@ export async function createStudio(options={}){
     if(tail==='/messages'&&input?.sessionId){
       let bound=sessionBinding(state,input.sessionId);if(!bound)throw httpError('Session not found',404);
       if(!bound.hostId){const creator=bound.createdHostId||project.ownerHostId||hostId;bound=creator===hostId?await bindSession(pid,input.sessionId,input,origin):await forward(creator,pid,`/api/projects/${pid}/sessions/${input.sessionId}/bind`,'POST',input,origin);}
-      // Conversations bound before the project's files left their host stay readable, not runnable.
-      const allowed=runHosts(project);if(allowed&&!allowed.includes(bound.hostId))throw httpError(`This project's files are only on ${allowed.map(hostName).join(', ')}. Fork to continue there.`,409);
+      // Conversations bound to a machine the project no longer allows stay readable, not runnable.
+      const allowed=runHosts(project);if(allowed&&!allowed.includes(bound.hostId))throw httpError(`This project may only run on ${allowed.map(hostName).join(', ')}. Fork to continue there.`,409);
       if(input.hostId&&input.hostId!==bound.hostId)throw httpError('Conversation machine and account are fixed. Create a new conversation to change them.',409);
       // The model may change between messages: the executing machine checks it and records it on the
       // conversation, and the native session continues on the new model (as /model does in the CLI).
@@ -375,9 +348,11 @@ export async function createStudio(options={}){
     const runRoute=/^\/runs\/([^/]+)/.exec(tail);
     if(runRoute)target=state.runs.find(r=>r.id===runRoute[1])?.hostId||hostId;
     if(tail==='/queues/resume')target=state.runs.findLast(r=>r.queueId===input.queueId)?.hostId||hostId;
-    // Artifacts, their comment agents and evidence live on the artifact host.
-    const artifactRoute=/^\/artifacts\/[^/]+\/(?:start|persist|stop|status|snapshot|restore|annotations)$/.test(tail)||tail==='/messages'&&input&&!input.sessionId;
-    if(artifactRoute){target=artifactHostOf(project)||hostId;if(input?.hostId&&input.hostId!==target)throw httpError(`Artifact comments run on ${hostName(target)}`,409);}
+    // Artifacts, their comment agents and evidence run on the machine the Artifact belongs to: the copy of the
+    // project that declares it.
+    const artifactPath=/^\/artifacts\/([^/]+)\/(start|persist|stop|status|snapshot|restore|annotations)$/.exec(tail);
+    const artifactRoute=Boolean(artifactPath)||tail==='/messages'&&input&&!input.sessionId;
+    if(artifactRoute){target=artifactHostOf(project,state.artifacts.find(a=>a.id===(artifactPath?.[1]||input?.artifactId)))||hostId;if(input?.hostId&&input.hostId!==target)throw httpError(`Artifact comments run on ${hostName(target)}`,409);}
     const sessionLifecycle=/^\/sessions\/([^/]+)\/lifecycle$/.exec(tail);
     if(sessionLifecycle)target=sessionBinding(state,sessionLifecycle[1])?.hostId||hostId;
     if(target!==hostId){if(req.headers['x-studio-hop'])throw httpError('Machine binding has not synchronized yet',409);const headers=artifactRoute?{'X-Studio-Parent-Origin':parentOrigin}:undefined;return send(res,await forward(target,pid,pathname+url.search,req.method,input,origin,headers),tail.endsWith('/annotations')||tail==='/messages'?201:200);}
@@ -410,11 +385,18 @@ export async function createStudio(options={}){
     // the page would otherwise get it executing without its last output.
     // Artifacts are discovered where the files are: a server holding only the metadata asks the file host,
     // and the journal it then pulls brings the new Artifacts here.
-    const discover=async()=>{if(inactive(state.project))return {};const files=fileHost(state);if(files===hostId||req.headers['x-studio-hop'])return artifacts.discover(pid,state);
-      try{const host=await hosts.get(files,origin);const result=await hosts.request(host,`/api/projects/${pid}/peer/discover-artifacts`,{method:'POST',data:{},timeout:4000});if(result.changed)await hosts.sync(store,host,pid);return result;}catch{return {};}};
+    // Since 0.2.5 each machine's copy declares Artifacts of its own (they belong to it), so every
+    // online machine holding a copy is asked (its manifest check is cached for 10 s); the journals then bring
+    // them here.
+    const discover=async()=>{if(inactive(state.project))return {};if(req.headers['x-studio-hop'])return artifacts.discover(pid,state);
+      const local=fileHost(state)===hostId?await artifacts.discover(pid,state):{};
+      const others=readyHosts(state.project).filter(id=>id!==hostId);
+      const peers=others.length?(await hosts.online(origin)).filter(h=>others.includes(h.id)):[];
+      const remote=await Promise.all(peers.map(async host=>{try{const result=await hosts.request(host,`/api/projects/${pid}/peer/discover-artifacts`,{method:'POST',data:{},timeout:4000});if(result.changed)await hosts.sync(store,host,pid);return result;}catch{return {};}}));
+      return {changed:Boolean(local.changed||remote.some(r=>r.changed)),error:local.error||remote.find(r=>r.error)?.error};};
     const assemble=async()=>{const discovery=await discover();const ended=()=>state.runs.some(r=>r.status==='running'&&(!r.hostId||r.hostId===hostId)&&!queue.controllers.has(r.id));if(discovery.changed||ended())state=await store.read(pid);state=queue.overlay(pid,state);const nativeRuntime=runner.runtime?.(`${pid}:`)||{};
       if(!req.headers['x-studio-hop'])await Promise.all((await hosts.online(origin)).filter(h=>!h.local&&state.runs.some(r=>r.hostId===h.id&&['running','waiting','queued'].includes(r.status))).map(async h=>{try{const live=await hosts.request(h,`/api/projects/${pid}/runtime`);for(const r of live.runs){const i=state.runs.findIndex(x=>x.id===r.id&&x.hostId===h.id);if(i>=0)state.runs[i]=r;}for(const message of live.messages){const i=state.messages.findIndex(x=>x.id===message.id);if(i>=0)state.messages[i]=message;else state.messages.push(message);}Object.assign(nativeRuntime,live.nativeRuntime);}catch{}}));
-      return {...state,filesHostId:fileHost(state),sessions:state.sessions.map(s=>sessionBinding(state,s.id)),artifactDiscoveryError:discovery.error||undefined,nativeRuntime};};
+      return {...state,filesHostId:fileHost(state),copies:req.headers['x-studio-hop']?undefined:await copiesOf(state,origin),sessions:(last=>state.sessions.map(s=>({...sessionBinding(state,s.id),lastMessageAt:last.get(s.id)||s.createdAt||null})))(lastMessageTimes(state)),artifactDiscoveryError:discovery.error||undefined,nativeRuntime};};
     // The web page asks for one conversation (?session=) or one Artifact's threads (?artifact=), with
     // tool records of ended runs as previews; without either, the full view.
     if(!tail&&req.method==='GET'){const sessionId=url.searchParams.get('session'),artifactId=url.searchParams.get('artifact');const full=await assemble();return send(res,sessionId||artifactId?pageView(full,{sessionId,artifactId}):full);}
@@ -452,13 +434,13 @@ export async function createStudio(options={}){
         if(current!==input.version)return {conflict:current};
         if(current===null)await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,input.content);const bytes=await fs.readFile(file);return fileMeta(rel,bytes,await fs.stat(file));});
       if(Object.hasOwn(saved,'conflict'))return send(res,{error:saved.conflict===null?'文件已被删除':'文件已被修改',code:'conflict',version:saved.conflict},409);
-      if(isSynced(project))commitEdits(pid);return send(res,saved);}
+      return send(res,saved);}
     if(tail==='/file'){const rel=url.searchParams.get('path')||'';const stat=url.searchParams.get('stat')==='1';let file;try{file=await safePath(project.path,rel);}catch(e){if(stat&&e.code==='ENOENT')throw Object.assign(httpError('文件不存在',404),{code:'missing'});throw e;}const info=await fs.stat(file);if(stat){if(!info.isFile())throw httpError('不是文件');return send(res,fileMeta(rel,await fs.readFile(file),info));}if(info.size>1024*1024)throw httpError('文件超过 1 MB 预览限制',413);const data=await fs.readFile(file);if(data.includes(0))throw httpError('二进制文件暂不支持文本预览');return send(res,{...fileMeta(rel,data,info),content:data.toString('utf8')});}
     // Images referenced by Markdown previews. Sandboxed like evidence so a project SVG cannot run script.
     if(tail==='/raw'){const rel=url.searchParams.get('path')||'';const type=rawImageTypes[path.extname(rel).toLowerCase()];if(!type)throw httpError('仅支持预览图片文件',415);const file=await safePath(project.path,rel);const info=await fs.stat(file);if(!info.isFile())throw httpError('不是文件');if(info.size>10*1024*1024)throw httpError('图片超过 10 MB 预览限制',413);const etag=`W/"${info.size}-${Math.trunc(info.mtimeMs)}"`;const headers={'Content-Type':type,'Cache-Control':'private, no-cache',ETag:etag,'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; sandbox"};if(req.headers['if-none-match']===etag){res.writeHead(304,headers);res.end();return;}const bytes=await fs.readFile(file);res.writeHead(200,{...headers,'Content-Length':bytes.length});res.end(req.method==='HEAD'?undefined:bytes);return;}
     if(tail==='/artifacts'&&req.method==='POST')return send(res,await artifacts.create(pid,await readBody()),201);
     const art=/^\/artifacts\/([^/]+)\/(start|persist|stop|status|snapshot|restore|annotations)$/.exec(tail);if(art){const aid=art[1],action=art[2];if(action==='status')return send(res,await artifacts.status(pid,aid,parentOrigin,origin));if(req.method!=='POST')throw httpError('需要 POST',405);if(action==='start')return send(res,await artifacts.start(pid,aid,parentOrigin,origin));if(action==='persist')return send(res,await artifacts.persist(pid,aid,parentOrigin,origin));if(action==='stop'){await artifacts.halt(pid,aid);return send(res,{running:false});}if(action==='snapshot')return send(res,await artifacts.snapshot(pid,aid));if(action==='restore')return send(res,await artifacts.restore(pid,aid,(await readBody()).snapshotId));if(action==='annotations'){const input=await readBody();if(input.hostId&&input.hostId!==hostId)throw httpError('Select this web server for Artifact comments',409);await artifacts.lookup(pid,aid);if(!input.text?.trim()||!input.requestId)throw httpError('需要批注文本及 requestId');let annotation=state.annotations.find(a=>a.requestId===input.requestId);if(!annotation){const annotationId=randomUUID();const anchor=await saveAnchorEvidence(project,annotationId,input.anchor||{});annotation={id:annotationId,requestId:input.requestId,artifactId:aid,text:input.text.trim(),anchor,anchorStatus:'attached',status:'open',createdAt:new Date().toISOString()};await store.mutate(pid,'annotation.created',s=>{if(!s.annotations.some(a=>a.requestId===input.requestId))s.annotations.push(annotation);else annotation=s.annotations.find(a=>a.requestId===input.requestId);});}const run=await queue.submit(pid,{...input,artifactId:aid,annotationId:annotation.id,queueId:'artifact:'+aid,hostId});return send(res,{annotation,run},201);}}
-    const evidence=/^\/annotations\/([^/]+)\/evidence$/.exec(tail);if(evidence&&req.method==='GET'&&artifactHostOf(project)&&artifactHostOf(project)!==hostId&&!req.headers['x-studio-hop'])return hosts.proxy(await filesOnline(artifactHostOf(project),origin),req,res,pathname);if(evidence&&req.method==='GET'){const annotation=state.annotations.find(a=>a.id===evidence[1]);if(!annotation)throw httpError('批注不存在',404);return sendImage(res,await readAnchorEvidence(project,annotation));}
+    const evidence=/^\/annotations\/([^/]+)\/evidence$/.exec(tail);const evidenceHost=evidence&&artifactHostOf(project,state.artifacts.find(a=>a.id===state.annotations.find(x=>x.id===evidence[1])?.artifactId));if(evidence&&req.method==='GET'&&evidenceHost&&evidenceHost!==hostId&&!req.headers['x-studio-hop'])return hosts.proxy(await filesOnline(evidenceHost,origin),req,res,pathname);if(evidence&&req.method==='GET'){const annotation=state.annotations.find(a=>a.id===evidence[1]);if(!annotation)throw httpError('批注不存在',404);return sendImage(res,await readAnchorEvidence(project,annotation));}
     const ann=/^\/annotations\/([^/]+)$/.exec(tail);if(ann&&req.method==='PATCH'){const input=await readBody();let result;await store.mutate(pid,'annotation.updated',s=>{const a=s.annotations.find(a=>a.id===ann[1]);if(!a)throw httpError('批注不存在',404);if(input.status){if(!['open','resolved'].includes(input.status))throw httpError('无效状态');a.status=input.status;}if(input.anchorStatus){if(!['attached','orphaned','unlocated'].includes(input.anchorStatus))throw httpError('无效锚点状态');a.anchorStatus=input.anchorStatus;}result=a;});
       // A resolved thread with nothing left to run closes its agent process; a later reply resumes its native session.
       if(result.status==='resolved'&&!(await store.read(pid)).runs.some(r=>r.annotationId===result.id&&['queued','running','waiting'].includes(r.status)))await runner.release?.(`${pid}:artifact:${result.artifactId}:${result.id}:`);
@@ -469,6 +451,6 @@ export async function createStudio(options={}){
   let syncing=false,syncWork=Promise.resolve();const syncTimer=setInterval(()=>{if(syncing)return;syncing=true;syncWork=(async()=>{try{await purger.reconcile().catch(e=>{purger.lastError=e.message;});const peers=(await hosts.online(`http://${bind}:${server.address().port}`)).filter(h=>!h.local);if(!peers.length)return;for(const h of peers)try{await hosts.syncIndex(peerIndex,h);}catch(e){hosts.lastSyncError=e.message;}const ids=await store.projectIds();for(const h of peers)for(const id of ids)try{await hosts.sync(store,h,id);}catch(e){hosts.lastSyncError=e.message;}}catch(e){hosts.lastSyncError=e.message;}finally{syncing=false;}})();},3000);syncTimer.unref();
   // Projects soft-deleted before hard deletion existed are removed once, after startup.
   const legacyPurge=purger.reconcile({legacy:true}).catch(e=>{purger.lastError=e.message;console.error('Project purge failed: '+e.message);});
-  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);for(const timer of editCommits.values())clearTimeout(timer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await store.flushAll?.();await devices?.close();await new Promise(r=>server.close(r));}};
+  return {server,store,queue,artifacts,purger,legacyPurge,hosts,hostId,port:server.address().port,stateDir,async close(){clearInterval(syncTimer);await syncWork;await legacyPurge;unsubscribe();accountAuth.close?.();login.close?.();for(const res of clients)res.end();const shutdown=await queue.close();if(shutdown?.pendingCancellation)console.error(shutdown.error);await artifacts.close();await store.flushAll?.();await devices?.close();await new Promise(r=>server.close(r));}};
 }
-if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}
+if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){const app=await createStudio();console.log(`Studio: http://${process.env.STUDIO_BIND||'127.0.0.1'}:${app.port}`);keepResident().then(r=>{if(r.applied)console.log(`Kept resident: ${r.minMB} MB working-set floor, CPU priority ${r.cpu}`);else if(r.reason!=='not windows')console.error(`Working-set floor not applied: ${r.reason||r.detail}`);});let closing=false;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{if(closing)return;closing=true;await app.close();process.exit(0)});}

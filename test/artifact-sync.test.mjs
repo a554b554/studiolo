@@ -28,9 +28,10 @@ async function fixture(t){
   }
   const a=await make('A'),b=await make('B'),p=await a.api('/api/projects',{name:'Synced Artifact'}),base=`/api/projects/${p.id}`,copy=path.join(b.app.store.projectRoot,p.id);
   async function sync(from=a,to=b){const source=from===a?p.path:copy,dest=to===a?p.path:copy;await copyPublished(source,dest);await to.app.store.discoverProjects();}
-  // Both hosts hold the files (a synced project); the artifact runs on one artifact host at a time.
-  await a.app.store.mutate(p.id,'project.synced',s=>{s.project.sync.enabled=true;s.project.replicas[b.app.hostId]={state:'ready',version:null,at:new Date().toISOString()};});
-  const host=async target=>{await a.app.store.mutate(p.id,'artifact.host',s=>{s.project.sync.artifactHostId=target.app.hostId;});await sync(a,b);};
+  // Both hosts hold the files. An Artifact runs on the machine it belongs to; these tests copy the
+  // files by hand (`sync`) and hand every Artifact, and the project, to one machine or the other.
+  await a.app.store.mutate(p.id,'project.copies',s=>{const at=new Date().toISOString();s.project.allowedHostIds=[b.app.hostId];s.project.replicas={[a.app.hostId]:{state:'ready',at},[b.app.hostId]:{state:'ready',at}};});
+  const host=async target=>{await a.app.store.mutate(p.id,'artifact.host',s=>{s.project.ownerHostId=target.app.hostId;s.project.allowedHostIds=[a.app.hostId,b.app.hostId].filter(id=>id!==target.app.hostId);for(const item of s.artifacts)item.hostId=target.app.hostId;});await sync(a,b);};
   await sync();return {a,b,p,base,copy,sync,host,calls,root};
 }
 const save=(client,ops,id=randomUUID())=>client.request('/__studio/storage',{method:'POST',headers:{'Content-Type':'application/json','X-Studio-Storage':'1'},body:JSON.stringify({id,ops})});
@@ -42,9 +43,11 @@ test('manifest metadata is visible on both hosts before assets arrive and become
   await fs.writeFile(path.join(p.path,'studio.artifacts.json'),JSON.stringify({artifacts:[{key:'ready',name:'Ready',root:'ready'},{key:'later',name:'Later',root:'not-yet-synced/deep'}]}));
   const state=await a.api(base);assert.equal(state.artifacts.length,2);assert.equal(state.artifactDiscoveryError,undefined);
   const later=state.artifacts.find(a=>a.manifestKey==='later'),route=`${base}/artifacts/${later.id}`;
-  await sync();assert.deepEqual((await b.api(base)).artifacts,state.artifacts);
+  // Discovered on A, so they belong to A; then handed to B.
+  assert.ok(state.artifacts.every(x=>x.hostId===a.app.hostId));
+  await host(b);const moved=(await b.api(base)).artifacts;assert.deepEqual(moved.map(x=>x.id),state.artifacts.map(x=>x.id));assert.ok(moved.every(x=>x.hostId===b.app.hostId));
   assert.equal((await b.api(route+'/status')).filesReady,false);
-  await assert.rejects(b.api(route+'/start',{}),e=>e.status===409&&/尚未到达/.test(e.message));
+  await assert.rejects(b.api(route+'/start',{}),e=>e.status===409&&/没有这个 Artifact 的文件/.test(e.message));
   await fs.mkdir(path.join(p.path,'not-yet-synced/deep'),{recursive:true});await fs.writeFile(path.join(p.path,'not-yet-synced/deep/index.html'),'<h1>Arrived</h1>');await sync();
   assert.equal((await b.api(route+'/status')).filesReady,true);
   const live=await b.api(route+'/start',{});assert.equal(live.hostId,b.app.hostId);assert.match(await(await(await previewClient(live)).request()).text(),/Arrived/);

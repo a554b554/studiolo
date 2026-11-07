@@ -5,7 +5,6 @@ import path from 'node:path';
 import os from 'node:os';
 import {randomUUID} from 'node:crypto';
 import {createStudio} from '../src/server.mjs';
-import {FakeTransport} from '../src/transport.mjs';
 import {forkTranscript} from '../src/context.mjs';
 
 // Plan P5: a fork is a new conversation whose first run starts from an agent summary of the
@@ -14,7 +13,7 @@ const wait=async(fn,ms=15000)=>{const end=Date.now()+ms;while(Date.now()<end){if
 async function servers(t){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'studio-fork-'));const calls=[],apps=[];
  const make=async label=>{
-  const app=await createStudio({stateDir:path.join(root,label,'state'),projectRoot:path.join(root,label,'projects'),port:0,previewPort:0,transport:new FakeTransport(),runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true},{id:'claude',models:[{id:'sonnet'}],available:true}],execute:async o=>{
+  const app=await createStudio({stateDir:path.join(root,label,'state'),projectRoot:path.join(root,label,'projects'),port:0,previewPort:0,runner:{profiles:async()=>[{id:'codex',models:[{id:'test'}],available:true},{id:'claude',models:[{id:'sonnet'}],available:true}],execute:async o=>{
    const summary=/handoff summary of the conversation/.test(o.prompt);calls.push({label,profileId:o.profileId,prompt:o.prompt,summary,permissionMode:o.permissionMode});
    return summary?{text:`SUMMARY by ${label}/${o.profileId}: goal is the parser`}:{text:`reply from ${label}`,nativeSessionId:`native-${label}-${randomUUID()}`};}}});
   apps.push(app);const base=`http://127.0.0.1:${app.port}`;
@@ -58,24 +57,26 @@ test('a fork on the owner switches account, starts from a summary and links both
  assert.equal(calls.filter(c=>c.summary).length,1);
 });
 
-test('a fork of a synced project runs on another copy and summarizes while the source computer is offline',async t=>{
+test('a fork of a project allowed on another computer runs there, in a fresh folder, while the source computer is offline',async t=>{
  const {a,b,calls}=await servers(t);
  const p=await a.api('/api/projects','POST',{name:'Fork across'}),url=`/api/projects/${p.id}`;
  await fs.writeFile(path.join(p.path,'notes.txt'),'v1');
  await wait(async()=>(await b.api('/api/projects')).some(x=>x.id===p.id&&!x.unavailable));
- await a.api(url+'/sync','PATCH',{enabled:true});
- await wait(async()=>(await b.api(url)).project.head);
- await b.api(url+'/replicas','POST',{});
- await wait(async()=>(await b.api(url)).project.replicas[b.app.hostId]?.state==='ready');
+ // Allowing B is metadata only: B holds no copy until it runs the project.
+ await a.api(url+'/sync','PATCH',{allowedHostIds:[b.app.hostId]});
+ await wait(async()=>(await b.api(url+'/sync')).allowedHostIds.includes(b.app.hostId));
+ assert.deepEqual((await b.api(url+'/sync')).copies,[a.app.hostId]);
  const s=await a.api(url+'/sessions','POST',{title:'On A'});
  await send(a,url,s.id,a.app.hostId,'codex','test','plan the release');await settled(a,url,s.id);
  await wait(async()=>(await b.api(url)).messages.some(m=>m.sessionId===s.id&&m.role==='assistant'));
- await wait(async()=>{const x=(await b.api(url)).project;return x.replicas[b.app.hostId].version===x.head.id;});
  const fork=await b.api(`${url}/sessions/${s.id}/fork`,'POST',{});
  await a.app.close();b.app.hosts.cache=null;
  await send(b,url,fork.id,b.app.hostId,'codex','test','go on');await settled(b,url,fork.id);
  const state=await b.api(url);
  assert.equal(state.runs.find(r=>r.sessionId===fork.id).status,'succeeded');
+ // B's first run gave it an (empty) working folder of its own; A's file was not copied.
+ assert.equal(state.project.replicas[b.app.hostId]?.state,'ready');assert.equal(state.filesHostId,b.app.hostId);
+ assert.equal(await fs.stat(path.join(b.app.store.projectRoot,p.id,'notes.txt')).catch(e=>e.code),'ENOENT');
  assert.match(state.messages.find(m=>m.sessionId===fork.id&&m.kind==='fork_summary').text,/SUMMARY by B/);
  assert.match(calls.find(c=>c.summary&&c.label==='B').prompt,/plan the release/);
 });
